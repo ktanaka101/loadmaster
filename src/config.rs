@@ -311,8 +311,14 @@ struct MachineFile {
 
 impl MachineConfig {
     /// Loads the machine config from its standard location.
+    /// A file named by LOADMASTER_CONFIG must exist: a typo there would
+    /// otherwise give this process the defaults while others use the file.
     pub fn load() -> Result<MachineConfig> {
-        Self::load_from(&machine_config_path()?)
+        let path = machine_config_path()?;
+        if machine_config_override()?.is_some() && !path.exists() {
+            return Err(Error::MissingMachineConfig { path });
+        }
+        Self::load_from(&path)
     }
 
     /// Loads the machine config; a missing file means all defaults.
@@ -362,10 +368,15 @@ impl MachineConfig {
 /// `$LOADMASTER_CONFIG`, else `$XDG_CONFIG_HOME/loadmaster/config.toml`,
 /// else `~/.config/loadmaster/config.toml`. Always absolute.
 pub fn machine_config_path() -> Result<PathBuf> {
-    if let Some(path) = env_path(CONFIG_ENV) {
-        return absolute(path);
+    match machine_config_override()? {
+        Some(path) => Ok(path),
+        None => Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("loadmaster/config.toml")),
     }
-    Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("loadmaster/config.toml"))
+}
+
+/// `$LOADMASTER_CONFIG`, resolved, if set.
+pub fn machine_config_override() -> Result<Option<PathBuf>> {
+    env_path(CONFIG_ENV).map(absolute).transpose()
 }
 
 /// `$LOADMASTER_STATE_DIR`, else `$XDG_STATE_HOME/loadmaster`,

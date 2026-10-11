@@ -379,8 +379,12 @@ fn run_admitted(
         .env(WEIGHT_ENV, task.weight.to_string())
         // Absolute, so nested runs find the same queue and machine config
         // from any directory: the task runs where .loadmaster.toml is.
-        .env(config::STATE_DIR_ENV, state_dir)
-        .env(config::CONFIG_ENV, config::machine_config_path()?);
+        .env(config::STATE_DIR_ENV, state_dir);
+    // Only if set: the default place is the same from anywhere, and a file
+    // named explicitly must exist.
+    if let Some(path) = config::machine_config_override()? {
+        command.env(config::CONFIG_ENV, path);
+    }
     let (db, id) = (state_dir.join(STATE_DB_FILE), ticket.id());
     // Runs on another thread, so it opens its own connection.
     let register = move |group| -> Result<()> { Queue::open(&db)?.record_child(id, group) };

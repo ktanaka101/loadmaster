@@ -341,9 +341,14 @@ not every agent has them.
   that is where a CLI user expects them and what the documentation shows.
   `LOADMASTER_CONFIG` and `LOADMASTER_STATE_DIR` override them (the tests use
   this for isolation). Relative overrides are resolved against the current
-  directory, and the resolved state directory and machine config path are
-  passed on to the task, so a nested run finds the same queue and the same
-  capacity even though the task runs elsewhere.
+  directory, and the resolved state directory (and `LOADMASTER_CONFIG`, if
+  set) are passed on to the task, so a loadmaster it runs finds the same
+  queue and the same machine config even though the task runs elsewhere.
+- A file named by `LOADMASTER_CONFIG` must exist, while a missing file in the
+  default place means all defaults. A typo in the variable would otherwise
+  give one process the default capacity while the others use the configured
+  one. For the same reason the variable is passed on to tasks only when it
+  was set: the default place is the same from anywhere.
 - The state directory is created with mode 0700: it holds command lines and
   paths.
 

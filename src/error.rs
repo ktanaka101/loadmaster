@@ -18,6 +18,9 @@ pub enum Error {
     #[error("cannot read {}: {source}", path.display())]
     ReadConfig { path: PathBuf, source: io::Error },
 
+    #[error("LOADMASTER_CONFIG names {}, which does not exist", path.display())]
+    MissingMachineConfig { path: PathBuf },
+
     #[error("invalid config {}: {message}", path.display())]
     InvalidConfig { path: PathBuf, message: String },
 

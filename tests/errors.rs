@@ -126,6 +126,50 @@ fn a_worktree_does_not_use_the_config_of_the_checkout_it_lives_in() {
 }
 
 #[test]
+fn a_machine_config_named_explicitly_must_exist() {
+    // A typo in LOADMASTER_CONFIG would otherwise give this process the
+    // default capacity while the others use the configured one.
+    let sandbox = Sandbox::new(4, &sh_task("lint", 1, "true"));
+    let missing = sandbox.path("machien.toml");
+    let mut cmd = sandbox.cmd(&["run", "lint"]);
+    cmd.env("LOADMASTER_CONFIG", &missing);
+    let output = output(cmd);
+    assert_eq!(output.status.code(), Some(125));
+    assert!(
+        stderr(&output).contains(&format!(
+            "LOADMASTER_CONFIG names {}, which does not exist",
+            missing.display()
+        )),
+        "{}",
+        stderr(&output)
+    );
+    assert!(sandbox.snapshot().jobs.is_empty(), "nothing was queued");
+}
+
+#[test]
+fn a_missing_machine_config_in_the_default_place_means_defaults() {
+    // Without LOADMASTER_CONFIG, the task does not get one either, so a
+    // loadmaster it runs also falls back to the defaults.
+    let sandbox = Sandbox::new(
+        4,
+        &sh_task(
+            "lint",
+            1,
+            &format!(
+                "echo \"config=${{LOADMASTER_CONFIG-unset}}\"; {} status >/dev/null && echo status-ok",
+                q(std::path::Path::new(BIN))
+            ),
+        ),
+    );
+    let mut cmd = sandbox.cmd(&["run", "lint"]);
+    cmd.env_remove("LOADMASTER_CONFIG")
+        .env("XDG_CONFIG_HOME", sandbox.path("xdg"));
+    let output = output(cmd);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "config=unset\nstatus-ok\n");
+}
+
+#[test]
 fn broken_machine_config_is_rejected() {
     let (sandbox, mut holder) = busy_sandbox();
     for (text, expected) in [
