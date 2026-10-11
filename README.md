@@ -122,13 +122,24 @@ the terminal, leave daemons behind or start their own process groups.
 
 ## Install
 
+Prebuilt binaries for macOS (Apple Silicon and Intel) and Linux (x86_64 and
+arm64, statically linked) are on the
+[releases page](https://github.com/ktanaka101/loadmaster/releases). With
+[mise](https://mise.jdx.dev):
+
 ```bash
-cargo install --locked --git https://github.com/ktanaka101/loadmaster
+mise use -g github:ktanaka101/loadmaster
 ```
 
-Building needs Rust 1.88 or later (`rustup update` if yours is older). Add
-`--rev <commit>` to pin a version; `cargo install --list` shows which commit is
-installed. macOS and Linux are supported.
+Append `@0.1.0` to pin a version. Without mise, download the archive for your
+platform, such as `loadmaster-aarch64-apple-darwin.tar.gz`, and put the
+`loadmaster` binary it contains on your `PATH`.
+
+To build from source instead (Rust 1.88 or later):
+
+```bash
+cargo install --locked --git https://github.com/ktanaka101/loadmaster --tag v0.1.0
+```
 
 ## Quick start
 
