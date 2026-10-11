@@ -279,6 +279,29 @@ weight = 4
 cmd = ["sh", "-c", "exec npx vitest run --maxWorkers=$LOADMASTER_WEIGHT \"$@\"", "sh"]
 ```
 
+### One check per task
+
+Make each check a task of its own, and run a series of checks, such as a
+"verify everything" script, as one `loadmaster run` per check rather than as
+one task. A job holds its weight for as long as it runs: a series defined as
+one task needs a weight that covers its heaviest step and holds it through
+every step, and while several such series wait in line, every check behind
+them waits for all of them. Run one by one, each check holds only its own
+weight, and checks that other agents started in the meantime run between the
+steps:
+
+```bash
+#!/bin/sh
+set -e
+loadmaster run lint
+loadmaster run test
+loadmaster run e2e
+```
+
+Such a script stops at exit code 75 as at any other failure, and running it
+again repeats the checks that already passed. To avoid that, have agents run
+the checks one command at a time instead of through the script.
+
 ### Machine: `~/.config/loadmaster/config.toml`
 
 ```toml
@@ -331,15 +354,17 @@ one with outcome `lost`.
 
 ### Nested runs
 
-If a task itself calls `loadmaster run` (a `check` task that runs `lint` and
-`test`, for example), the inner call must not queue: it would wait forever for
-the slot its own parent holds. The inner call sees `LOADMASTER_HELD`, checks in
-the queue that this job is really running, and then runs directly, without
-taking another slot. A stale or bogus `LOADMASTER_HELD` is an error, not a free
-pass.
+If a task itself calls `loadmaster run`, the inner call must not queue: it
+would wait forever for the slot its own parent holds. The inner call sees
+`LOADMASTER_HELD`, checks in the queue that this job is really running, and
+then runs directly, without taking another slot. A stale or bogus
+`LOADMASTER_HELD` is an error, not a free pass.
 
 The inner task's load counts against the outer task's weight, so give the outer
-task a weight that covers everything it runs.
+task a weight that covers everything it runs. Nested runs keep a task that
+happens to call loadmaster, such as a script that is also run on its own, from
+deadlocking; to run several checks in a row, prefer
+[one `loadmaster run` per check](#one-check-per-task).
 
 ### Giving up without losing your place
 
@@ -404,6 +429,32 @@ stop a running job, signal its task's process group, e.g. `kill -TERM -12346`.
 
 A task can exit with 75, 125, 126 or 127 itself; loadmaster's own messages on
 stderr start with `loadmaster:`.
+
+## Routing existing commands through loadmaster
+
+Agents and people run whatever the repository offers: `npm test`, a Makefile
+target, a script under `scripts/`. Point those entry points at loadmaster, and
+every run goes through the queue, whoever starts it and whatever the agent,
+without relying on permission rules or hooks:
+
+```json
+{
+  "scripts": {
+    "lint": "loadmaster run lint --",
+    "test": "loadmaster run test --",
+    "test:e2e": "loadmaster run e2e --"
+  }
+}
+```
+
+The trailing `--` lets `npm test -- src/a.test.ts` pass its arguments on to
+the task. The tasks' `cmd` must call the tools themselves
+(`["npx", "vitest", "run"]`), never these scripts: a task whose `cmd` is
+`["npm", "test"]` calls itself forever, because the inner `loadmaster run test`
+runs directly inside the outer one's slot (see [Nested runs](#nested-runs)).
+
+Running a tool directly (`npx vitest`) still bypasses the queue; in Claude
+Code, [blocking direct execution](#3-block-direct-execution) catches that.
 
 ## Using it with Claude Code
 
@@ -524,9 +575,10 @@ Exit code 2 blocks the call and shows the message to Claude. The hook blocks
 `npm test`, `cd x && npx vitest` and `loadmaster run test && npx vitest`, and
 allows a plain `loadmaster run test`. Its patterns are plain text matches, so
 adjust them to your scripts: as written, they miss `npm run test:unit`, and
-they also block harmless commands such as `grep vitest`. Without `jq` the hook
-lets everything through. Like permission rules, it is a guardrail against
-accidents, not a security boundary.
+they also block harmless commands such as `grep vitest`. If your package
+scripts already go through loadmaster, drop the second `block` line. Without
+`jq` the hook lets everything through. Like permission rules, it is a
+guardrail against accidents, not a security boundary.
 
 ## Checking that it helps
 
