@@ -111,16 +111,27 @@ fn a_job_of_another_checkout_is_not_held() {
     std::fs::write(other.join(".loadmaster.toml"), "").unwrap();
     let link = sandbox.path("link");
     std::os::unix::fs::symlink(&sandbox.repo, &link).unwrap();
+    // A worktree whose .loadmaster.toml is a symlink to the same file is still
+    // a checkout of its own.
+    let shared = sandbox.path("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::os::unix::fs::symlink(
+        sandbox.repo.join(".loadmaster.toml"),
+        shared.join(".loadmaster.toml"),
+    )
+    .unwrap();
 
     let mut holder = sandbox.spawn(&["run", "hold"]);
     wait_until("the task to start", || sandbox.started("hold"));
     let id = sandbox.job("hold").unwrap().id.to_string();
 
-    let output = held_with(&sandbox, &id, &other);
-    assert_eq!(output.status.code(), Some(NOT_HELD));
-    let err = stderr(&output);
-    assert!(err.contains("another checkout"), "{err}");
-    assert!(err.contains(&format!("job #{id}")), "{err}");
+    for dir in [&other, &shared] {
+        let output = held_with(&sandbox, &id, dir);
+        assert_eq!(output.status.code(), Some(NOT_HELD), "{}", dir.display());
+        let err = stderr(&output);
+        assert!(err.contains("another checkout"), "{err}");
+        assert!(err.contains(&format!("job #{id}")), "{err}");
+    }
 
     // The same job is accepted in its own checkout, also through a symlink
     // and from a subdirectory.

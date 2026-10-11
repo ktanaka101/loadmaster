@@ -223,16 +223,21 @@ fn run(args: RunArgs) -> Result<i32> {
                 wait_started,
                 &mut record,
             ),
-            Turn::GaveUp { ahead, used } => {
+            Turn::GaveUp {
+                ahead,
+                used,
+                waiting_for,
+            } => {
                 ticket.park()?;
                 say!(
-                    "loadmaster: gave up waiting for `{}` after {} ({}, {used}/{} in use)\n\
+                    "loadmaster: gave up waiting for `{}` after {} ({}, {used}/{} in use{})\n\
                      loadmaster: your place in line is kept for {}s; \
                      run the same command again from this directory to resume",
                     task.name,
                     format_duration(wait_started.elapsed()),
                     format_ahead(ahead),
                     machine.capacity,
+                    format_waiting_for(&waiting_for),
                     PARK_TTL.as_secs(),
                 );
                 record.outcome = Outcome::GaveUp;
@@ -292,7 +297,11 @@ fn resource_uses(repo: &RepoConfig, task: &Task, machine: &MachineConfig) -> Vec
 
 enum Turn {
     Admitted,
-    GaveUp { ahead: u32, used: u64 },
+    GaveUp {
+        ahead: u32,
+        used: u64,
+        waiting_for: Vec<String>,
+    },
     Interrupted(i32),
 }
 
@@ -331,19 +340,19 @@ fn wait_turn(
                     if let Some(&signal) = signals.take().first() {
                         return Ok(Turn::Interrupted(signal));
                     }
-                    return Ok(Turn::GaveUp { ahead, used });
+                    return Ok(Turn::GaveUp {
+                        ahead,
+                        used,
+                        waiting_for,
+                    });
                 }
                 if last_report.is_none_or(|at| at.elapsed() >= REPORT_INTERVAL) {
-                    let resources = if waiting_for.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; waiting for {}", waiting_for.join(", "))
-                    };
                     say!(
-                        "loadmaster: waiting to run `{}` (weight {}): {}, {used}/{capacity} in use{resources}",
+                        "loadmaster: waiting to run `{}` (weight {}): {}, {used}/{capacity} in use{}",
                         task.name,
                         task.weight,
                         format_ahead(ahead),
+                        format_waiting_for(&waiting_for),
                     );
                     last_report = Some(Instant::now());
                 }
@@ -471,9 +480,16 @@ fn held(args: HeldArgs) -> Result<i32> {
             "{HELD_ENV}={value} does not refer to a running job"
         ));
     };
-    // Resolved, so a symlink to the same checkout matches.
-    let here = fs::canonicalize(&checkout).ok();
-    let theirs = RepoConfig::find(&job.dir).and_then(|path| fs::canonicalize(path).ok());
+    // A checkout is the resolved directory of its .loadmaster.toml, as for
+    // per-checkout limits: a symlink to the same checkout matches, a worktree
+    // whose config is a symlink to another's file does not.
+    let resolved_dir = |config: &Path| config.parent().and_then(|dir| fs::canonicalize(dir).ok());
+    let here = resolved_dir(&checkout);
+    let theirs = match &job.checkout {
+        Some(dir) => Some(dir.clone()),
+        // Recorded before checkouts were.
+        None => RepoConfig::find(&job.dir).and_then(|config| resolved_dir(&config)),
+    };
     if here.is_none() || theirs != here {
         return not_held(format!(
             "job #{} (`{}`) was started from another checkout, in {}",
@@ -498,10 +514,13 @@ fn held(args: HeldArgs) -> Result<i32> {
 /// `$LOADMASTER_MAX_WAIT`, where empty means unset, as for LOADMASTER_HELD:
 /// a script can turn the limit off for its steps by setting it to "".
 fn max_wait_from_env() -> Result<Option<u64>> {
-    let Some(value) = env::var_os(MAX_WAIT_ENV).filter(|v| !v.is_empty()) else {
+    let Some(value) = env::var_os(MAX_WAIT_ENV) else {
         return Ok(None);
     };
     let value = value.to_string_lossy().into_owned();
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
     value
         .trim()
         .parse()
@@ -572,7 +591,7 @@ fn resources_in_use(jobs: &[Job], machine: &MachineConfig) -> String {
         .into_iter()
         .map(|(name, (used, capacity))| match capacity {
             Some(capacity) => format!("{name}: {used}/{capacity} in use\n"),
-            None => format!("{name}: {used} in use (no capacity set)\n"),
+            None => format!("{name}: {used} in use (no machine-wide limit)\n"),
         })
         .collect()
 }
@@ -709,6 +728,15 @@ fn open_state_dir() -> Result<PathBuf> {
 fn print(text: &str) {
     // Ignore EPIPE (e.g. `loadmaster status | head`).
     let _ = io::stdout().lock().write_all(text.as_bytes());
+}
+
+/// "; waiting for db, mem" for the resources other than CPU a job waits for.
+fn format_waiting_for(resources: &[String]) -> String {
+    if resources.is_empty() {
+        String::new()
+    } else {
+        format!("; waiting for {}", resources.join(", "))
+    }
 }
 
 fn format_ahead(ahead: u32) -> String {

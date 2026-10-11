@@ -448,9 +448,10 @@ If the job has not started after 600 seconds, loadmaster exits with code 75
 but keeps the job's place in line for 120 seconds. Running the same command
 again from the same directory resumes that place instead of joining the back of
 the line. "The same command" means the same caller directory, task name and
-extra arguments. A kept place still blocks jobs behind it, as if it were
-waiting, until it is resumed or expires. The 120 seconds are fixed, and each
-resumed run may again wait up to `--max-wait`.
+extra arguments; if the task's weight or resources changed in the meantime,
+the re-run gets in line again instead. A kept place still holds back jobs
+behind it, as if it were waiting, until it is resumed or expires. The 120
+seconds are fixed, and each resumed run may again wait up to `--max-wait`.
 
 `LOADMASTER_MAX_WAIT` sets the default for `--max-wait`; set to an empty
 string, it means no limit. You can tell loadmaster's 75 from a task that

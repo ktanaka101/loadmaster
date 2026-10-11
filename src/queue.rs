@@ -347,10 +347,22 @@ impl Queue {
         let ((id, resumed), _) = self.write(|tx| {
             let parked: Option<JobId> = tx
                 .query_row(
+                    // Only with the same demands: jobs behind may have
+                    // started next to what the parked job set aside, and
+                    // could delay it if it needed more now.
                     "SELECT id FROM jobs
                  WHERE state = 'parked' AND dir = ?1 AND task = ?2 AND args = ?3
+                   AND weight = ?4 AND capacity IS ?5 AND uses = ?6 AND checkout IS ?7
                  ORDER BY id LIMIT 1",
-                    params![dir, request.task, args],
+                    params![
+                        dir,
+                        request.task,
+                        args,
+                        request.weight,
+                        request.capacity,
+                        uses,
+                        checkout
+                    ],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -604,10 +616,13 @@ fn demands(job: &Job, capacity: u32) -> Vec<(Dim<'_>, u64, u64)> {
     let cpu = job.capacity.unwrap_or(capacity);
     let mut demands = vec![(Dim::Cpu, u64::from(job.weight.min(cpu)), u64::from(cpu))];
     for u in &job.uses {
-        if let Some(limit) = u.capacity {
-            let amount = u64::from(u.amount.min(limit));
-            demands.push((Dim::Resource(&u.name), amount, u64::from(limit)));
-        }
+        // Without a capacity of its own, the job is still counted: resource
+        // names are shared, and other jobs may have one.
+        let (amount, limit) = match u.capacity {
+            Some(limit) => (u.amount.min(limit), u64::from(limit)),
+            None => (u.amount, u64::MAX),
+        };
+        demands.push((Dim::Resource(&u.name), u64::from(amount), limit));
         if let (Some(limit), Some(checkout)) = (u.per_checkout, &job.checkout) {
             let amount = u64::from(u.amount.min(limit));
             demands.push((

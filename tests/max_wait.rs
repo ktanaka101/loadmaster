@@ -128,6 +128,18 @@ fn an_empty_max_wait_in_the_environment_means_no_limit() {
 }
 
 #[test]
+fn a_blank_max_wait_in_the_environment_means_no_limit_too() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let sandbox = sandbox(log.path());
+    let output = sandbox
+        .cmd(&["run", "test"])
+        .env("LOADMASTER_MAX_WAIT", "  ")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
 fn an_invalid_max_wait_in_the_environment_is_an_error() {
     let log = tempfile::NamedTempFile::new().unwrap();
     let sandbox = sandbox(log.path());

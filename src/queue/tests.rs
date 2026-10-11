@@ -212,6 +212,34 @@ fn parked_job_keeps_its_place_and_can_be_resumed() {
 }
 
 #[test]
+fn a_parked_job_is_resumed_only_with_the_same_demands() {
+    // Jobs behind may have started next to the parked job's set-aside; a
+    // re-run that needs more could then be delayed by them.
+    let f = fixture();
+    let parked = f.queue.enqueue(&request("e2e", 2, &[]), f.me).unwrap();
+    let parked_id = parked.id();
+    parked.park().unwrap();
+    let bigger = f.queue.enqueue(&request("e2e", 4, &[]), f.me).unwrap();
+    assert!(!bigger.resumed());
+    assert_ne!(bigger.id(), parked_id);
+    let uses = [db(1)];
+    let with_db = f
+        .queue
+        .enqueue(
+            &JobRequest {
+                uses: &uses,
+                ..request("e2e", 2, &[])
+            },
+            f.me,
+        )
+        .unwrap();
+    assert!(!with_db.resumed());
+    let same = f.queue.enqueue(&request("e2e", 2, &[]), f.me).unwrap();
+    assert!(same.resumed());
+    assert_eq!(same.id(), parked_id);
+}
+
+#[test]
 fn parked_head_blocks_until_it_expires() {
     let f = fixture();
     let parked = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
@@ -473,6 +501,21 @@ fn db(amount: u32) -> Use {
     }
 }
 
+fn capped_db(amount: u32) -> Use {
+    Use {
+        per_checkout: None,
+        ..db(amount)
+    }
+}
+
+/// `db` as declared by a repository that gives it no capacity.
+fn uncapped_db(amount: u32) -> Use {
+    Use {
+        capacity: None,
+        ..db(amount)
+    }
+}
+
 fn mem(amount: u32) -> Use {
     Use {
         name: "mem".into(),
@@ -588,6 +631,20 @@ fn an_amount_above_a_limit_takes_all_of_it() {
     ];
     assert!(admitted(&jobs, 1), "10 counts as the whole 6");
     assert!(!admitted(&jobs, 2));
+}
+
+#[test]
+fn a_job_without_a_capacity_still_counts_toward_others_limits() {
+    // Repositories may disagree: one declares `db` with capacity 2, another
+    // without one. The second one's runs still use a db.
+    let jobs = [
+        job(1, Running, 1, vec![uncapped_db(1)], "/a"),
+        job(2, Running, 1, vec![capped_db(1)], "/b"),
+        job(3, Waiting, 1, vec![capped_db(1)], "/c"),
+        job(4, Waiting, 1, vec![uncapped_db(1)], "/d"),
+    ];
+    assert!(!admitted(&jobs, 3), "2 of 2 in use");
+    assert!(!admitted(&jobs, 4), "job 3 is short of a db ahead of it");
 }
 
 #[test]
@@ -708,8 +765,13 @@ fn random_workload(rng: &mut Rng, jobs: usize, resources: bool) -> Vec<Arrival> 
         .map(|_| {
             at += rng.below(3);
             let mut uses = vec![];
-            if resources && rng.below(3) == 0 {
-                uses.push(db(1));
+            if resources {
+                // Some jobs record no machine-wide capacity for `db`.
+                match rng.below(6) {
+                    0 | 1 => uses.push(db(1)),
+                    2 => uses.push(uncapped_db(1)),
+                    _ => {}
+                }
             }
             if resources && rng.below(3) == 0 {
                 uses.push(mem(1 + rng.below(6)));

@@ -153,12 +153,16 @@ milliseconds, so it is accepted rather than paid for with a more complex wait.
 - The resume key is (caller's working directory, task name, extra arguments).
   The directory distinguishes worktrees; arguments distinguish, for example,
   test shards. The directory is stored and compared as raw bytes; a lossy
-  string could make two different directories look the same. The task's weight and command are taken from the current config
-  when resuming.
-- A parked job keeps blocking the head of the line, exactly like a waiting job.
-  If parked jobs let others pass, a big job whose waits keep timing out could
-  starve: small jobs would refill the capacity during each gap between its
-  attempts.
+  string could make two different directories look the same.
+- A re-run resumes the place only if it asks for exactly what the parked job
+  did: the same weight, resources and limits, from the same checkout. Jobs
+  behind may have started next to what the parked job set aside, and would
+  delay a re-run that needed more; one whose config changed in the meantime
+  gets in line again instead.
+- A parked job holds its place exactly like a waiting job: it sets aside what
+  it needs, or holds back what it is short of. If parked jobs let others pass
+  freely, a big job whose waits keep timing out could starve: small jobs would
+  refill the capacity during each gap between its attempts.
 - Parked jobs expire after 120 seconds. That comfortably covers an agent
   reading the exit code and re-running the command, while limiting how long an
   abandoned place can block the line.
@@ -214,10 +218,15 @@ resources.
   set per machine. A resource with no capacity anywhere is not limited
   machine-wide.
 - Resource names are shared by all repositories on the machine, like the
-  capacity.
+  capacity. A job that records no capacity for a resource still counts toward
+  it. When repositories disagree on a capacity, each job is admitted by its
+  own record (bounded by the jobs ahead of it), so set a capacity they should
+  all share in the machine config.
 - A per-checkout limit counts only jobs started from the same checkout: the
-  same `.loadmaster.toml`, compared as a resolved path. It describes the
-  project (one database per checkout), so the machine config cannot change it.
+  directory containing `.loadmaster.toml`, resolved, so a worktree whose
+  `.loadmaster.toml` is a symlink to another's file is still a checkout of its
+  own. It describes the project (one database per checkout), so the machine
+  config cannot change it.
 - An amount above a limit counts as the whole limit, like a weight above the
   capacity.
 - Each job records the limits it got in line with, and every process judges
@@ -241,8 +250,11 @@ resource of each checkout):
 A job behind can therefore start first only by using nothing the waiting job
 is short of and leaving it its share everywhere else, so no job is ever
 delayed by jobs that got in line after it. Every task uses CPU, so a job
-waiting for CPU still holds back everyone behind it: with CPU alone,
-admission is exactly what it was. Without the rule, a third e2e run waiting
+waiting for CPU still holds back everyone behind it: with CPU alone, no job
+starts while one ahead of it is short of CPU, as in the strict line of the
+first version. (One difference is for the better: a parked job that fits used
+to block everyone until it was resumed or expired, and now only sets aside its
+weight.) Without the rule, a third e2e run waiting
 for a database stack would hold up every lint behind it, though no lint needs
 a stack.
 
@@ -270,11 +282,10 @@ not every agent has them.
 
 - It accepts what a nested run accepts, a `LOADMASTER_HELD` that names a
   running job, and also requires that job to have been started from the same
-  checkout: the `.loadmaster.toml` found from the job's directory and the one
-  found from the current directory must be the same file once symlinks are
-  resolved. Otherwise a value that leaked into another worktree would pass.
-  The files are only located, not parsed, so a config edited while the job
-  runs makes no difference.
+  checkout, in the sense of per-checkout limits: the resolved directory of the
+  `.loadmaster.toml` found from the current directory. Otherwise a value that
+  leaked into another worktree would pass. The file is only located, not
+  parsed, so a config edited while the job runs makes no difference.
 - It does not check the task's name. A guarded script can be run by several
   tasks, and by a nested run, whose job is the outer task's. What such a
   script depends on is a resource: `--uses NAME` also requires the job to use
