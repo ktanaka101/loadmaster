@@ -36,7 +36,7 @@ port a checkout has.
 | Crash safety | Places and slots of killed processes are reclaimed automatically (PID plus start time, so reused PIDs don't fool it). A task keeps its slot while it runs, even if `loadmaster` itself is killed. |
 | Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. `loadmaster held` lets scripts refuse to run outside the queue, whatever the agent. Ready-made Claude Code settings: instructions, timeouts, permissions, a hook that blocks direct runs. |
 | Measuring | `loadmaster report` shows failures, timeouts, run and wait times and the cores each task really used; a measure-only mode records a baseline to compare with. See [Checking that it helps](#checking-that-it-helps). |
-| Platforms | macOS and Linux. Not Windows. |
+| Platforms | macOS and Linux. On Windows, WSL2 should work (it runs the Linux binary) but is not tested yet; native Windows is not supported. |
 | Integration cost | One binary, one `.loadmaster.toml` per repository, a few lines of agent instructions. Removing it means deleting those, `~/.local/state/loadmaster` and `~/.config/loadmaster`. |
 | Status | 0.2, new. Verified with tests, soak tests and real Claude Code sessions with biome, vitest and Playwright; see [Status](#status). |
 | License | MIT or Apache-2.0 |
@@ -60,7 +60,8 @@ Look elsewhere when:
   machine;
 - you need priorities, preemption, or limits based on measured CPU or memory:
   loadmaster uses static weights;
-- you need Windows.
+- you need native Windows (WSL2 should work, but is not tested yet; see
+  [Install](#install)).
 
 Not sure? Record a baseline first and compare; see
 [Checking that it helps](#checking-that-it-helps).
@@ -140,6 +141,11 @@ mise use -g github:ktanaka101/loadmaster
 Append `@0.2.0` to pin a version. Without mise, download the archive for your
 platform, such as `loadmaster-aarch64-apple-darwin.tar.gz`, and put the
 `loadmaster` binary it contains on your `PATH`.
+
+On Windows, use the Linux binary inside WSL2, and run the agents and their
+checks in the same WSL2 distribution: loadmaster only coordinates runs that
+share its state directory, so checks started on the Windows side, or in
+another distribution, are not seen. This has not been tested yet.
 
 To build from source instead (Rust 1.88 or later):
 
