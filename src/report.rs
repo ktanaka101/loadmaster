@@ -409,6 +409,9 @@ pub fn format_duration(d: Duration) -> String {
 
 /// Unix milliseconds as local time, `2026-10-11 09:12`.
 fn format_time(unix_ms: u64) -> String {
+    // libc deprecates `time_t` on musl ahead of a change in its size; this
+    // works with either size.
+    #[allow(deprecated)]
     let secs = libc::time_t::try_from(unix_ms / 1000).unwrap_or(libc::time_t::MAX);
     // SAFETY: an all-zero `tm` is a valid value to be overwritten.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
