@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use crate::config::{CapacitySource, REPO_CONFIG_FILE};
+use crate::config::REPO_CONFIG_FILE;
 use crate::queue::JobId;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -26,19 +26,6 @@ pub enum Error {
         name: String,
         path: PathBuf,
         available: Vec<(String, u32)>,
-    },
-
-    #[error(
-        "task `{task}` has weight {weight}, but this machine's capacity is {capacity} ({capacity_source}), so it could never start\n\
-         lower the weight in {}, or raise `capacity` in the machine config",
-        path.display()
-    )]
-    WeightExceedsCapacity {
-        task: String,
-        weight: u32,
-        capacity: u32,
-        capacity_source: CapacitySource,
-        path: PathBuf,
     },
 
     #[error(

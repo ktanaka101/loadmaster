@@ -135,15 +135,23 @@ fn run(args: RunArgs) -> Result<i32> {
     }
 
     let machine = MachineConfig::load()?;
+    // Weights belong to the repository and the capacity to the machine, so a
+    // weight can exceed a small machine's capacity: the task then takes all
+    // of it.
     if task.weight > machine.capacity {
-        return Err(Error::WeightExceedsCapacity {
-            task: task.name.clone(),
-            weight: task.weight,
-            capacity: machine.capacity,
-            capacity_source: machine.capacity_source,
-            path: repo.path().to_owned(),
-        });
+        say!(
+            "loadmaster: `{}` has weight {}, above this machine's capacity of {} ({}); \
+             it runs alone",
+            task.name,
+            task.weight,
+            machine.capacity,
+            machine.capacity_source
+        );
     }
+    let task = &Task {
+        weight: task.weight.min(machine.capacity),
+        ..task.clone()
+    };
 
     let signals = Signals::install().map_err(|e| Error::io("cannot install signal handlers", e))?;
     let state_dir = open_state_dir()?;

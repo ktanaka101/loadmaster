@@ -91,3 +91,38 @@ fn concurrent_weight_never_exceeds_capacity() {
     );
     assert!(sandbox.snapshot().jobs.is_empty());
 }
+
+#[test]
+fn a_weight_above_the_capacity_runs_alone() {
+    // Weights are committed with the repository, the capacity belongs to the
+    // machine: on a smaller machine the task still runs, taking all of it.
+    let sandbox = Sandbox::new(4, "");
+    let tasks = sh_task("hold", 1, &sandbox.hold_script("hold"))
+        + &sh_task("big", 8, "echo \"weight=$LOADMASTER_WEIGHT\"");
+    std::fs::write(sandbox.repo.join(".loadmaster.toml"), tasks).unwrap();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+
+    let mut big = sandbox
+        .cmd(&["run", "big"])
+        .stdout(std::fs::File::create(sandbox.path("big.out")).unwrap())
+        .stderr(std::fs::File::create(sandbox.path("big.err")).unwrap())
+        .spawn()
+        .unwrap();
+    wait_until("big to wait for the whole capacity", || {
+        sandbox
+            .job("big")
+            .is_some_and(|j| j.state == loadmaster::queue::JobState::Waiting)
+    });
+    assert_eq!(sandbox.job("big").unwrap().weight, 4);
+
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+    assert!(wait(&mut big).success(), "{}", sandbox.read("big.err"));
+    assert_eq!(sandbox.read("big.out"), "weight=4\n");
+    let err = sandbox.read("big.err");
+    assert!(
+        err.contains("`big` has weight 8, above this machine's capacity of 4"),
+        "{err}"
+    );
+}

@@ -350,8 +350,11 @@ one with outcome `lost`.
   the task runs, they are forwarded to the task's process group, and
   loadmaster waits for the task to exit before freeing the slot. Signals that
   were ignored when loadmaster started (as under `nohup`) stay ignored.
-- **Unknown tasks, weights above the capacity and broken config files** fail
-  immediately instead of waiting.
+- **Unknown tasks and broken config files** fail immediately instead of
+  waiting.
+- **A weight above the capacity** counts as the whole capacity: the task runs
+  alone, with a note on stderr. Weights are committed with the repository, so
+  this keeps them usable on a smaller machine, such as a CI runner.
 
 ### Nested runs
 
@@ -428,7 +431,7 @@ stop a running job, signal its task's process group, e.g. `kill -TERM -12346`.
 | task's code | The task ran and exited normally. |
 | 128 + n | The task was killed by signal n, or loadmaster was interrupted by signal n while waiting. |
 | 75 | `--max-wait` elapsed. The job keeps its place in line; run the same command again to resume. |
-| 125 | loadmaster itself failed: unknown task, weight above capacity, invalid config, invalid `LOADMASTER_HELD`, bad arguments. |
+| 125 | loadmaster itself failed: unknown task, invalid config, invalid `LOADMASTER_HELD` or `LOADMASTER_MAX_WAIT`, bad arguments. |
 | 126 | The task's program could not be executed. |
 | 127 | The task's program was not found. |
 

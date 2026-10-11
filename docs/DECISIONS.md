@@ -263,6 +263,14 @@ transaction would remove this cost; it is left out until it matters.
   4294967295` cannot overflow the admission check.
 - Nested runs skip the capacity check and inherit the holder's
   `LOADMASTER_WEIGHT`: they run inside the holder's slot.
+- A weight above the capacity counts as the whole capacity, and the task runs
+  alone. Weights are committed with the repository while the capacity belongs
+  to each machine, so a repository's weights have to work on smaller machines
+  too (a CI runner, a laptop); rejecting them, as the first version did, made
+  the shared config unusable there. A note on stderr still points out a typo
+  such as `weight = 80`. The capped weight is what the job records, what
+  `LOADMASTER_WEIGHT` says and what the history log shows: it is the slot the
+  task really held.
 
 ## History log
 
@@ -307,8 +315,8 @@ so users need a way to find out from their own use.
   queue (and in `status`) and logged. This gives a baseline that differs from
   admission in one thing only, with the same agent instructions, permissions
   and hooks. Simply not using loadmaster would leave nothing to compare with.
-  A weight above the capacity is still an error, so both periods run with the
-  same configuration.
+  Weights above the capacity are capped the same way in both modes, so both
+  periods run with the same configuration.
 - **A check is one request.** A re-run after exit code 75 resumes the same job,
   so `report` joins all records of a job ID until one ends in something other
   than `gave_up`. Its wait runs from the first time it got in line to the
