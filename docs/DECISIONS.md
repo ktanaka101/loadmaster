@@ -348,7 +348,11 @@ not every agent has them.
   default place means all defaults. A typo in the variable would otherwise
   give one process the default capacity while the others use the configured
   one. For the same reason the variable is passed on to tasks only when it
-  was set: the default place is the same from anywhere.
+  was set: the default place is the same from anywhere. A task that changes
+  `XDG_CONFIG_HOME` or `HOME` therefore changes it for the loadmaster
+  commands it runs, which is what it asked for; forcing the parent's file on
+  them would undo that. No accounting depends on it: a nested run is judged
+  by the terms its holder recorded, not by the machine config.
 - The state directory is created with mode 0700: it holds command lines and
   paths.
 

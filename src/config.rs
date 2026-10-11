@@ -310,15 +310,21 @@ struct MachineFile {
 }
 
 impl MachineConfig {
-    /// Loads the machine config from its standard location.
-    /// A file named by LOADMASTER_CONFIG must exist: a typo there would
-    /// otherwise give this process the defaults while others use the file.
+    /// Loads the machine config from its standard location. A file named by
+    /// LOADMASTER_CONFIG must exist: a typo there would otherwise give this
+    /// process the defaults while others use the file. Judged by reading
+    /// it, so a file removed in between is not mistaken for no file.
     pub fn load() -> Result<MachineConfig> {
-        let path = machine_config_path()?;
-        if machine_config_override()?.is_some() && !path.exists() {
-            return Err(Error::MissingMachineConfig { path });
+        let Some(path) = machine_config_override()? else {
+            return Self::load_from(&machine_config_path()?);
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::parse(&path, &text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(Error::MissingMachineConfig { path })
+            }
+            Err(source) => Err(Error::ReadConfig { path, source }),
         }
-        Self::load_from(&path)
     }
 
     /// Loads the machine config; a missing file means all defaults.
