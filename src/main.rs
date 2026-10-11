@@ -18,7 +18,7 @@ use loadmaster::config::{self, MachineConfig, RepoConfig, Task};
 use loadmaster::history::{self, HISTORY_FILE, Outcome, Record};
 use loadmaster::process::{self, ProcessId};
 use loadmaster::queue::{
-    Admission, Job, JobId, JobRequest, JobState, PARK_TTL, Queue, STATE_DB_FILE, Ticket,
+    Admission, Job, JobId, JobRequest, JobState, PARK_TTL, Queue, STATE_DB_FILE, Ticket, Use,
 };
 use loadmaster::report::{self, format_duration};
 use loadmaster::runner::{self, HELD_ENV, Signals, SpawnError, WEIGHT_ENV};
@@ -70,7 +70,14 @@ enum Cmd {
     Report(ReportArgs),
     /// Exit 0 if this process runs inside a loadmaster job started from this
     /// checkout, 1 if not; for scripts that must only run through the queue
-    Held,
+    Held(HeldArgs),
+}
+
+#[derive(Args)]
+struct HeldArgs {
+    /// Also require the job to use this resource; can be repeated
+    #[arg(long = "uses", value_name = "RESOURCE")]
+    uses: Vec<String>,
 }
 
 #[derive(Args)]
@@ -111,7 +118,7 @@ fn main() {
         Cmd::Status => status(),
         Cmd::Clean => clean(),
         Cmd::Report(args) => report(args),
-        Cmd::Held => held(),
+        Cmd::Held(args) => held(args),
     };
     let code = result.unwrap_or_else(|e| {
         say!("loadmaster: error: {e}");
@@ -152,6 +159,9 @@ fn run(args: RunArgs) -> Result<i32> {
         weight: task.weight.min(machine.capacity),
         ..task.clone()
     };
+    let uses = resource_uses(&repo, task, &machine);
+    // Resolved, so every worktree path that leads here is one checkout.
+    let checkout = fs::canonicalize(repo.dir()).unwrap_or_else(|_| repo.dir().to_owned());
 
     let signals = Signals::install().map_err(|e| Error::io("cannot install signal handlers", e))?;
     let state_dir = open_state_dir()?;
@@ -166,6 +176,8 @@ fn run(args: RunArgs) -> Result<i32> {
         command: &display,
         capacity: machine.capacity,
         measure_only: machine.measure_only,
+        uses: &uses,
+        checkout: &checkout,
     };
     // Both clocks start here, so wait times include getting in line.
     let (queued_at, wait_started) = (SystemTime::now(), Instant::now());
@@ -247,6 +259,37 @@ fn run(args: RunArgs) -> Result<i32> {
     result
 }
 
+/// What `task` uses, with this machine's limits: the machine config's
+/// capacity, else the repository's. Like a weight above the capacity, an
+/// amount above a limit takes all of it.
+fn resource_uses(repo: &RepoConfig, task: &Task, machine: &MachineConfig) -> Vec<Use> {
+    task.uses
+        .iter()
+        .map(|(name, &amount)| {
+            let declared = repo.resource(name).cloned().unwrap_or_default();
+            let capacity = machine.resources.get(name).copied().or(declared.capacity);
+            for (limit, what) in [
+                (capacity, "capacity"),
+                (declared.per_checkout, "per-checkout limit"),
+            ] {
+                if let Some(limit) = limit.filter(|&limit| amount > limit) {
+                    say!(
+                        "loadmaster: `{}` uses {amount} of `{name}`, above its {what} of \
+                         {limit}; it takes all of it",
+                        task.name
+                    );
+                }
+            }
+            Use {
+                name: name.clone(),
+                amount,
+                capacity,
+                per_checkout: declared.per_checkout,
+            }
+        })
+        .collect()
+}
+
 enum Turn {
     Admitted,
     GaveUp { ahead: u32, used: u64 },
@@ -277,7 +320,11 @@ fn wait_turn(
                 }
                 return Ok(Turn::Admitted);
             }
-            Admission::Waiting { ahead, used } => {
+            Admission::Waiting {
+                ahead,
+                used,
+                waiting_for,
+            } => {
                 if max_wait.is_some_and(|max| started.elapsed() >= max) {
                     // A signal that arrived meanwhile wins: leave the line
                     // instead of parking.
@@ -287,8 +334,13 @@ fn wait_turn(
                     return Ok(Turn::GaveUp { ahead, used });
                 }
                 if last_report.is_none_or(|at| at.elapsed() >= REPORT_INTERVAL) {
+                    let resources = if waiting_for.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; waiting for {}", waiting_for.join(", "))
+                    };
                     say!(
-                        "loadmaster: waiting to run `{}` (weight {}): {}, {used}/{capacity} in use",
+                        "loadmaster: waiting to run `{}` (weight {}): {}, {used}/{capacity} in use{resources}",
                         task.name,
                         task.weight,
                         format_ahead(ahead),
@@ -393,7 +445,7 @@ fn run_nested(held: &OsStr, mut command: Command) -> Result<i32> {
 /// Whether this process runs inside a job started from this checkout: the
 /// check made for nested runs, plus the checkout. Silent when it does, so a
 /// script can use it as a guard.
-fn held() -> Result<i32> {
+fn held(args: HeldArgs) -> Result<i32> {
     let cwd = env::current_dir().map_err(|e| Error::io("cannot read the current directory", e))?;
     let checkout =
         RepoConfig::find(&cwd).ok_or_else(|| Error::RepoConfigNotFound { start: cwd.clone() })?;
@@ -428,6 +480,16 @@ fn held() -> Result<i32> {
             job.id,
             job.task,
             job.dir.display()
+        ));
+    }
+    if let Some(missing) = args
+        .uses
+        .iter()
+        .find(|name| !job.uses.iter().any(|u| &u.name == *name))
+    {
+        return not_held(format!(
+            "job #{} (`{}`) does not use `{missing}`",
+            job.id, job.task
         ));
     }
     Ok(0)
@@ -469,6 +531,7 @@ fn status() -> Result<i32> {
         machine.capacity,
         machine.capacity_source
     );
+    out += &resources_in_use(&snapshot.jobs, &machine);
     if machine.measure_only {
         out += "measure-only: jobs start at once and are only recorded (see `loadmaster report`)\n";
     }
@@ -488,14 +551,44 @@ fn status() -> Result<i32> {
     Ok(0)
 }
 
+/// One line per machine-wide resource that any job uses: how much running
+/// jobs use, against the machine config's capacity, else the one jobs
+/// recorded.
+fn resources_in_use(jobs: &[Job], machine: &MachineConfig) -> String {
+    let mut resources: std::collections::BTreeMap<&str, (u64, Option<u32>)> =
+        std::collections::BTreeMap::new();
+    for job in jobs {
+        for u in &job.uses {
+            let entry = resources
+                .entry(&u.name)
+                .or_insert((0, machine.resources.get(&u.name).copied()));
+            entry.1 = entry.1.or(u.capacity);
+            if job.state == JobState::Running {
+                entry.0 += u64::from(u.capacity.map_or(u.amount, |c| u.amount.min(c)));
+            }
+        }
+    }
+    resources
+        .into_iter()
+        .map(|(name, (used, capacity))| match capacity {
+            Some(capacity) => format!("{name}: {used}/{capacity} in use\n"),
+            None => format!("{name}: {used} in use (no capacity set)\n"),
+        })
+        .collect()
+}
+
 fn jobs_table(jobs: &[Job]) -> String {
     let now = SystemTime::now();
     let since = |t: Option<SystemTime>| {
         t.and_then(|t| now.duration_since(t).ok())
             .map_or_else(|| "-".to_owned(), format_duration)
     };
-    let mut rows =
-        vec![["ID", "STATE", "TASK", "WEIGHT", "PID", "PGID", "FOR", "DIR"].map(String::from)];
+    let mut rows = vec![
+        [
+            "ID", "STATE", "TASK", "WEIGHT", "USES", "PID", "PGID", "FOR", "DIR",
+        ]
+        .map(String::from),
+    ];
     let (mut orphaned, mut parked) = (false, false);
     for job in jobs {
         let (state, at) = match job.state {
@@ -515,6 +608,15 @@ fn jobs_table(jobs: &[Job]) -> String {
             state.to_owned(),
             job.task.clone(),
             job.weight.to_string(),
+            if job.uses.is_empty() {
+                "-".to_owned()
+            } else {
+                job.uses
+                    .iter()
+                    .map(|u| format!("{}={}", u.name, u.amount))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
             job.owner.map_or("-".to_owned(), |o| o.pid.to_string()),
             job.child.map_or("-".to_owned(), |c| c.pgid.to_string()),
             since(at),

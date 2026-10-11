@@ -1,8 +1,9 @@
 //! Configuration, split in two layers:
 //!
-//! - **Repository** (`.loadmaster.toml`, committed): tasks and their weights.
+//! - **Repository** (`.loadmaster.toml`, committed): tasks, their weights and
+//!   the resources they use.
 //! - **Machine** (`~/.config/loadmaster/config.toml`): the capacity shared by
-//!   every repository and worktree on this machine.
+//!   every repository and worktree on this machine, and resource capacities.
 //!
 //! Weights are measured in "roughly how many CPU cores the task keeps busy",
 //! so that tasks from different repositories draw from the same budget.
@@ -31,8 +32,20 @@ const RESERVED_CORES: u32 = 2;
 pub struct Task {
     pub name: String,
     pub weight: u32,
+    /// Resources the task uses, by name, all declared in the same file.
+    pub uses: BTreeMap<String, u32>,
     /// Program and arguments. Never empty.
     pub cmd: Vec<String>,
+}
+
+/// A resource declared under `[resources.NAME]` in `.loadmaster.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resource {
+    /// The machine-wide capacity, unless the machine config sets one.
+    pub capacity: Option<u32>,
+    /// At most this much is used at once by jobs from one checkout.
+    pub per_checkout: Option<u32>,
 }
 
 /// A parsed `.loadmaster.toml`.
@@ -40,6 +53,7 @@ pub struct Task {
 pub struct RepoConfig {
     path: PathBuf,
     tasks: BTreeMap<String, Task>,
+    resources: BTreeMap<String, Resource>,
 }
 
 #[derive(Deserialize)]
@@ -47,12 +61,16 @@ pub struct RepoConfig {
 struct RepoFile {
     #[serde(default)]
     tasks: BTreeMap<String, TaskFile>,
+    #[serde(default)]
+    resources: BTreeMap<String, Resource>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskFile {
     weight: u32,
+    #[serde(default)]
+    uses: BTreeMap<String, u32>,
     cmd: toml::Value,
 }
 
@@ -90,18 +108,36 @@ impl RepoConfig {
             message,
         };
         let file: RepoFile = toml::from_str(text).map_err(|e| invalid(e.to_string()))?;
+        for (name, resource) in &file.resources {
+            for (key, limit) in [
+                ("capacity", resource.capacity),
+                ("per_checkout", resource.per_checkout),
+            ] {
+                if limit == Some(0) {
+                    return Err(invalid(format!(
+                        "resource `{name}`: {key} must be at least 1"
+                    )));
+                }
+            }
+        }
         let tasks = file
             .tasks
             .into_iter()
             .map(|(name, def)| {
-                let task = Task::validate(name, def).map_err(invalid)?;
+                let task = Task::validate(name, def, &file.resources).map_err(invalid)?;
                 Ok((task.name.clone(), task))
             })
             .collect::<Result<_>>()?;
         Ok(RepoConfig {
             path: path.to_owned(),
             tasks,
+            resources: file.resources,
         })
+    }
+
+    /// The resource declared as `name`, if any.
+    pub fn resource(&self, name: &str) -> Option<&Resource> {
+        self.resources.get(name)
     }
 
     pub fn path(&self) -> &Path {
@@ -127,9 +163,27 @@ impl RepoConfig {
 }
 
 impl Task {
-    fn validate(name: String, def: TaskFile) -> std::result::Result<Task, String> {
+    fn validate(
+        name: String,
+        def: TaskFile,
+        resources: &BTreeMap<String, Resource>,
+    ) -> std::result::Result<Task, String> {
         if def.weight == 0 {
             return Err(format!("task `{name}`: weight must be at least 1"));
+        }
+        if let Some(undeclared) = def.uses.keys().find(|r| !resources.contains_key(*r)) {
+            let declared = if resources.is_empty() {
+                "none".to_owned()
+            } else {
+                resources.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            return Err(format!(
+                "task `{name}` uses `{undeclared}`, which is not declared under [resources] \
+                 (declared: {declared})"
+            ));
+        }
+        if def.uses.values().any(|&amount| amount == 0) {
+            return Err(format!("task `{name}`: `uses` amounts must be at least 1"));
         }
         let cmd_hint = "e.g. cmd = [\"npx\", \"vitest\", \"run\"]; \
                         use [\"sh\", \"-c\", \"...\"] if you need shell syntax";
@@ -164,6 +218,7 @@ impl Task {
         Ok(Task {
             name,
             weight: def.weight,
+            uses: def.uses,
             cmd,
         })
     }
@@ -195,6 +250,8 @@ pub struct MachineConfig {
     /// Admit every job at once and only record it: a baseline to compare
     /// against (see `loadmaster report`).
     pub measure_only: bool,
+    /// Resource capacities, overriding the repositories' defaults.
+    pub resources: BTreeMap<String, u32>,
 }
 
 #[derive(Deserialize)]
@@ -203,6 +260,8 @@ struct MachineFile {
     capacity: Option<u32>,
     #[serde(default)]
     measure_only: bool,
+    #[serde(default)]
+    resources: BTreeMap<String, u32>,
 }
 
 impl MachineConfig {
@@ -229,6 +288,11 @@ impl MachineConfig {
             message,
         };
         let file: MachineFile = toml::from_str(text).map_err(|e| invalid(e.to_string()))?;
+        if let Some((name, _)) = file.resources.iter().find(|(_, c)| **c == 0) {
+            return Err(invalid(format!(
+                "resource `{name}`: capacity must be at least 1"
+            )));
+        }
         let (capacity, capacity_source) = match file.capacity {
             Some(0) => return Err(invalid("capacity must be at least 1".to_owned())),
             Some(capacity) => (capacity, CapacitySource::File(path.to_owned())),
@@ -245,6 +309,7 @@ impl MachineConfig {
             capacity,
             capacity_source,
             measure_only: file.measure_only,
+            resources: file.resources,
         })
     }
 }
@@ -319,6 +384,7 @@ mod tests {
             &Task {
                 name: "test".into(),
                 weight: 4,
+                uses: BTreeMap::new(),
                 cmd: vec!["npx".into(), "vitest".into(), "run".into()],
             }
         );
@@ -447,9 +513,97 @@ mod tests {
             ("capacity = \"8\"\n", "invalid type"),
             ("capasity = 8\n", "unknown field `capasity`"),
             ("measure_only = \"yes\"\n", "invalid type"),
+            (
+                "[resources]\nmemory = 0\n",
+                "resource `memory`: capacity must be at least 1",
+            ),
+            ("[resources]\nmemory = \"40\"\n", "invalid type"),
         ] {
             let msg = message(MachineConfig::parse(Path::new("/m.toml"), text).unwrap_err());
             assert!(msg.contains(expected), "{text:?}: {msg}");
         }
+    }
+
+    #[test]
+    fn parses_resources_and_what_tasks_use() {
+        let config = parse(
+            r#"
+            [resources.db]
+            capacity = 2
+            per_checkout = 1
+
+            [resources.memory]
+
+            [tasks.e2e]
+            weight = 2
+            uses = { db = 1, memory = 4 }
+            cmd = ["npx", "playwright", "test"]
+
+            [tasks.lint]
+            weight = 1
+            cmd = ["npx", "biome", "check"]
+            "#,
+        )
+        .unwrap();
+        let e2e = config.task("e2e").unwrap();
+        assert_eq!(
+            e2e.uses,
+            BTreeMap::from([("db".to_owned(), 1), ("memory".to_owned(), 4)])
+        );
+        assert!(config.task("lint").unwrap().uses.is_empty());
+        assert_eq!(
+            config.resource("db"),
+            Some(&Resource {
+                capacity: Some(2),
+                per_checkout: Some(1),
+            })
+        );
+        assert_eq!(config.resource("memory"), Some(&Resource::default()));
+        assert_eq!(config.resource("gpu"), None);
+    }
+
+    #[test]
+    fn rejects_bad_resources() {
+        let task = |uses: &str| format!("[tasks.t]\nweight = 1\nuses = {uses}\ncmd = [\"x\"]\n");
+        for (text, expected) in [
+            (
+                "[resources.db]\n".to_owned() + &task("{ dbb = 1 }"),
+                "task `t` uses `dbb`, which is not declared under [resources] (declared: db)",
+            ),
+            (
+                task("{ db = 1 }"),
+                "task `t` uses `db`, which is not declared under [resources] (declared: none)",
+            ),
+            (
+                "[resources.db]\n".to_owned() + &task("{ db = 0 }"),
+                "task `t`: `uses` amounts must be at least 1",
+            ),
+            (
+                "[resources.db]\ncapacity = 0\n".to_owned(),
+                "resource `db`: capacity must be at least 1",
+            ),
+            (
+                "[resources.db]\nper_checkout = 0\n".to_owned(),
+                "resource `db`: per_checkout must be at least 1",
+            ),
+            (
+                "[resources.db]\ncapacty = 2\n".to_owned(),
+                "unknown field `capacty`",
+            ),
+        ] {
+            let msg = message(parse(&text).unwrap_err());
+            assert!(msg.contains(expected), "{text:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn machine_resources() {
+        let path = Path::new("/m.toml");
+        let config = MachineConfig::parse(path, "[resources]\nmemory = 40\ndb = 3\n").unwrap();
+        assert_eq!(
+            config.resources,
+            BTreeMap::from([("db".to_owned(), 3), ("memory".to_owned(), 40)])
+        );
+        assert!(MachineConfig::parse(path, "").unwrap().resources.is_empty());
     }
 }

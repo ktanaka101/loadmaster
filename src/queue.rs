@@ -1,8 +1,13 @@
 //! The machine-wide job queue, kept in SQLite.
 //!
-//! **Admission rule.** A job starts only when it is at the head of the line
-//! *and* `used + weight <= capacity`. The line is strictly FIFO: a small job
-//! never overtakes a big one waiting at the head, so big jobs cannot starve.
+//! **Admission rule.** Jobs are considered in line order, on every dimension
+//! at once: CPU (the weight), each machine-wide resource and each per-checkout
+//! resource. A job starts if it fits in what running jobs use plus what is set
+//! aside for the jobs ahead of it. A job that does not fit sets aside its
+//! amount where it fits and holds back entirely the dimensions it is short
+//! of, so no job is ever delayed by jobs that got in line after it. Every job
+//! uses CPU, so with CPU alone this is a strictly FIFO line: a small job never
+//! overtakes a big one waiting at the head, and big jobs cannot starve.
 //!
 //! **Ordering.** Arrival order is the `INTEGER PRIMARY KEY` assigned inside a
 //! `BEGIN IMMEDIATE` transaction, so it always matches the order in which the
@@ -19,6 +24,7 @@
 //! A reaped job whose loadmaster process was killed never wrote its history
 //! record, so the reaper writes one for it (outcome `lost`).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -26,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::history::{self, Outcome, Record};
@@ -42,10 +49,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a parked job keeps its place in line without an owner.
 pub const PARK_TTL: Duration = Duration::from_secs(120);
 
-const SCHEMA_VERSION: i64 = 2;
-
 // AUTOINCREMENT: IDs are never reused, so a stale LOADMASTER_HELD can never
-// point at an unrelated newer job.
+// point at an unrelated newer job. This is version 1; a new database is
+// created from it and brought up to date by every migration in turn.
 const SCHEMA: &str = "
 CREATE TABLE jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,17 +67,21 @@ CREATE TABLE jobs (
     child_start INTEGER,
     enqueued_at INTEGER NOT NULL,
     parked_at   INTEGER,
-    started_at  INTEGER,
-    capacity     INTEGER,
-    measure_only INTEGER NOT NULL DEFAULT 0
+    started_at  INTEGER
 );
 ";
 
-/// From version 1, which did not record the machine setting of each job.
-const MIGRATE_FROM_1: &str = "
-ALTER TABLE jobs ADD COLUMN capacity INTEGER;
-ALTER TABLE jobs ADD COLUMN measure_only INTEGER NOT NULL DEFAULT 0;
-";
+/// `MIGRATIONS[n - 1]` upgrades version `n` to `n + 1`.
+const MIGRATIONS: [&str; 2] = [
+    // The machine setting of each job, so a lost job can still be logged.
+    "ALTER TABLE jobs ADD COLUMN capacity INTEGER;
+     ALTER TABLE jobs ADD COLUMN measure_only INTEGER NOT NULL DEFAULT 0;",
+    // Resources: what each job uses, and the checkout it was started from.
+    "ALTER TABLE jobs ADD COLUMN checkout BLOB;
+     ALTER TABLE jobs ADD COLUMN uses TEXT NOT NULL DEFAULT '[]';",
+];
+
+const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64 + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
@@ -119,6 +129,26 @@ pub struct Job {
     /// queued before it was recorded).
     pub capacity: Option<u32>,
     pub measure_only: bool,
+    /// Resources the job uses, with the limits it got in line with.
+    pub uses: Vec<Use>,
+    /// The resolved directory of the `.loadmaster.toml` the job was started
+    /// from (unknown for jobs queued before it was recorded).
+    pub checkout: Option<PathBuf>,
+}
+
+/// A resource a job uses, and the limits it got in line with: every process
+/// judges a job by these, whatever its own config says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Use {
+    pub name: String,
+    pub amount: u32,
+    /// Machine-wide capacity; `None` if the resource is not limited
+    /// machine-wide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u32>,
+    /// Limit for the jobs of one checkout, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_checkout: Option<u32>,
 }
 
 impl Job {
@@ -166,9 +196,12 @@ pub struct JobRequest<'a> {
     /// The machine setting, kept so a lost job can still be logged.
     pub capacity: u32,
     pub measure_only: bool,
+    pub uses: &'a [Use],
+    /// The resolved directory of the `.loadmaster.toml` in use.
+    pub checkout: &'a Path,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
     Admitted,
     Waiting {
@@ -176,6 +209,8 @@ pub enum Admission {
         ahead: u32,
         /// Weight currently running.
         used: u64,
+        /// Resources other than CPU that the job waits for.
+        waiting_for: Vec<String>,
     },
 }
 
@@ -231,19 +266,20 @@ impl Queue {
         }
         let tx = self.begin()?;
         let found: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if found == 0 {
-            tx.execute_batch(SCHEMA)?;
-            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
-        } else if found == 1 {
-            tx.execute_batch(MIGRATE_FROM_1)?;
-            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
-        } else if found != SCHEMA_VERSION {
+        if !(0..=SCHEMA_VERSION).contains(&found) {
             return Err(Error::SchemaVersion {
                 path: self.path.clone(),
                 found,
                 expected: SCHEMA_VERSION,
             });
         }
+        if found == 0 {
+            tx.execute_batch(SCHEMA)?;
+        }
+        for migration in &MIGRATIONS[found.max(1) as usize - 1..] {
+            tx.execute_batch(migration)?;
+        }
+        tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         tx.commit()?;
         Ok(())
     }
@@ -305,7 +341,9 @@ impl Queue {
     pub fn enqueue(&self, request: &JobRequest, owner: ProcessId) -> Result<Ticket<'_>> {
         // Raw bytes: a lossy string could make two directories look equal.
         let dir = request.dir.as_os_str().as_bytes();
+        let checkout = request.checkout.as_os_str().as_bytes();
         let args = serde_json::to_string(request.args).expect("strings always serialize");
+        let uses = serde_json::to_string(request.uses).expect("uses always serialize");
         let ((id, resumed), _) = self.write(|tx| {
             let parked: Option<JobId> = tx
                 .query_row(
@@ -321,7 +359,7 @@ impl Queue {
                     tx.execute(
                         "UPDATE jobs SET state = 'waiting', weight = ?2, command = ?3,
                          owner_pid = ?4, owner_start = ?5, parked_at = NULL,
-                         capacity = ?6, measure_only = ?7
+                         capacity = ?6, measure_only = ?7, checkout = ?8, uses = ?9
                      WHERE id = ?1",
                         params![
                             id,
@@ -330,7 +368,9 @@ impl Queue {
                             owner.pid,
                             owner.start_time as i64,
                             request.capacity,
-                            request.measure_only
+                            request.measure_only,
+                            checkout,
+                            uses
                         ],
                     )?;
                     (id, true)
@@ -339,8 +379,8 @@ impl Queue {
                     tx.execute(
                         "INSERT INTO jobs (task, weight, state, dir, args, command,
                                        owner_pid, owner_start, enqueued_at,
-                                       capacity, measure_only)
-                     VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                       capacity, measure_only, checkout, uses)
+                     VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                         params![
                             request.task,
                             request.weight,
@@ -351,7 +391,9 @@ impl Queue {
                             owner.start_time as i64,
                             unix_ms(SystemTime::now()),
                             request.capacity,
-                            request.measure_only
+                            request.measure_only,
+                            checkout,
+                            uses
                         ],
                     )?;
                     (tx.last_insert_rowid(), false)
@@ -547,8 +589,40 @@ fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
     }
 }
 
-/// The admission rule: job `id` may start if it is at the head of the line
-/// and fits in what is left of `capacity`.
+/// A dimension of the admission check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Dim<'a> {
+    Cpu,
+    Resource(&'a str),
+    PerCheckout(&'a str, &'a Path),
+}
+
+/// What `job` needs on each dimension, and the limit it got in line with.
+/// Amounts above a limit count as the whole limit. `capacity` stands in for
+/// a CPU capacity the job did not record.
+fn demands(job: &Job, capacity: u32) -> Vec<(Dim<'_>, u64, u64)> {
+    let cpu = job.capacity.unwrap_or(capacity);
+    let mut demands = vec![(Dim::Cpu, u64::from(job.weight.min(cpu)), u64::from(cpu))];
+    for u in &job.uses {
+        if let Some(limit) = u.capacity {
+            let amount = u64::from(u.amount.min(limit));
+            demands.push((Dim::Resource(&u.name), amount, u64::from(limit)));
+        }
+        if let (Some(limit), Some(checkout)) = (u.per_checkout, &job.checkout) {
+            let amount = u64::from(u.amount.min(limit));
+            demands.push((
+                Dim::PerCheckout(&u.name, checkout),
+                amount,
+                u64::from(limit),
+            ));
+        }
+    }
+    demands
+}
+
+/// The admission rule (see the module docs): whether job `id` may start.
+/// `capacity` is this process's CPU capacity, for jobs that did not record
+/// theirs.
 fn decide(jobs: &[Job], id: JobId, capacity: u32) -> Result<Admission> {
     let me = jobs
         .iter()
@@ -557,24 +631,63 @@ fn decide(jobs: &[Job], id: JobId, capacity: u32) -> Result<Admission> {
     if me.state == JobState::Running {
         return Ok(Admission::Admitted);
     }
-    // A sum of u32 weights cannot overflow u64.
-    let used: u64 = jobs
-        .iter()
-        .filter(|job| job.state == JobState::Running)
-        .map(|job| u64::from(job.weight))
-        .sum();
-    let ahead = jobs
-        .iter()
-        .filter(|job| job.state != JobState::Running && job.id < id)
-        .count();
-    let ahead = u32::try_from(ahead).unwrap_or(u32::MAX);
-    Ok(
-        if ahead == 0 && used + u64::from(me.weight) <= u64::from(capacity) {
-            Admission::Admitted
-        } else {
-            Admission::Waiting { ahead, used }
-        },
-    )
+    // Sums of u32 amounts cannot overflow u64.
+    let mut used: BTreeMap<Dim, u64> = BTreeMap::new();
+    for job in jobs.iter().filter(|job| job.state == JobState::Running) {
+        for (dim, amount, _) in demands(job, capacity) {
+            *used.entry(dim).or_default() += amount;
+        }
+    }
+    // For the jobs ahead: what they set aside and the smallest limit among
+    // them (processes may disagree on a limit), and what they are short of.
+    let mut set_aside: BTreeMap<Dim, (u64, u64)> = BTreeMap::new();
+    let mut short: BTreeSet<Dim> = BTreeSet::new();
+    let mut ahead = 0u32;
+    for job in jobs.iter().filter(|job| job.state != JobState::Running) {
+        let demands = demands(job, capacity);
+        let fits: Vec<bool> = demands
+            .iter()
+            .map(|&(dim, amount, limit)| {
+                let (reserved, reserved_limit) = set_aside.get(&dim).copied().unwrap_or((0, limit));
+                !short.contains(&dim)
+                    && used.get(&dim).copied().unwrap_or(0) + reserved + amount
+                        <= limit.min(reserved_limit)
+            })
+            .collect();
+        let fits_all = fits.iter().all(|&fits| fits);
+        if job.id == id {
+            if fits_all {
+                return Ok(Admission::Admitted);
+            }
+            let mut waiting_for: Vec<String> = demands
+                .iter()
+                .zip(&fits)
+                .filter_map(|(&(dim, ..), &fits)| match dim {
+                    Dim::Resource(name) | Dim::PerCheckout(name, _) if !fits => {
+                        Some(name.to_owned())
+                    }
+                    _ => None,
+                })
+                .collect();
+            waiting_for.dedup();
+            return Ok(Admission::Waiting {
+                ahead,
+                used: used.get(&Dim::Cpu).copied().unwrap_or(0),
+                waiting_for,
+            });
+        }
+        ahead = ahead.saturating_add(1);
+        for (&(dim, amount, limit), &fits) in demands.iter().zip(&fits) {
+            // A job that fits is about to start: it sets aside everything.
+            if fits_all || fits {
+                let entry = set_aside.entry(dim).or_insert((0, limit));
+                *entry = (entry.0 + amount, entry.1.min(limit));
+            } else {
+                short.insert(dim);
+            }
+        }
+    }
+    Err(Error::JobVanished(id))
 }
 
 fn reap(tx: &Transaction) -> Result<Vec<Job>> {
@@ -593,7 +706,7 @@ fn load_jobs(conn: &Connection) -> Result<Vec<Job>> {
     let mut stmt = conn.prepare(
         "SELECT id, task, weight, state, dir, args, command, owner_pid, owner_start,
                 child_pgid, child_start, enqueued_at, parked_at, started_at,
-                capacity, measure_only
+                capacity, measure_only, checkout, uses
          FROM jobs ORDER BY id",
     )?;
     let jobs = stmt
@@ -603,6 +716,11 @@ fn load_jobs(conn: &Connection) -> Result<Vec<Job>> {
 }
 
 fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
+    fn json<T: serde::de::DeserializeOwned>(idx: usize, text: String) -> rusqlite::Result<T> {
+        serde_json::from_str(&text).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, e.into())
+        })
+    }
     let args: String = row.get(5)?;
     let owner_pid: Option<u32> = row.get(7)?;
     let owner_start: Option<i64> = row.get(8)?;
@@ -614,9 +732,7 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         weight: row.get(2)?,
         state: JobState::parse(&row.get::<_, String>(3)?)?,
         dir: PathBuf::from(OsString::from_vec(row.get(4)?)),
-        args: serde_json::from_str(&args).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into())
-        })?,
+        args: json(5, args)?,
         command: row.get(6)?,
         owner: owner_pid.zip(owner_start).map(|(pid, start)| ProcessId {
             pid,
@@ -631,6 +747,10 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         started_at: row.get::<_, Option<i64>>(13)?.map(from_unix_ms),
         capacity: row.get(14)?,
         measure_only: row.get(15)?,
+        checkout: row
+            .get::<_, Option<Vec<u8>>>(16)?
+            .map(|bytes| PathBuf::from(OsString::from_vec(bytes))),
+        uses: json(17, row.get(17)?)?,
     })
 }
 

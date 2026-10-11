@@ -21,15 +21,17 @@ With capacity 8, lint = 1, test = 4 and e2e = 8:
 A count-based limit can't express this: set it low and the machine idles while
 lints wait; set it high and three e2e runs at once bring the machine down.
 
-The line is strictly first-come, first-served, so a big job is never starved by
-a stream of small ones.
+The line is first come, first served, so a big job is never starved by a
+stream of small ones. CPU is not the only limit: tasks can also use named
+resources, such as a few local database stacks, memory, or the one dev server
+port a checkout has.
 
 ## At a glance
 
 | | |
 | --- | --- |
 | Problem | Several AI agents on one machine run heavy checks at the same time. CPU and memory contention causes timeouts that look like test failures, and a sluggish machine. |
-| Approach | Every task has a weight (≈ CPU cores it keeps busy), the machine has a capacity. A job starts only when it is first in line and its weight fits. |
+| Approach | Every task has a weight (≈ CPU cores it keeps busy), the machine has a capacity, and the line is first come, first served. Tasks can also use named resources (database stacks, memory), limited per machine or per checkout; a job waiting for one doesn't hold up jobs that don't need it. |
 | Interface | A command wrapper: `loadmaster run <task> [-- args]`. No daemon or server; processes coordinate through a SQLite file. |
 | Crash safety | Places and slots of killed processes are reclaimed automatically (PID plus start time, so reused PIDs don't fool it). A task keeps its slot while it runs, even if `loadmaster` itself is killed. |
 | Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. `loadmaster held` lets scripts refuse to run outside the queue, whatever the agent. Ready-made Claude Code settings: instructions, timeouts, permissions, a hook that blocks direct runs. |
@@ -268,10 +270,47 @@ out, size them by memory instead. Once tasks run through loadmaster,
 `loadmaster report` shows the cores each one really kept busy (`CORES`),
 measured the same way.
 
-Tasks that bind a fixed port, such as an e2e suite's dev server, collide when
-two worktrees run them at once. Either give each worktree its own port, or
-give the task a weight above half the capacity, which guarantees that two runs
-never overlap.
+### Resources besides CPU
+
+When something other than CPU runs out, declare it as a resource and list
+what each task uses:
+
+```toml
+[resources.e2e-db]
+capacity = 2      # at most 2 at once on this machine
+per_checkout = 1  # and 1 per checkout: they share its ports and database
+
+[resources.memory]  # GiB; the machine config sets the capacity
+
+[tasks.e2e]
+weight = 2
+uses = { e2e-db = 1, memory = 4 }
+cmd = ["npx", "playwright", "test"]
+
+[tasks.lint]
+weight = 1
+uses = { memory = 11 }
+cmd = ["npx", "eslint", "."]
+```
+
+- `capacity` limits a resource on the whole machine. The machine config can
+  set or override it; with no capacity anywhere, the resource is not limited
+  machine-wide.
+- `per_checkout` limits what the jobs of one checkout use together, for what a
+  checkout has only one of: its dev server port, its local database, its build
+  output. A checkout is a directory with `.loadmaster.toml`, so each worktree
+  is one. A port that every worktree shares is a resource with `capacity = 1`
+  instead.
+- Every name in `uses` must be declared under `[resources]`. Names are shared
+  by all repositories on the machine, like the capacity, so give
+  project-specific resources project-specific names.
+- An amount above a limit counts as the whole limit, like a weight above the
+  capacity.
+
+A job waiting for a resource holds back only that resource: a lint that needs
+no database can start while an e2e run waits for one, as long as it leaves the
+e2e run the CPU it will need. A job waiting for CPU still holds back everyone
+behind it. See [How it works](#how-it-works).
 
 The running task gets two environment variables:
 
@@ -327,6 +366,10 @@ command at a time instead.
 
 ```toml
 capacity = 8
+
+[resources]
+memory = 48  # GiB
+e2e-db = 3   # overrides the repository's default
 ```
 
 If `capacity` is not set, it defaults to the number of CPU cores minus 2
@@ -351,11 +394,16 @@ one with outcome `lost`.
 
 ## How it works
 
-- **Admission**: a job starts only when it is at the head of the line *and*
-  `used + weight <= capacity`. A small job never overtakes a big job at the
-  head, so the big job starts as soon as enough running jobs finish. The price
-  is that a quick lint can wait behind an e2e run even while some cores are
-  free.
+- **Admission**: jobs are considered in line order. A job starts when its
+  weight and each resource it uses fit in what running jobs leave free and in
+  what the jobs ahead of it set aside: a job waiting in line sets aside what
+  it needs wherever that fits, and holds back entirely what it is short of.
+  No job is ever delayed by jobs that got in line after it. Every task uses
+  CPU, so a small job never overtakes a big job waiting for CPU, and the big
+  job starts as soon as enough running jobs finish; the price is that a quick
+  lint can wait behind an e2e run even while some cores are free. A job
+  waiting only for a resource, such as a database stack, lets jobs that don't
+  need it pass, as long as they leave it the CPU it needs.
 - **Crashes**: state is a per-user SQLite database. Every update first checks
   that the processes holding places and slots are still alive (comparing PID
   and process start time, so a reused PID can't fool it):
@@ -385,7 +433,7 @@ then runs directly, without taking another slot. A stale or bogus
 `LOADMASTER_HELD` is an error, not a free pass.
 
 The inner task's load counts against the outer task's weight, so give the outer
-task a weight that covers everything it runs. Nested runs keep a task that
+task a weight, and `uses`, that cover everything it runs. Nested runs keep a task that
 happens to call loadmaster, such as a script that is also run on its own, from
 deadlocking; to run several checks in a row, prefer
 [one `loadmaster run` per check](#one-check-per-task).
@@ -415,11 +463,12 @@ loadmaster run [--max-wait SECONDS] <TASK> [-- ARGS...]
 loadmaster status
 loadmaster clean
 loadmaster report [--since DURATION] [--dir TEXT]
-loadmaster held
+loadmaster held [--uses RESOURCE]
 ```
 
-- `run`: run a task once its weight fits.
-- `status`: show used/total capacity and every running, waiting or parked job.
+- `run`: run a task once its weight and resources fit.
+- `status`: show used/total capacity, resources in use and every running,
+  waiting or parked job.
 - `clean`: reclaim places and slots whose processes are gone. Every update
   already does this, so you should rarely need it.
 - `report`: summarize the history log per task. `--since 7d` (or `12h`, `2w`)
@@ -427,19 +476,25 @@ loadmaster held
   whose path contains `myapp`. See
   [Checking that it helps](#checking-that-it-helps).
 - `held`: exit with 0 if this process runs inside a loadmaster job started
-  from this checkout, and with 1 (saying why on stderr) if not; see
-  [Guarding a script](#guarding-a-script). Its own failures exit with 125.
+  from this checkout (and, with `--uses`, using that resource), and with 1
+  (saying why on stderr) if not; see [Guarding a script](#guarding-a-script).
+  Its own failures exit with 125.
 
 ```text
 $ loadmaster status
 6/8 in use (capacity set in /Users/you/.config/loadmaster/config.toml)
+e2e-db: 1/2 in use
 
-ID  STATE    TASK  WEIGHT  PID    PGID   FOR    DIR
-41  running  test  4       12345  12346  1m02s  /Users/you/src/app-wt1
-42  running  lint  1       12399  12400  3.1s   /Users/you/src/app-wt2
-43  running  lint  1       12410  12411  0.8s   /Users/you/src/app-wt4
-44  waiting  e2e   8       12420  -      45s    /Users/you/src/app-wt3
+ID  STATE    TASK  WEIGHT  USES      PID    PGID   FOR    DIR
+41  running  test  4       -         12345  12346  1m02s  /Users/you/src/app-wt1
+42  running  e2e   2       e2e-db=1  12399  12400  3.1s   /Users/you/src/app-wt2
+43  waiting  e2e   2       e2e-db=1  12410  -      0.8s   /Users/you/src/app-wt2
+44  waiting  lint  1       -         12420  -      0.5s   /Users/you/src/app-wt3
 ```
+
+Job 43 waits because `app-wt2` already has its one `e2e-db`. Job 44 waits
+although 2 cores are free: they are set aside for job 43, which needs them as
+soon as `app-wt2`'s database is free.
 
 `FOR` is the time spent in the current state. There is no cancel command: to
 stop a running job, signal its task's process group, e.g. `kill -TERM -12346`.
@@ -498,7 +553,9 @@ works whatever starts the script, unlike permission rules and hooks, which
 only see an agent's own commands. A stale or made-up `LOADMASTER_HELD`, or one
 from another checkout, fails; one copied into another shell of the same
 checkout still passes while its job runs, so this too is a guardrail against
-accidents, not a security boundary.
+accidents, not a security boundary. `loadmaster held --uses e2e-db` also
+requires the job to use `e2e-db`, for a script that needs that resource
+held.
 
 Tools you don't control, such as `npx vitest` run directly, still bypass the
 queue; in Claude Code, [blocking direct execution](#3-block-direct-execution)
@@ -745,14 +802,15 @@ cargo test
 
 Besides unit tests, this runs integration tests that start real `loadmaster`
 processes: many jobs at once, a big job among a stream of small ones, `kill -9`
-of waiting and running jobs, nested runs, `loadmaster held`, exit codes and
-config errors. Design decisions and their reasons are in
+of waiting and running jobs, nested runs, resources, `loadmaster held`, exit
+codes and config errors. Design decisions and their reasons are in
 [docs/DECISIONS.md](docs/DECISIONS.md).
 
 A soak test simulates five agents calling `loadmaster run` the way Claude
 Code's Bash tool does (timeouts that SIGTERM and then SIGKILL the process
-group, re-runs after exit code 75, occasional crashes) and checks from inside
-the tasks that the capacity is never exceeded and that nothing is left behind:
+group, re-runs after exit code 75, occasional crashes), in two checkouts with
+two resources besides CPU. It checks from inside the tasks that no limit is
+ever exceeded, that every task gets through and that nothing is left behind:
 
 ```bash
 LOADMASTER_SOAK_SECS=600 cargo test --release --test soak -- --ignored --nocapture

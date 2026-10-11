@@ -193,6 +193,75 @@ The `jobs` table uses `INTEGER PRIMARY KEY AUTOINCREMENT`. A plain
 old ID again once the table empties, and then a leaked `LOADMASTER_HELD` could
 validate against an unrelated new job.
 
+## Resources
+
+CPU is not the only thing that runs out. An e2e suite may need one of a few
+local database stacks, a linter may need 11 GiB of memory, and two e2e runs in
+one checkout collide on its ports and database. A weight sized for one of
+those makes the CPU accounting wrong (the earlier advice was a weight above
+half the capacity, to keep two runs apart), so tasks can also use named
+resources.
+
+- A resource is declared in `.loadmaster.toml` under `[resources.NAME]`, with
+  an optional machine-wide `capacity` and an optional `per_checkout` limit,
+  and a task lists what it uses: `uses = { NAME = amount }`. Every name a task
+  uses must be declared, so a typo fails loudly, as unknown keys do.
+- The machine config can set or override a capacity under `[resources]`. The
+  repository's value is a default: a count such as "two e2e database stacks"
+  belongs to the project and suits most machines, and a repository's config
+  should work without setting up each machine. A resource whose size the
+  repository cannot know, such as memory, is declared without a capacity and
+  set per machine. A resource with no capacity anywhere is not limited
+  machine-wide.
+- Resource names are shared by all repositories on the machine, like the
+  capacity.
+- A per-checkout limit counts only jobs started from the same checkout: the
+  same `.loadmaster.toml`, compared as a resolved path. It describes the
+  project (one database per checkout), so the machine config cannot change it.
+- An amount above a limit counts as the whole limit, like a weight above the
+  capacity.
+- Each job records the limits it got in line with, and every process judges
+  each job by that record. A process from another repository, which may not
+  know a resource at all, can still tell whether a job fits.
+
+**Admission.** The line stays first come, first served, but a job waiting in
+it holds back only what it is short of. Jobs are considered in line order, on
+every dimension at once (CPU, each machine-wide resource, each per-checkout
+resource of each checkout):
+
+- A job fits if, on every dimension, what running jobs use plus what is set
+  aside for jobs ahead of it plus its own amount is within the limit, and it
+  uses nothing that a job ahead of it is short of. A job that fits may start.
+- A job that does not fit is short of some dimensions: no job behind it may
+  use those at all. On the dimensions where it fits, its amount is set aside,
+  so jobs behind it can only use what is left.
+- A job ahead that fits but has not started yet (its own poll comes later)
+  has its whole amount set aside.
+
+A job behind can therefore start first only by using nothing the waiting job
+is short of and leaving it its share everywhere else, so no job is ever
+delayed by jobs that got in line after it. Every task uses CPU, so a job
+waiting for CPU still holds back everyone behind it: with CPU alone,
+admission is exactly what it was. Without the rule, a third e2e run waiting
+for a database stack would hold up every lint behind it, though no lint needs
+a stack.
+
+The rule does not know which running job will free what, so where in doubt it
+sets aside. A job waiting for its checkout's limit still sets aside its
+machine-wide amount, so a job from another checkout may wait for a stack that
+is free. That takes two jobs of one checkout in line for the same resource,
+which one agent per worktree rarely causes. Skipping that set-aside when the
+release the job waits for would free enough anyway was considered; it breaks
+the guarantee when a waiting job leaves the line instead.
+
+A unit test simulates random workloads with several resources and checks that
+each job starts at the same time whether or not the jobs that got in line
+after it exist. The soak test adds resources and a second checkout and checks
+every limit from inside the tasks.
+
+Nested runs still skip every check, so an outer task must declare what its
+nested runs use.
+
 ## Checking that a script runs through the queue
 
 `loadmaster held` lets a script refuse to run outside the queue, whatever
@@ -207,7 +276,9 @@ not every agent has them.
   The files are only located, not parsed, so a config edited while the job
   runs makes no difference.
 - It does not check the task's name. A guarded script can be run by several
-  tasks, and by a nested run, whose job is the outer task's.
+  tasks, and by a nested run, whose job is the outer task's. What such a
+  script depends on is a resource: `--uses NAME` also requires the job to use
+  NAME.
 - It does not check that the caller descends from the task's process. Tools
   start helpers in process groups of their own, and orphaned processes are
   re-parented, so such a check would refuse legitimate runs. A value copied

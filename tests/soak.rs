@@ -1,5 +1,6 @@
 //! Soak test: several simulated agents drive loadmaster the way Claude Code's
-//! Bash tool does, for a while, with timeouts, kills and crashes.
+//! Bash tool does, for a while, with timeouts, kills and crashes, in two
+//! checkouts and with two resources besides CPU.
 //!
 //! Ignored by default. Run it with:
 //!
@@ -19,22 +20,29 @@ use std::time::{Duration, Instant};
 use common::*;
 
 const CAPACITY: u32 = 8;
+/// `db`: at most 2 at once, 1 per checkout. `mem`: at most 6.
+const RESOURCES: &str = "[resources.db]\ncapacity = 2\nper_checkout = 1\n\n\
+                         [resources.mem]\ncapacity = 6\n\n";
+const CHECKOUTS: [&str; 2] = ["repo", "repo2"];
 const AGENTS: usize = 5;
 /// Delay between SIGTERM and SIGKILL (a few seconds in Claude Code; shorter here).
 const KILL_GRACE: Duration = Duration::from_secs(1);
 
-/// (name, weight, work). `slow` takes a second to shut down after SIGTERM.
-const TASKS: [(&str, u32, &str); 4] = [
-    ("lint", 1, "sleep 0.3"),
-    ("test", 4, "sleep 1"),
-    ("e2e", 8, "sleep 2"),
-    ("slow", 2, "trap 'sleep 1; exit 143' TERM; sleep 3"),
+/// (name, weight, db, mem, work). `slow` takes a second to shut down after
+/// SIGTERM.
+const TASKS: [(&str, u32, u32, u32, &str); 5] = [
+    ("lint", 1, 0, 0, "sleep 0.3"),
+    ("test", 4, 0, 3, "sleep 1"),
+    ("e2e", 2, 1, 2, "sleep 2"),
+    ("big", 8, 0, 0, "sleep 1"),
+    ("slow", 2, 1, 4, "trap 'sleep 1; exit 143' TERM; sleep 3"),
 ];
 
 #[derive(Default)]
 struct Stats {
     runs: AtomicUsize,
     ok: AtomicUsize,
+    ok_by_task: [AtomicUsize; TASKS.len()],
     gave_up: AtomicUsize,
     timed_out: AtomicUsize,
     crashed: AtomicUsize,
@@ -51,28 +59,46 @@ fn agents_under_timeouts_and_crashes() {
     let markers = probe.path("markers");
     let violations = probe.path("violations");
     std::fs::create_dir_all(&markers).unwrap();
-    // Every task, right after it starts, sums the weights of tasks whose
-    // process is alive (cleaning up markers of dead ones) and records any
-    // excess. A task's marker outlives a SIGKILL, so liveness decides.
+    // Every task, right after it starts, sums what tasks whose process is
+    // alive use (cleaning up markers of dead ones) and records any excess:
+    // CPU, each resource, and `db` in its own checkout. A task's marker
+    // outlives a SIGKILL, so liveness decides.
     let tasks: String = TASKS
         .iter()
-        .map(|(name, weight, work)| {
+        .map(|(name, weight, db, mem, work)| {
             let script = format!(
-                "m={markers}/$$.{weight}; : > \"$m\"; total=0; \
+                "ck=${{PWD##*/}}; m={markers}/$$.{weight}.{db}.{mem}.$ck; : > \"$m\"; \
+                 cpu=0; db=0; mem=0; dbck=0; \
                  for f in {markers}/*; do [ -e \"$f\" ] || continue; \
-                   p=${{f##*/}}; p=${{p%.*}}; \
-                   if kill -0 \"$p\" 2>/dev/null; then total=$((total + ${{f##*.}})); \
+                   set -- $(echo \"${{f##*/}}\" | tr . ' '); \
+                   if kill -0 \"$1\" 2>/dev/null; then \
+                     cpu=$((cpu + $2)); db=$((db + $3)); mem=$((mem + $4)); \
+                     if [ \"$5\" = \"$ck\" ]; then dbck=$((dbck + $3)); fi; \
                    else rm -f \"$f\"; fi; \
                  done; \
-                 if [ \"$total\" -gt {CAPACITY} ]; then echo \"$total\" >> {violations}; fi; \
+                 if [ $cpu -gt {CAPACITY} ] || [ $db -gt 2 ] || [ $mem -gt 6 ] || [ $dbck -gt 1 ]; \
+                 then echo \"cpu=$cpu db=$db mem=$mem db-in-$ck=$dbck\" >> {violations}; fi; \
                  {work}; rm -f \"$m\"",
                 markers = q(&markers),
                 violations = q(&violations),
             );
-            sh_task(name, *weight, &script)
+            let uses: Vec<String> = [("db", db), ("mem", mem)]
+                .iter()
+                .filter(|(_, amount)| **amount > 0)
+                .map(|(resource, amount)| format!("{resource} = {amount}"))
+                .collect();
+            sh_task(name, *weight, &script).replacen(
+                "cmd = ",
+                &format!("uses = {{ {} }}\ncmd = ", uses.join(", ")),
+                1,
+            )
         })
         .collect();
-    std::fs::write(probe.repo.join(".loadmaster.toml"), tasks).unwrap();
+    for checkout in CHECKOUTS {
+        let dir = probe.root.path().join(checkout);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".loadmaster.toml"), RESOURCES.to_owned() + &tasks).unwrap();
+    }
     let sandbox = Arc::new(probe);
     let stats = Arc::new(Stats::default());
     let until = Instant::now() + Duration::from_secs(secs);
@@ -101,11 +127,17 @@ fn agents_under_timeouts_and_crashes() {
     let excess = std::fs::read_to_string(&violations).unwrap_or_default();
     let history = std::fs::read_to_string(sandbox.state.join("history.jsonl")).unwrap();
 
+    let ok_by_task: Vec<String> = TASKS
+        .iter()
+        .zip(&stats.ok_by_task)
+        .map(|((name, ..), ok)| format!("{name} {}", ok.load(Ordering::SeqCst)))
+        .collect();
     println!(
-        "soak: {secs}s, {} runs: {} ok, {} gave up (resumed), {} timed out, {} crashed; \
+        "soak: {secs}s, {} runs: {} ok ({}), {} gave up (resumed), {} timed out, {} crashed; \
          {} history lines",
         stats.runs.load(Ordering::SeqCst),
         stats.ok.load(Ordering::SeqCst),
+        ok_by_task.join(", "),
         stats.gave_up.load(Ordering::SeqCst),
         stats.timed_out.load(Ordering::SeqCst),
         stats.crashed.load(Ordering::SeqCst),
@@ -116,7 +148,10 @@ fn agents_under_timeouts_and_crashes() {
         leftover.is_empty(),
         "task processes left running: {leftover:?}"
     );
-    assert!(stats.ok.load(Ordering::SeqCst) > 0);
+    // No task is starved: each, the whole-machine one included, gets through.
+    for ((name, ..), ok) in TASKS.iter().zip(&stats.ok_by_task) {
+        assert!(ok.load(Ordering::SeqCst) > 0, "`{name}` never succeeded");
+    }
     // Every run that got in line is logged once, by itself or, if it was
     // killed, by whoever reaped its job. Only a crash can come before getting
     // in line.
@@ -133,13 +168,19 @@ fn agents_under_timeouts_and_crashes() {
 fn agent(sandbox: &Sandbox, stats: &Stats, seed: u64, until: Instant) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     while Instant::now() < until {
-        let (task, ..) = TASKS[rng.below(TASKS.len() as u64) as usize];
+        let index = rng.below(TASKS.len() as u64) as usize;
+        let (task, ..) = TASKS[index];
+        let checkout = sandbox
+            .root
+            .path()
+            .join(CHECKOUTS[rng.below(CHECKOUTS.len() as u64) as usize]);
         let timeout = Duration::from_millis(1500 + rng.below(6500));
         let crash_after = (rng.below(10) == 0).then(|| Duration::from_millis(rng.below(2000)));
         loop {
             stats.runs.fetch_add(1, Ordering::SeqCst);
             let mut child = sandbox
                 .cmd(&["run", "--max-wait", "2", task])
+                .current_dir(&checkout)
                 // Like Claude Code: each command in its own process group.
                 .process_group(0)
                 .stdout(Stdio::null())
@@ -153,6 +194,7 @@ fn agent(sandbox: &Sandbox, stats: &Stats, seed: u64, until: Instant) {
             }
             if status.success() {
                 stats.ok.fetch_add(1, Ordering::SeqCst);
+                stats.ok_by_task[index].fetch_add(1, Ordering::SeqCst);
             }
             break;
         }
