@@ -15,6 +15,9 @@
 //!   process group is alive, so killing only loadmaster does not free a slot
 //!   whose work is still running;
 //! - a *parked* job (see [`Ticket::park`]) keeps its place for [`PARK_TTL`].
+//!
+//! A reaped job whose loadmaster process was killed never wrote its history
+//! record, so the reaper writes one for it (outcome `lost`).
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -25,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use crate::error::{Error, Result};
+use crate::history::{self, Outcome, Record};
 use crate::process::{ProcessGroup, ProcessId};
 
 pub type JobId = i64;
@@ -38,7 +42,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a parked job keeps its place in line without an owner.
 pub const PARK_TTL: Duration = Duration::from_secs(120);
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 // AUTOINCREMENT: IDs are never reused, so a stale LOADMASTER_HELD can never
 // point at an unrelated newer job.
@@ -57,8 +61,16 @@ CREATE TABLE jobs (
     child_start INTEGER,
     enqueued_at INTEGER NOT NULL,
     parked_at   INTEGER,
-    started_at  INTEGER
+    started_at  INTEGER,
+    capacity     INTEGER,
+    measure_only INTEGER NOT NULL DEFAULT 0
 );
+";
+
+/// From version 1, which did not record the machine setting of each job.
+const MIGRATE_FROM_1: &str = "
+ALTER TABLE jobs ADD COLUMN capacity INTEGER;
+ALTER TABLE jobs ADD COLUMN measure_only INTEGER NOT NULL DEFAULT 0;
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +123,10 @@ pub struct Job {
     pub enqueued_at: SystemTime,
     pub parked_at: Option<SystemTime>,
     pub started_at: Option<SystemTime>,
+    /// The machine's capacity when the job got in line (unknown for jobs
+    /// queued before it was recorded).
+    pub capacity: Option<u32>,
+    pub measure_only: bool,
 }
 
 impl Job {
@@ -136,6 +152,12 @@ impl Job {
     pub fn is_orphaned(&self) -> bool {
         self.state == JobState::Running && !self.owner_alive()
     }
+
+    /// Reaped while it still had an owner: its loadmaster process was killed
+    /// before it could log the result. Parked and handed-over jobs have none.
+    fn was_lost(&self) -> bool {
+        self.owner.is_some() && self.state != JobState::Parked
+    }
 }
 
 /// What a caller wants to run.
@@ -149,6 +171,9 @@ pub struct JobRequest<'a> {
     pub args: &'a [String],
     /// Human-readable command line, for `status`.
     pub command: &'a str,
+    /// The machine setting, kept so a lost job can still be logged.
+    pub capacity: u32,
+    pub measure_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +242,9 @@ impl Queue {
         if found == 0 {
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        } else if found == 1 {
+            tx.execute_batch(MIGRATE_FROM_1)?;
+            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         } else if found != SCHEMA_VERSION {
             return Err(Error::SchemaVersion {
                 path: self.path.clone(),
@@ -232,59 +260,112 @@ impl Queue {
         Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
     }
 
+    /// Runs `f` in a write transaction, after reaping dead jobs. Once that is
+    /// committed, logs the reaped jobs that were lost, and returns them all.
+    fn write<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<(T, Vec<Job>)> {
+        let tx = self.begin()?;
+        let reaped = reap(&tx)?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        self.log_lost(&reaped);
+        Ok((value, reaped))
+    }
+
+    fn log_lost(&self, reaped: &[Job]) {
+        let Some(state_dir) = self.path.parent() else {
+            return;
+        };
+        let now = SystemTime::now();
+        for job in reaped.iter().filter(|job| job.was_lost()) {
+            let waited_until = job.started_at.unwrap_or(now);
+            let record = Record {
+                job: job.id,
+                task: &job.task,
+                weight: job.weight,
+                capacity: job.capacity,
+                measure_only: job.measure_only,
+                dir: job.dir.to_string_lossy(),
+                args: &job.args,
+                outcome: Outcome::Lost,
+                queued_at: history::unix_ms(job.enqueued_at),
+                wait_ms: millis(
+                    waited_until
+                        .duration_since(job.enqueued_at)
+                        .unwrap_or_default(),
+                ),
+                run_ms: None,
+                cpu_ms: None,
+                load: None,
+                signal: None,
+                exit_code: None,
+            };
+            if let Err(e) = history::append(state_dir, &record) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "loadmaster: warning: cannot write the history log: {e}"
+                );
+            }
+        }
+    }
+
     /// Gets in line, or takes over a parked job with the same
     /// (`dir`, `task`, `args`) and with it that job's place.
     pub fn enqueue(&self, request: &JobRequest, owner: ProcessId) -> Result<Ticket<'_>> {
         // Raw bytes: a lossy string could make two directories look equal.
         let dir = request.dir.as_os_str().as_bytes();
         let args = serde_json::to_string(request.args).expect("strings always serialize");
-        let tx = self.begin()?;
-        reap(&tx)?;
-        let parked: Option<JobId> = tx
-            .query_row(
-                "SELECT id FROM jobs
+        let ((id, resumed), _) = self.write(|tx| {
+            let parked: Option<JobId> = tx
+                .query_row(
+                    "SELECT id FROM jobs
                  WHERE state = 'parked' AND dir = ?1 AND task = ?2 AND args = ?3
                  ORDER BY id LIMIT 1",
-                params![dir, request.task, args],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let (id, resumed) = match parked {
-            Some(id) => {
-                tx.execute(
-                    "UPDATE jobs SET state = 'waiting', weight = ?2, command = ?3,
-                         owner_pid = ?4, owner_start = ?5, parked_at = NULL
+                    params![dir, request.task, args],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(match parked {
+                Some(id) => {
+                    tx.execute(
+                        "UPDATE jobs SET state = 'waiting', weight = ?2, command = ?3,
+                         owner_pid = ?4, owner_start = ?5, parked_at = NULL,
+                         capacity = ?6, measure_only = ?7
                      WHERE id = ?1",
-                    params![
-                        id,
-                        request.weight,
-                        request.command,
-                        owner.pid,
-                        owner.start_time as i64
-                    ],
-                )?;
-                (id, true)
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO jobs (task, weight, state, dir, args, command,
-                                       owner_pid, owner_start, enqueued_at)
-                     VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        request.task,
-                        request.weight,
-                        dir,
-                        args,
-                        request.command,
-                        owner.pid,
-                        owner.start_time as i64,
-                        unix_ms(SystemTime::now())
-                    ],
-                )?;
-                (tx.last_insert_rowid(), false)
-            }
-        };
-        tx.commit()?;
+                        params![
+                            id,
+                            request.weight,
+                            request.command,
+                            owner.pid,
+                            owner.start_time as i64,
+                            request.capacity,
+                            request.measure_only
+                        ],
+                    )?;
+                    (id, true)
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO jobs (task, weight, state, dir, args, command,
+                                       owner_pid, owner_start, enqueued_at,
+                                       capacity, measure_only)
+                     VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            request.task,
+                            request.weight,
+                            dir,
+                            args,
+                            request.command,
+                            owner.pid,
+                            owner.start_time as i64,
+                            unix_ms(SystemTime::now()),
+                            request.capacity,
+                            request.measure_only
+                        ],
+                    )?;
+                    (tx.last_insert_rowid(), false)
+                }
+            })
+        })?;
         Ok(Ticket {
             queue: self,
             id,
@@ -295,30 +376,25 @@ impl Queue {
 
     /// Reaps dead jobs and returns everything left.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let tx = self.begin()?;
-        let reaped = reap(&tx)?;
-        let jobs = load_jobs(&tx)?;
-        tx.commit()?;
+        let (jobs, reaped) = self.write(|tx| load_jobs(tx))?;
         Ok(Snapshot { jobs, reaped })
     }
 
     /// Removes jobs nobody holds any more and returns them.
     pub fn reap(&self) -> Result<Vec<Job>> {
-        let tx = self.begin()?;
-        let reaped = reap(&tx)?;
-        tx.commit()?;
-        Ok(reaped)
+        Ok(self.write(|_| Ok(()))?.1)
     }
 
     /// Whether `id` is a running job that is still alive, i.e. a valid
     /// holder for nested `loadmaster run` calls.
     pub fn is_live_holder(&self, id: JobId) -> Result<bool> {
-        let tx = self.begin()?;
-        reap(&tx)?;
-        let state: Option<String> = tx
-            .query_row("SELECT state FROM jobs WHERE id = ?1", [id], |r| r.get(0))
-            .optional()?;
-        tx.commit()?;
+        let (state, _) = self.write(|tx| {
+            Ok(tx
+                .query_row("SELECT state FROM jobs WHERE id = ?1", [id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?)
+        })?;
         Ok(state.as_deref() == Some(JobState::Running.as_str()))
     }
 
@@ -335,10 +411,7 @@ impl Queue {
     }
 
     fn remove(&self, id: JobId) -> Result<()> {
-        let tx = self.begin()?;
-        reap(&tx)?;
-        tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
-        tx.commit()?;
+        self.write(|tx| Ok(tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?))?;
         Ok(())
     }
 }
@@ -381,21 +454,37 @@ impl Ticket<'_> {
         {
             return Ok(waiting);
         }
-        let tx = self.queue.begin()?;
-        reap(&tx)?;
-        let jobs = load_jobs(&tx)?;
-        let admission = decide(&jobs, self.id, capacity)?;
-        let running = jobs
-            .iter()
-            .any(|job| job.id == self.id && job.state == JobState::Running);
-        if admission == Admission::Admitted && !running {
-            tx.execute(
-                "UPDATE jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
-                params![self.id, unix_ms(SystemTime::now())],
-            )?;
-        }
-        tx.commit()?;
+        let (admission, _) = self.queue.write(|tx| {
+            let jobs = load_jobs(tx)?;
+            let admission = decide(&jobs, self.id, capacity)?;
+            let running = jobs
+                .iter()
+                .any(|job| job.id == self.id && job.state == JobState::Running);
+            if admission == Admission::Admitted && !running {
+                tx.execute(
+                    "UPDATE jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+                    params![self.id, unix_ms(SystemTime::now())],
+                )?;
+            }
+            Ok(admission)
+        })?;
         Ok(admission)
+    }
+
+    /// Starts the job at once, whatever its place in line and the capacity:
+    /// measure-only mode.
+    pub fn admit_now(&self) -> Result<()> {
+        let (started, _) = self.queue.write(|tx| {
+            Ok(tx.execute(
+                "UPDATE jobs SET state = 'running', started_at = ?2
+                 WHERE id = ?1 AND state = 'waiting'",
+                params![self.id, unix_ms(SystemTime::now())],
+            )?)
+        })?;
+        if started == 0 {
+            return Err(Error::JobVanished(self.id));
+        }
+        Ok(())
     }
 
     /// Hands the slot over to the task's process group: it stays held until
@@ -514,7 +603,8 @@ fn reap(tx: &Transaction) -> Result<Vec<Job>> {
 fn load_jobs(conn: &Connection) -> Result<Vec<Job>> {
     let mut stmt = conn.prepare(
         "SELECT id, task, weight, state, dir, args, command, owner_pid, owner_start,
-                child_pgid, child_start, enqueued_at, parked_at, started_at
+                child_pgid, child_start, enqueued_at, parked_at, started_at,
+                capacity, measure_only
          FROM jobs ORDER BY id",
     )?;
     let jobs = stmt
@@ -550,6 +640,8 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         enqueued_at: from_unix_ms(row.get(11)?),
         parked_at: row.get::<_, Option<i64>>(12)?.map(from_unix_ms),
         started_at: row.get::<_, Option<i64>>(13)?.map(from_unix_ms),
+        capacity: row.get(14)?,
+        measure_only: row.get(15)?,
     })
 }
 
@@ -558,301 +650,13 @@ fn unix_ms(t: SystemTime) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn from_unix_ms(ms: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct Fixture {
-        _dir: tempfile::TempDir,
-        queue: Queue,
-        me: ProcessId,
-    }
-
-    fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
-        let queue = Queue::open(&dir.path().join(STATE_DB_FILE)).unwrap();
-        Fixture {
-            _dir: dir,
-            queue,
-            me: ProcessId::current().unwrap(),
-        }
-    }
-
-    fn request<'a>(task: &'a str, weight: u32, args: &'a [String]) -> JobRequest<'a> {
-        JobRequest {
-            task,
-            weight,
-            dir: Path::new("/repo"),
-            args,
-            command: task,
-        }
-    }
-
-    /// An owner that is guaranteed dead: our PID with the wrong start time.
-    fn dead_owner(me: ProcessId) -> ProcessId {
-        ProcessId {
-            start_time: me.start_time + 1,
-            ..me
-        }
-    }
-
-    #[test]
-    fn admits_jobs_up_to_capacity() {
-        let f = fixture();
-        let a = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-        let b = f.queue.enqueue(&request("lint", 4, &[]), f.me).unwrap();
-        let c = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
-        assert_eq!(a.try_admit(8).unwrap(), Admission::Admitted);
-        assert_eq!(b.try_admit(8).unwrap(), Admission::Admitted);
-        assert_eq!(
-            c.try_admit(8).unwrap(),
-            Admission::Waiting { ahead: 0, used: 8 }
-        );
-        drop(a);
-        assert_eq!(c.try_admit(8).unwrap(), Admission::Admitted);
-        assert_eq!(f.queue.snapshot().unwrap().used(), 5);
-    }
-
-    #[test]
-    fn small_jobs_never_overtake_the_head() {
-        let f = fixture();
-        let running = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-        assert_eq!(running.try_admit(8).unwrap(), Admission::Admitted);
-        let big = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
-        let small = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
-        // The small job would fit, but the big one is ahead of it.
-        assert_eq!(
-            small.try_admit(8).unwrap(),
-            Admission::Waiting { ahead: 1, used: 4 }
-        );
-        assert_eq!(
-            big.try_admit(8).unwrap(),
-            Admission::Waiting { ahead: 0, used: 4 }
-        );
-        drop(running);
-        assert_eq!(big.try_admit(8).unwrap(), Admission::Admitted);
-        assert_eq!(
-            small.try_admit(8).unwrap(),
-            Admission::Waiting { ahead: 0, used: 8 }
-        );
-    }
-
-    #[test]
-    fn dropping_a_waiting_ticket_leaves_the_line() {
-        let f = fixture();
-        let running = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
-        running.try_admit(8).unwrap();
-        let head = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-        let next = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
-        drop(head);
-        drop(running);
-        assert_eq!(next.try_admit(8).unwrap(), Admission::Admitted);
-        assert_eq!(f.queue.snapshot().unwrap().jobs.len(), 1);
-    }
-
-    #[test]
-    fn reaps_jobs_whose_owner_died() {
-        let f = fixture();
-        let dead = f
-            .queue
-            .enqueue(&request("e2e", 8, &[]), dead_owner(f.me))
-            .unwrap();
-        let alive = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
-        // The dead head would block everyone; reaping removes it.
-        assert_eq!(alive.try_admit(8).unwrap(), Admission::Admitted);
-        std::mem::forget(dead);
-        let snapshot = f.queue.snapshot().unwrap();
-        assert_eq!(snapshot.jobs.len(), 1);
-    }
-
-    #[test]
-    fn running_job_survives_its_owner_while_child_group_lives() {
-        let f = fixture();
-        let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-        ticket.try_admit(8).unwrap();
-        let task = LiveGroup::start();
-        f.queue.record_child(ticket.id(), task.group).unwrap();
-        f.queue
-            .conn
-            .execute(
-                "UPDATE jobs SET owner_start = owner_start + 1 WHERE id = ?1",
-                [ticket.id()],
-            )
-            .unwrap();
-        let snapshot = f.queue.snapshot().unwrap();
-        assert!(snapshot.reaped.is_empty());
-        assert!(snapshot.jobs[0].is_orphaned());
-        std::mem::forget(ticket);
-    }
-
-    /// A real task process group, killed on drop.
-    struct LiveGroup {
-        child: std::process::Child,
-        group: ProcessGroup,
-    }
-
-    impl LiveGroup {
-        fn start() -> LiveGroup {
-            use std::os::unix::process::CommandExt;
-            let child = std::process::Command::new("sleep")
-                .arg("30")
-                .process_group(0)
-                .spawn()
-                .unwrap();
-            let group = ProcessGroup {
-                pgid: child.id(),
-                leader_start_time: ProcessId::of(child.id()).unwrap().map(|p| p.start_time),
-            };
-            LiveGroup { child, group }
-        }
-    }
-
-    impl Drop for LiveGroup {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-
-    #[test]
-    fn detached_slot_is_held_until_the_group_exits() {
-        let f = fixture();
-        let live = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-        live.try_admit(8).unwrap();
-        let task = LiveGroup::start();
-        f.queue.record_child(live.id(), task.group).unwrap();
-        live.detach().unwrap();
-
-        let gone = f.queue.enqueue(&request("lint", 2, &[]), f.me).unwrap();
-        gone.try_admit(8).unwrap();
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        child.wait().unwrap();
-        let dead_group = ProcessGroup {
-            pgid: child.id(),
-            leader_start_time: None,
-        };
-        f.queue.record_child(gone.id(), dead_group).unwrap();
-        gone.detach().unwrap();
-
-        let snapshot = f.queue.snapshot().unwrap();
-        assert_eq!(snapshot.reaped.len(), 1);
-        assert_eq!(snapshot.reaped[0].task, "lint");
-        assert_eq!(snapshot.used(), 4);
-        assert!(snapshot.jobs[0].is_orphaned());
-    }
-
-    #[test]
-    fn parked_job_keeps_its_place_and_can_be_resumed() {
-        let f = fixture();
-        let args = vec!["--shard=1".to_owned()];
-        let running = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
-        running.try_admit(8).unwrap();
-        let first = f.queue.enqueue(&request("test", 4, &args), f.me).unwrap();
-        let first_id = first.id();
-        first.park().unwrap();
-        let later = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-        assert!(!later.resumed(), "different args must not resume");
-
-        let resumed = f.queue.enqueue(&request("test", 4, &args), f.me).unwrap();
-        assert!(resumed.resumed());
-        assert_eq!(resumed.id(), first_id);
-        drop(running);
-        assert_eq!(resumed.try_admit(4).unwrap(), Admission::Admitted);
-        assert_eq!(
-            later.try_admit(4).unwrap(),
-            Admission::Waiting { ahead: 0, used: 4 }
-        );
-    }
-
-    #[test]
-    fn parked_head_blocks_until_it_expires() {
-        let f = fixture();
-        let parked = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
-        let parked_id = parked.id();
-        parked.park().unwrap();
-        let next = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
-        assert_eq!(
-            next.try_admit(8).unwrap(),
-            Admission::Waiting { ahead: 1, used: 0 }
-        );
-        let expired = unix_ms(SystemTime::now() - PARK_TTL - Duration::from_secs(1));
-        f.queue
-            .conn
-            .execute(
-                "UPDATE jobs SET parked_at = ?2 WHERE id = ?1",
-                params![parked_id, expired],
-            )
-            .unwrap();
-        assert_eq!(next.try_admit(8).unwrap(), Admission::Admitted);
-    }
-
-    #[test]
-    fn live_holder_check() {
-        let f = fixture();
-        let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-        assert!(!f.queue.is_live_holder(ticket.id()).unwrap(), "waiting");
-        ticket.try_admit(8).unwrap();
-        assert!(f.queue.is_live_holder(ticket.id()).unwrap());
-        assert!(!f.queue.is_live_holder(ticket.id() + 100).unwrap());
-        let id = ticket.id();
-        drop(ticket);
-        assert!(!f.queue.is_live_holder(id).unwrap());
-    }
-
-    #[test]
-    fn ids_are_never_reused() {
-        let f = fixture();
-        let first = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-        let first_id = first.id();
-        drop(first);
-        let second = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-        assert!(second.id() > first_id);
-    }
-
-    #[test]
-    fn resume_key_compares_directories_byte_for_byte() {
-        use std::ffi::OsStr;
-        let f = fixture();
-        // Both are "/repo/\u{FFFD}" when converted lossily.
-        let a = Path::new(OsStr::from_bytes(b"/repo/\xff"));
-        let b = Path::new(OsStr::from_bytes(b"/repo/\xfe"));
-        let parked = f
-            .queue
-            .enqueue(
-                &JobRequest {
-                    dir: a,
-                    ..request("test", 4, &[])
-                },
-                f.me,
-            )
-            .unwrap();
-        parked.park().unwrap();
-        let other = f
-            .queue
-            .enqueue(
-                &JobRequest {
-                    dir: b,
-                    ..request("test", 4, &[])
-                },
-                f.me,
-            )
-            .unwrap();
-        assert!(!other.resumed());
-        let same = f
-            .queue
-            .enqueue(
-                &JobRequest {
-                    dir: a,
-                    ..request("test", 4, &[])
-                },
-                f.me,
-            )
-            .unwrap();
-        assert!(same.resumed());
-        assert_eq!(f.queue.snapshot().unwrap().jobs[0].dir, a);
-    }
-}
+mod tests;

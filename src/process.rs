@@ -6,6 +6,7 @@
 //! both match.
 
 use std::io;
+use std::time::Duration;
 
 /// A process, identified by PID plus start time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,10 +375,53 @@ fn read_stat(pid: u32) -> io::Result<Option<Stat>> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("loadmaster supports macOS and Linux only");
 
+/// The system's 1-minute load average, if the OS reports one.
+pub fn load_average() -> Option<f64> {
+    let mut load = [0.0f64; 1];
+    // SAFETY: the buffer holds the one element requested.
+    let n = unsafe { libc::getloadavg(load.as_mut_ptr(), 1) };
+    (n == 1 && load[0].is_finite()).then_some(load[0])
+}
+
+/// CPU time (user plus system) used by this process's children that have
+/// exited and been waited for, and by their own waited-for descendants.
+pub fn children_cpu_time() -> Option<Duration> {
+    // SAFETY: an all-zero `rusage` is a valid value to be overwritten.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer is valid for the call.
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } != 0 {
+        return None;
+    }
+    let time = |t: libc::timeval| {
+        Duration::from_secs(u64::try_from(t.tv_sec).ok()?)
+            .checked_add(Duration::from_micros(u64::try_from(t.tv_usec).ok()?))
+    };
+    time(usage.ru_utime)?.checked_add(time(usage.ru_stime)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn load_average_is_reported() {
+        assert!(load_average().is_some_and(|load| load >= 0.0));
+    }
+
+    #[test]
+    fn cpu_time_of_children_is_counted_once_waited_for() {
+        let before = children_cpu_time().unwrap();
+        // A fixed amount of work in grandchildren: about 0.25 s of CPU.
+        let status = Command::new("sh")
+            .args(["-c", "sh -c 'head -c 100000000 /dev/zero | cksum'"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let used = children_cpu_time().unwrap() - before;
+        assert!(used >= Duration::from_millis(50), "{used:?}");
+    }
 
     #[test]
     fn current_process_is_alive() {

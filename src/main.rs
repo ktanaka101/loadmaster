@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::fs::DirBuilder;
 use std::io::{self, Write};
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -15,11 +15,12 @@ use std::time::{Duration, Instant, SystemTime};
 use clap::{Args, Parser, Subcommand};
 
 use loadmaster::config::{self, MachineConfig, RepoConfig, Task};
-use loadmaster::history::{self, Outcome, Record};
-use loadmaster::process::ProcessId;
+use loadmaster::history::{self, HISTORY_FILE, Outcome, Record};
+use loadmaster::process::{self, ProcessId};
 use loadmaster::queue::{
     Admission, Job, JobId, JobRequest, JobState, PARK_TTL, Queue, STATE_DB_FILE, Ticket,
 };
+use loadmaster::report::{self, format_duration};
 use loadmaster::runner::{self, HELD_ENV, Signals, SpawnError, WEIGHT_ENV};
 use loadmaster::{Error, Result};
 
@@ -60,6 +61,20 @@ enum Cmd {
     Status,
     /// Reclaim places and slots held by jobs whose processes are gone
     Clean,
+    /// Summarize the history log: results, run and wait times, load
+    Report(ReportArgs),
+}
+
+#[derive(Args)]
+struct ReportArgs {
+    /// Only checks from this recent period, e.g. 12h, 7d, 2w
+    #[arg(long, value_name = "DURATION", value_parser = report::parse_since)]
+    since: Option<Duration>,
+
+    /// Only checks run from a directory whose path contains TEXT, e.g. a
+    /// project name shared by its worktrees
+    #[arg(long, value_name = "TEXT")]
+    dir: Option<String>,
 }
 
 #[derive(Args)]
@@ -86,6 +101,7 @@ fn main() {
         Cmd::Run(args) => run(args),
         Cmd::Status => status(),
         Cmd::Clean => clean(),
+        Cmd::Report(args) => report(args),
     };
     let code = result.unwrap_or_else(|e| {
         say!("loadmaster: error: {e}");
@@ -126,8 +142,11 @@ fn run(args: RunArgs) -> Result<i32> {
         dir: &cwd,
         args: &args.args,
         command: &display,
+        capacity: machine.capacity,
+        measure_only: machine.measure_only,
     };
-    let queued_at = SystemTime::now();
+    // Both clocks start here, so wait times include getting in line.
+    let (queued_at, wait_started) = (SystemTime::now(), Instant::now());
     let ticket = queue.enqueue(&request, owner)?;
     if ticket.resumed() {
         say!("loadmaster: resumed your place in line for `{}`", task.name);
@@ -137,23 +156,39 @@ fn run(args: RunArgs) -> Result<i32> {
         job: ticket.id(),
         task: &task.name,
         weight: task.weight,
+        capacity: Some(machine.capacity),
+        measure_only: machine.measure_only,
         dir: cwd.to_string_lossy(),
         args: &args.args,
         outcome: Outcome::Exited,
         queued_at: history::unix_ms(queued_at),
         wait_ms: 0,
         run_ms: None,
+        cpu_ms: None,
+        load: None,
+        signal: None,
         exit_code: None,
     };
     let result = (|| {
-        let wait_started = Instant::now();
         let max_wait = args.max_wait.map(Duration::from_secs);
-        let turn = wait_turn(&ticket, task, machine.capacity, max_wait, &signals);
+        let turn = if machine.measure_only {
+            // Admitted whatever the capacity and place in line: the run
+            // behaves as without loadmaster, and is only recorded.
+            ticket.admit_now().map(|()| Turn::Admitted)
+        } else {
+            wait_turn(&ticket, task, machine.capacity, max_wait, &signals)
+        };
         record.wait_ms = millis(wait_started.elapsed());
         match turn? {
-            Turn::Admitted => {
-                run_admitted(ticket, &state_dir, command, task, &signals, &mut record)
-            }
+            Turn::Admitted => run_admitted(
+                ticket,
+                &state_dir,
+                command,
+                task,
+                &signals,
+                wait_started,
+                &mut record,
+            ),
             Turn::GaveUp { ahead, used } => {
                 ticket.park()?;
                 say!(
@@ -250,6 +285,7 @@ fn run_admitted(
     mut command: Command,
     task: &Task,
     signals: &Signals,
+    wait_started: Instant,
     record: &mut Record,
 ) -> Result<i32> {
     if let Some(&signal) = signals.take().first() {
@@ -264,7 +300,7 @@ fn run_admitted(
     let (db, id) = (state_dir.join(STATE_DB_FILE), ticket.id());
     // Runs on another thread, so it opens its own connection.
     let register = move |group| -> Result<()> { Queue::open(&db)?.record_child(id, group) };
-    let started = Instant::now();
+    let cpu_before = process::children_cpu_time();
     let mut child = match runner::spawn(&mut command, register) {
         Ok(child) => child,
         Err(SpawnError::Register(e)) => return Err(e),
@@ -274,8 +310,20 @@ fn run_admitted(
             return Ok(spawn_failure_code(&e));
         }
     };
+    // `spawn` returns once the task has been registered and exec'd: the
+    // wait ends and the run begins here.
+    let started = Instant::now();
+    record.wait_ms = millis(started.duration_since(wait_started));
     let status =
         runner::wait(&mut child, signals).map_err(|e| Error::io("cannot wait for the task", e))?;
+    // Measured before the slot is released, which may wait for the database.
+    record.run_ms = Some(millis(started.elapsed()));
+    record.cpu_ms = process::children_cpu_time()
+        .zip(cpu_before)
+        .and_then(|(after, before)| after.checked_sub(before))
+        .map(millis);
+    record.load = process::load_average();
+    record.signal = status.signal();
     let handed_over = if child.group.is_alive() {
         say!(
             "loadmaster: `{}` exited, but processes it started are still running \
@@ -291,8 +339,14 @@ fn run_admitted(
     // Signals that arrived while the slot was being handed over or released
     // (even if that failed) still go to what is left of the task.
     runner::forward_pending(&child.group, signals);
-    handed_over?;
-    record.run_ms = Some(millis(started.elapsed()));
+    if let Err(e) = handed_over {
+        // As with a failed release: the task's result stands, and the job
+        // keeps its owner, so it is reclaimed once its processes are gone.
+        say!(
+            "loadmaster: warning: could not hand over job #{id}: {e} \
+             (it will be reclaimed once its processes exit)"
+        );
+    }
     Ok(runner::exit_code(status))
 }
 
@@ -332,6 +386,9 @@ fn status() -> Result<i32> {
         machine.capacity,
         machine.capacity_source
     );
+    if machine.measure_only {
+        out += "measure-only: jobs start at once and are only recorded (see `loadmaster report`)\n";
+    }
     if !snapshot.reaped.is_empty() {
         out += &format!(
             "reclaimed {} job(s) whose processes were gone\n",
@@ -435,6 +492,25 @@ fn clean() -> Result<i32> {
     Ok(0)
 }
 
+fn report(args: ReportArgs) -> Result<i32> {
+    let path = config::state_dir()?.join(HISTORY_FILE);
+    let (entries, unreadable) = match history::read(&path) {
+        Ok(read) => read,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (Vec::new(), 0),
+        Err(e) => return Err(Error::io(format!("cannot read {}", path.display()), e)),
+    };
+    let now = history::unix_ms(SystemTime::now());
+    let options = report::Options {
+        source: &path,
+        since: args.since.map(|d| now.saturating_sub(millis(d))),
+        dir: args.dir.as_deref(),
+        unreadable,
+        cpus: thread::available_parallelism().ok().map(|n| n.get()),
+    };
+    print(&report::render(&entries, &options));
+    Ok(0)
+}
+
 fn open_state_dir() -> Result<PathBuf> {
     let dir = config::state_dir()?;
     DirBuilder::new()
@@ -455,16 +531,6 @@ fn format_ahead(ahead: u32) -> String {
         0 => "next in line".to_owned(),
         1 => "1 job ahead".to_owned(),
         n => format!("{n} jobs ahead"),
-    }
-}
-
-fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    match secs {
-        0..10 => format!("{:.1}s", d.as_secs_f64()),
-        10..60 => format!("{secs}s"),
-        60..3600 => format!("{}m{:02}s", secs / 60, secs % 60),
-        _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
     }
 }
 

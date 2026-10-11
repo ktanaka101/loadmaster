@@ -8,6 +8,7 @@ pub mod error;
 pub mod history;
 pub mod process;
 pub mod queue;
+pub mod report;
 pub mod runner;
 
 pub use error::{Error, Result};

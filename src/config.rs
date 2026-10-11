@@ -185,12 +185,17 @@ impl fmt::Display for CapacitySource {
 pub struct MachineConfig {
     pub capacity: u32,
     pub capacity_source: CapacitySource,
+    /// Admit every job at once and only record it: a baseline to compare
+    /// against (see `loadmaster report`).
+    pub measure_only: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MachineFile {
     capacity: Option<u32>,
+    #[serde(default)]
+    measure_only: bool,
 }
 
 impl MachineConfig {
@@ -217,21 +222,23 @@ impl MachineConfig {
             message,
         };
         let file: MachineFile = toml::from_str(text).map_err(|e| invalid(e.to_string()))?;
-        match file.capacity {
-            Some(0) => Err(invalid("capacity must be at least 1".to_owned())),
-            Some(capacity) => Ok(MachineConfig {
-                capacity,
-                capacity_source: CapacitySource::File(path.to_owned()),
-            }),
+        let (capacity, capacity_source) = match file.capacity {
+            Some(0) => return Err(invalid("capacity must be at least 1".to_owned())),
+            Some(capacity) => (capacity, CapacitySource::File(path.to_owned())),
             None => {
                 let cores = std::thread::available_parallelism()
                     .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX));
-                Ok(MachineConfig {
-                    capacity: cores.saturating_sub(RESERVED_CORES).max(1),
-                    capacity_source: CapacitySource::Default { cores },
-                })
+                (
+                    cores.saturating_sub(RESERVED_CORES).max(1),
+                    CapacitySource::Default { cores },
+                )
             }
-        }
+        };
+        Ok(MachineConfig {
+            capacity,
+            capacity_source,
+            measure_only: file.measure_only,
+        })
     }
 }
 
@@ -396,6 +403,18 @@ mod tests {
     }
 
     #[test]
+    fn measure_only_is_off_unless_set() {
+        let path = Path::new("/m.toml");
+        assert!(
+            !MachineConfig::parse(path, "capacity = 8\n")
+                .unwrap()
+                .measure_only
+        );
+        let config = MachineConfig::parse(path, "measure_only = true\n").unwrap();
+        assert!(config.measure_only);
+    }
+
+    #[test]
     fn machine_capacity_defaults_below_core_count() {
         let config = MachineConfig::parse(Path::new("/m.toml"), "").unwrap();
         let CapacitySource::Default { cores } = config.capacity_source else {
@@ -420,6 +439,7 @@ mod tests {
             ("capacity = 0\n", "capacity must be at least 1"),
             ("capacity = \"8\"\n", "invalid type"),
             ("capasity = 8\n", "unknown field `capasity`"),
+            ("measure_only = \"yes\"\n", "invalid type"),
         ] {
             let msg = message(MachineConfig::parse(Path::new("/m.toml"), text).unwrap_err());
             assert!(msg.contains(expected), "{text:?}: {msg}");

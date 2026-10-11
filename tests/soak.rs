@@ -117,6 +117,15 @@ fn agents_under_timeouts_and_crashes() {
         "task processes left running: {leftover:?}"
     );
     assert!(stats.ok.load(Ordering::SeqCst) > 0);
+    // Every run that got in line is logged once, by itself or, if it was
+    // killed, by whoever reaped its job. Only a crash can come before getting
+    // in line.
+    let (lines, runs) = (history.lines().count(), stats.runs.load(Ordering::SeqCst));
+    let crashed = stats.crashed.load(Ordering::SeqCst);
+    assert!(
+        lines <= runs && lines + crashed >= runs,
+        "{lines} history lines for {runs} runs ({crashed} crashed)"
+    );
 }
 
 /// One simulated agent: picks tasks and runs them like Claude Code's Bash

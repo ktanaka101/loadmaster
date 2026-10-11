@@ -33,6 +33,7 @@ a stream of small ones.
 | Interface | A command wrapper: `loadmaster run <task> [-- args]`. No daemon or server; processes coordinate through a SQLite file. |
 | Crash safety | Places and slots of killed processes are reclaimed automatically (PID plus start time, so reused PIDs don't fool it). A task keeps its slot while it runs, even if `loadmaster` itself is killed. |
 | Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. Ready-made Claude Code settings: instructions, timeouts, permissions, a hook that blocks direct runs. |
+| Measuring | `loadmaster report` shows failures, timeouts, run and wait times and the cores each task really used; a measure-only mode records a baseline to compare with. See [Checking that it helps](#checking-that-it-helps). |
 | Platforms | macOS and Linux. Not Windows. |
 | Integration cost | One binary, one `.loadmaster.toml` per repository, a few lines of agent instructions. Removing it means deleting those, `~/.local/state/loadmaster` and `~/.config/loadmaster`. |
 | Status | 0.1, new. Verified with tests, soak tests and real Claude Code sessions with biome, vitest and Playwright; see [Status](#status). |
@@ -58,6 +59,9 @@ Look elsewhere when:
 - you need priorities, preemption, or limits based on measured CPU or memory:
   loadmaster uses static weights;
 - you need Windows.
+
+Not sure? Record a baseline first and compare; see
+[Checking that it helps](#checking-that-it-helps).
 
 ## Compared with alternatives
 
@@ -238,8 +242,9 @@ Playwright with 4 workers only 1.2, because browser tests mostly wait. A
 weight that is too high costs real time: with e2e weighted 8 instead of 2, five
 agents verifying at once took 126 seconds instead of 40, all of it spent
 waiting. Weights are a single number: if memory rather than CPU is what runs
-out, size them by memory instead. Afterwards, `history.jsonl` shows how long
-jobs waited and ran.
+out, size them by memory instead. Once tasks run through loadmaster,
+`loadmaster report` shows the cores each one really kept busy (`CORES`),
+measured the same way.
 
 Tasks that bind a fixed port, such as an e2e suite's dev server, collide when
 two worktrees run them at once. Either give each worktree its own port, or
@@ -276,11 +281,18 @@ Apple Silicon the core count includes efficiency cores; the number of
 performance cores (`sysctl hw.perflevel0.physicalcpu`) is often a better
 starting point.
 
+`measure_only = true` makes every job start at once, whatever the capacity
+and its place in line, and only records it, to get a baseline; see
+[Checking that it helps](#checking-that-it-helps).
+
 `$XDG_CONFIG_HOME` is honored, and `LOADMASTER_CONFIG` overrides the path.
 
 The queue lives in `~/.local/state/loadmaster/state.db` (`$XDG_STATE_HOME`,
 `LOADMASTER_STATE_DIR`). Next to it, `history.jsonl` gets one line per job
-(task, weight, wait time, run time, exit code) to help you tune the weights.
+(task, weight, capacity, wait and run time, CPU time, load average, signal,
+exit code), which `loadmaster report` summarizes. If `loadmaster` is killed
+before it can write its line, the process that later reclaims the job writes
+one with outcome `lost`.
 
 ## How it works
 
@@ -342,12 +354,17 @@ loadmaster's 75 from a task that happens to exit with 75 by the
 loadmaster run [--max-wait SECONDS] <TASK> [-- ARGS...]
 loadmaster status
 loadmaster clean
+loadmaster report [--since DURATION] [--dir TEXT]
 ```
 
 - `run`: run a task once its weight fits.
 - `status`: show used/total capacity and every running, waiting or parked job.
 - `clean`: reclaim places and slots whose processes are gone. Every update
   already does this, so you should rarely need it.
+- `report`: summarize the history log per task. `--since 7d` (or `12h`, `2w`)
+  limits it to a recent period, `--dir myapp` to checks run from directories
+  whose path contains `myapp`. See
+  [Checking that it helps](#checking-that-it-helps).
 
 ```text
 $ loadmaster status
@@ -499,6 +516,75 @@ adjust them to your scripts: as written, they miss `npm run test:unit`, and
 they also block harmless commands such as `grep vitest`. Without `jq` the hook
 lets everything through. Like permission rules, it is a guardrail against
 accidents, not a security boundary.
+
+## Checking that it helps
+
+loadmaster trades waiting for fewer overloaded runs. Whether that pays off
+depends on your checks and on how often agents run them at once, so measure it
+on your machine:
+
+1. Record a baseline: add `measure_only = true` to
+   `~/.config/loadmaster/config.toml` and work as usual for a few days. Every
+   run still goes through loadmaster and is logged, but none waits, so the
+   machine is as loaded as it would be without loadmaster.
+2. Remove the line and work as usual for about as long.
+3. Run `loadmaster report`.
+
+The report has one section per setting (measure-only or admission, and the
+capacity). Tasks are grouped by name across all repositories; if two projects
+both have a `test` task, look at one at a time with `--dir`. This report comes
+from a short demo, five agents each running `test` and then `e2e` at once:
+
+```text
+$ loadmaster report
+history: /Users/you/.local/state/loadmaster/history.jsonl
+
+== measure-only (capacity 12): 10 check(s), 2026-10-11 11:40 to 2026-10-11 11:40
+weight in use: above capacity 35% of the time checks ran, peak 20
+load average when tasks ended: median 10.7, p90 16.3 (14 CPUs)
+
+TASK  WEIGHT  CORES  CHECKS  PASSED  FAILED  KILLED  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
+e2e        2    1.3       5       5       0       0        0      24s      25s      0.0s      0.0s      0.0s
+test       4    2.2       5       5       0       0        0      13s      13s      0.1s      0.2s      0.2s
+
+== admission (capacity 12): 10 check(s), 2026-10-11 11:41 to 2026-10-11 11:42
+demand: above capacity 23% of the time checks ran, peak 20 (held back by loadmaster; in use peaked at 12)
+load average when tasks ended: median 13.0, p90 17.0 (14 CPUs)
+
+TASK  WEIGHT  CORES  CHECKS  PASSED  FAILED  KILLED  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
+e2e        2    1.3       5       5       0       0        0      24s      25s      0.2s       10s       10s
+test       4    2.9       5       5       0       0        0      10s      10s      0.1s       10s       10s
+```
+
+What to compare between the two periods:
+
+- **FAILED and KILLED**: the false failures and timeouts loadmaster is meant
+  to remove (along with real failures, which both periods have). KILLED means
+  ended by a signal, usually a tool timeout, including runs whose `loadmaster`
+  was killed before it could log the result.
+- **RUN MED / RUN P90** (passed checks): contention makes runs slower; under
+  admission they should come close to the time a task takes alone.
+- **WAIT** (from first getting in line to starting, re-runs after exit code 75
+  included; for checks that never started, until they ended): what admission
+  costs. If it nears your Bash tool timeout, raise the capacity or lower
+  weights.
+- **CORES** against **WEIGHT**: the cores a task really kept busy (CPU time
+  divided by run time). If your weights count CPU cores, a weight far above it
+  makes jobs wait for nothing. A weight sized for memory is not comparable.
+  Read it from the admission period; under contention it reads low.
+- **above capacity ... of the time checks ran**: how often the weights of the
+  checks running at once (measure-only) or asking to run (admission) added up
+  to more than the capacity. It is only as meaningful as the weights are; the
+  load average and the run times show whether the machine really struggled.
+  Near 0% means the agents rarely overlap and loadmaster has little to do.
+- **load average**: the whole machine's 1-minute load average when tasks
+  ended, including everything outside loadmaster. A rough sign of how sluggish
+  the machine was.
+
+In the demo, admission made `test` runs faster (13 s to 10 s) at the price of
+waits of up to 10 s, with no failures either way, and showed that `test` uses
+about 3 cores rather than 4. Periods with different kinds of work are not
+comparable, and a few dozen checks are noisy; compare similar weeks.
 
 ## Limitations
 

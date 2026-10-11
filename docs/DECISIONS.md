@@ -175,6 +175,11 @@ same moment on a fresh state directory occasionally got "database is locked"
 (found in the real-tools demo, about 1 run in 300). The switch is retried for
 up to the busy timeout; everything else relies on SQLite's busy handler.
 
+The schema version lives in `PRAGMA user_version`. A database from an older
+version is upgraded in place (version 1 gains each job's capacity and mode);
+an older `loadmaster` refuses a newer database with an error instead of
+guessing.
+
 ## Job IDs are never reused
 
 The `jobs` table uses `INTEGER PRIMARY KEY AUTOINCREMENT`. A plain
@@ -232,11 +237,87 @@ transaction would remove this cost; it is left out until it matters.
 ## History log
 
 `history.jsonl` in the state directory gets one JSON object per queued run:
-job ID, task, weight, caller directory, arguments, outcome (`exited`,
-`gave_up`, `interrupted`, `spawn_failed`, `error`), queue time, wait and run
-durations, and the exit code `loadmaster run` returned. Every run that got in
-line writes exactly one line, whatever happened afterwards. JSON Lines is easy
-to analyze with `jq`. It is not rotated.
+job ID, task, weight, capacity, whether the machine was in measure-only mode,
+caller directory, arguments, outcome (`exited`, `gave_up`, `interrupted`,
+`spawn_failed`, `error`, `lost`), queue time, wait and run durations, CPU
+time, the 1-minute load average when the task ended, the signal that killed
+the task, if any, and the exit code `loadmaster run` returned. Every run that
+got in line writes exactly one line, whatever happened afterwards: a
+`loadmaster` killed with SIGKILL cannot write its own, so the process that
+reaps its job writes a `lost` line for it, after the reaping is committed.
+That needs the capacity and mode of the job, which are therefore kept in the
+queue database. JSON Lines is easy to analyze with `jq`. It is not rotated.
+Fields added later are optional when read back, so older logs still work with
+`loadmaster report`.
+
+Known gaps, each needing an unusual combination of events, accepted rather
+than paid for with per-attempt IDs and logging inside the queue's
+transactions:
+
+- A `loadmaster` killed right after removing, parking or handing over its job
+  but before writing its line leaves no line.
+- If releasing or handing over a finished job fails (the database stayed
+  locked for the whole 60-second busy timeout), `loadmaster` warns, exits with
+  the task's code and logs its result, and the job is later also logged as
+  `lost`. The slot stays held until the task's processes are gone either way.
+- A run that gave up can, in theory, append its `gave_up` line after a re-run
+  that resumed its place has already finished; `report` then counts two
+  checks.
+- While a `loadmaster` from before `lost` logging is still running during an
+  upgrade, it can reap jobs without logging them.
+
+## Measuring the effect
+
+Whether admission helps depends on the checks and on how often agents overlap,
+so users need a way to find out from their own use.
+
+- **Measure-only mode** admits every job at once, ignoring both the capacity
+  and the line (a place kept by `--max-wait` from before the switch would
+  otherwise still block it), but keeps everything else: jobs are still in the
+  queue (and in `status`) and logged. This gives a baseline that differs from
+  admission in one thing only, with the same agent instructions, permissions
+  and hooks. Simply not using loadmaster would leave nothing to compare with.
+  A weight above the capacity is still an error, so both periods run with the
+  same configuration.
+- **A check is one request.** A re-run after exit code 75 resumes the same job,
+  so `report` joins all records of a job ID until one ends in something other
+  than `gave_up`. Its wait runs from the first time it got in line to the
+  start, which includes the agent's own delay before re-running: that delay is
+  part of what admission costs. Job IDs restart if the database is deleted,
+  so a record only joins a kept place if it has the queue's resume key (caller
+  directory, task, arguments) and starts within the place's lifetime of giving
+  up (120 seconds, plus two minutes for a busy database and clocks). A `lost`
+  record carries the time the job first got in line, so it may start earlier
+  than the attempts it joins.
+- **Results**: a task killed by a signal (recorded from its exit status), a
+  signal while waiting and a `lost` run are killed (usually a tool timeout);
+  exit code 0 is passed and any other code failed, so a task that exits with
+  143 on its own is a failure. Records without a `signal` field (from before
+  it was logged; `null` means "not killed") fall back to treating 129–192 as
+  killed. A place given up and never resumed, a
+  failed spawn and a loadmaster error are not run. A wait that never ended in
+  a start still counts, up to when it ended, so waits that ran into a timeout
+  are not hidden.
+- **Demand** replays the checks as if each had started the moment it got in
+  line, with its real run time. Runs under contention would have been longer,
+  so this underestimates the overload loadmaster prevented; it still shows
+  whether the agents overlap at all. The measure-only section uses the real
+  start times instead. Only checks whose run time is known are replayed, and
+  each counts until its main process exited: a slot kept by processes a task
+  left behind, or held by a `lost` run, is not counted. Run time and CPU time
+  are taken as soon as the task exits, before its slot is released, since
+  releasing it may wait for the database.
+- **Grouping**: tasks are grouped by name, across repositories, since
+  worktrees of one project have unrelated paths. `--dir TEXT` keeps only
+  checks run from directories whose path contains TEXT, which usually picks
+  out one project with all its worktrees.
+- **CPU time** is the task's `RUSAGE_CHILDREN` delta, which covers the task and
+  every descendant that was waited for. loadmaster has one child, so nothing
+  else is mixed in. Processes a task leaves behind are not counted.
+- **Load average** is the system-wide 1-minute average: it lags and includes
+  everything else on the machine, so it is only a rough signal. It is recorded
+  because "the machine is sluggish" is part of the problem, and nothing else
+  measures it.
 
 ## Messages are in English
 
