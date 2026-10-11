@@ -7,8 +7,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -104,6 +104,15 @@ pub fn spawn<E: Send + 'static>(
     command: &mut Command,
     register: impl FnOnce(ProcessGroup) -> Result<(), E> + Send + 'static,
 ) -> Result<Task, SpawnError<E>> {
+    // One gated spawn at a time per process. A child forked by a concurrent
+    // spawn would inherit this spawn's gate (and vice versa) until it execs;
+    // two children both waiting for their gate to close would then each keep
+    // the other's gate open forever. By the time this returns, every gate
+    // descriptor is closed again.
+    static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+    let _serialized = SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (hello_read, hello_write) = cloexec_pipe().map_err(SpawnError::Spawn)?; // child -> us: its PID
     let (gate_read, gate_write) = cloexec_pipe().map_err(SpawnError::Spawn)?; // us -> child: go ahead
     let fds = [&hello_read, &hello_write, &gate_read, &gate_write].map(|fd| fd.as_raw_fd());
@@ -308,6 +317,43 @@ mod tests {
         ));
         thread::sleep(Duration::from_millis(100));
         assert!(!marker.exists());
+    }
+
+    /// Gated spawns from several threads at once, half of them failing to
+    /// register, must neither deadlock nor run a task they shouldn't.
+    #[test]
+    fn concurrent_spawns_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|t| {
+                let dir = dir.path().to_owned();
+                thread::spawn(move || {
+                    for i in 0..5 {
+                        let marker = dir.join(format!("ran-{t}-{i}"));
+                        let mut cmd = Command::new("touch");
+                        cmd.arg(&marker);
+                        let fail = (t + i) % 2 == 0;
+                        let result = spawn(&mut cmd, move |_| if fail { Err(()) } else { Ok(()) });
+                        match result {
+                            Ok(mut task) => {
+                                assert!(!fail);
+                                assert!(task.child.wait().unwrap().success());
+                                assert!(marker.exists());
+                            }
+                            Err(_) => assert!(fail && !marker.exists()),
+                        }
+                    }
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        for worker in workers {
+            while !worker.is_finished() {
+                assert!(std::time::Instant::now() < deadline, "spawns deadlocked");
+                thread::sleep(Duration::from_millis(10));
+            }
+            worker.join().unwrap();
+        }
     }
 
     #[test]

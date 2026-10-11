@@ -20,7 +20,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
@@ -31,6 +31,9 @@ pub type JobId = i64;
 
 /// File name of the queue database inside the state directory.
 pub const STATE_DB_FILE: &str = "state.db";
+
+/// How long to wait for another process's lock on the database.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a parked job keeps its place in line without an owner.
 pub const PARK_TTL: Duration = Duration::from_secs(120);
@@ -188,10 +191,10 @@ impl Queue {
     /// Opens (creating if needed) the queue database at `path`.
     pub fn open(path: &Path) -> Result<Queue> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(60))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        enable_wal(&conn)?;
         // Losing the queue on power loss is fine: after a reboot every PID in
         // it is dead and gets reaped anyway.
-        let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         conn.execute_batch("PRAGMA synchronous = NORMAL")?;
         let queue = Queue {
             conn,
@@ -441,6 +444,27 @@ impl Drop for Ticket<'_> {
                  (it will be reclaimed once this process exits)",
                 self.id
             );
+        }
+    }
+}
+
+/// Switches the database to WAL mode, retrying while it is busy.
+///
+/// The switch needs an exclusive lock that SQLite tries to take once, without
+/// the busy handler, so several processes opening a brand-new database at the
+/// same time can get "database is locked" despite the busy timeout.
+fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
+    let deadline = Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)) {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e),
         }
     }
 }

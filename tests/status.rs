@@ -84,3 +84,27 @@ fn waiting_job_reports_progress_on_stderr() {
     );
     wait(&mut holder);
 }
+
+/// Many processes opening a brand-new queue at once must all succeed: SQLite
+/// switches to WAL without consulting the busy timeout, which used to surface
+/// as an occasional "database is locked".
+#[test]
+fn fresh_queue_survives_a_stampede() {
+    for _ in 0..40 {
+        let sandbox = Sandbox::new(4, "");
+        let mut children: Vec<_> = (0..20)
+            .map(|_| {
+                sandbox
+                    .cmd(&["status"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in &mut children {
+            let stderr = std::io::read_to_string(child.stderr.take().unwrap()).unwrap();
+            assert!(wait(child).success(), "{stderr}");
+        }
+    }
+}

@@ -34,6 +34,12 @@ exits with 125: running it untracked would let its slot be freed while it
 still runs. The child-side code uses only async-signal-safe calls (`close`,
 `getpid`, `write`, `read`).
 
+Gated spawns are serialized within a process. A child forked by one spawn
+inherits the other spawn's gate descriptors until it execs, so two children
+that both wait for their gate to close would keep each other's gate open
+forever. The CLI spawns only once per process, but the library's own tests
+deadlocked this way.
+
 ## Processes a task leaves behind keep its slot
 
 When the task's main process exits but other processes in its group are still
@@ -160,6 +166,14 @@ milliseconds, so it is accepted rather than paid for with a more complex wait.
   starts instead of giving up, since running is what the caller wanted and
   giving up would only make it re-run the command. That poll is normally at
   most 100 ms late, but can take longer while the database is busy.
+
+## Opening the queue
+
+Switching a new database to WAL mode takes an exclusive lock that SQLite tries
+to get once, without consulting the busy timeout. Five agents starting at the
+same moment on a fresh state directory occasionally got "database is locked"
+(found in the real-tools demo, about 1 run in 300). The switch is retried for
+up to the busy timeout; everything else relies on SQLite's busy handler.
 
 ## Job IDs are never reused
 
