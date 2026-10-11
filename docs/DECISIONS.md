@@ -163,7 +163,10 @@ milliseconds, so it is accepted rather than paid for with a more complex wait.
   reading the exit code and re-running the command, while limiting how long an
   abandoned place can block the line.
 - `LOADMASTER_MAX_WAIT` sets the default, so a Claude Code `env` setting can
-  apply it to every call without the agents having to remember the flag.
+  apply it to every call without the agents having to remember the flag. An
+  empty value means unset, as for `LOADMASTER_HELD`, so a script can turn the
+  limit off for the checks it runs by setting it to "" (clap's own `env`
+  support would reject the empty value).
 - `--max-wait` takes whole seconds and is a soft limit: it is checked after
   each poll, and a job that finds room on the poll that crosses the limit
   starts instead of giving up, since running is what the caller wanted and

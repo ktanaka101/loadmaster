@@ -381,9 +381,9 @@ extra arguments. A kept place still blocks jobs behind it, as if it were
 waiting, until it is resumed or expires. The 120 seconds are fixed, and each
 resumed run may again wait up to `--max-wait`.
 
-`LOADMASTER_MAX_WAIT` sets the default for `--max-wait`. You can tell
-loadmaster's 75 from a task that happens to exit with 75 by the
-`loadmaster: gave up waiting` line on stderr.
+`LOADMASTER_MAX_WAIT` sets the default for `--max-wait`; set to an empty
+string, it means no limit. You can tell loadmaster's 75 from a task that
+happens to exit with 75 by the `loadmaster: gave up waiting` line on stderr.
 
 ## Commands
 

@@ -99,6 +99,53 @@ fn max_wait_can_come_from_the_environment() {
 }
 
 #[test]
+fn an_empty_max_wait_in_the_environment_means_no_limit() {
+    // So a script can turn it off for its steps without unsetting it.
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let sandbox = sandbox(log.path());
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+
+    let mut waiter = sandbox
+        .cmd(&["run", "test"])
+        .env("LOADMASTER_MAX_WAIT", "")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("a waiting job", || {
+        sandbox
+            .job("test")
+            .is_some_and(|j| j.state == JobState::Waiting)
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(waiter.try_wait().unwrap().is_none(), "still waiting");
+
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+    assert!(wait(&mut waiter).success());
+    assert_eq!(std::fs::read_to_string(log.path()).unwrap(), "test \n");
+}
+
+#[test]
+fn an_invalid_max_wait_in_the_environment_is_an_error() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let sandbox = sandbox(log.path());
+    let output = sandbox
+        .cmd(&["run", "test"])
+        .env("LOADMASTER_MAX_WAIT", "ten")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    assert!(
+        stderr(&output).contains("LOADMASTER_MAX_WAIT=ten"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(sandbox.snapshot().jobs.is_empty(), "nothing was queued");
+}
+
+#[test]
 fn max_wait_does_not_apply_once_admitted() {
     let log = tempfile::NamedTempFile::new().unwrap();
     let sandbox = sandbox(log.path());

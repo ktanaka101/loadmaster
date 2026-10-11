@@ -33,6 +33,9 @@ const EXIT_ERROR: i32 = 125;
 const EXIT_CANNOT_EXECUTE: i32 = 126;
 const EXIT_NOT_FOUND: i32 = 127;
 
+/// The default for `--max-wait`.
+const MAX_WAIT_ENV: &str = "LOADMASTER_MAX_WAIT";
+
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -88,8 +91,9 @@ struct RunArgs {
     task: String,
 
     /// Give up after waiting this long and exit with code 75, keeping the place
-    /// in line: running the same command again from the same directory resumes it
-    #[arg(long, value_name = "SECONDS", env = "LOADMASTER_MAX_WAIT")]
+    /// in line: running the same command again from the same directory resumes
+    /// it. Defaults to $LOADMASTER_MAX_WAIT; empty or unset means no limit
+    #[arg(long, value_name = "SECONDS")]
     max_wait: Option<u64>,
 
     /// Extra arguments, appended to the task's cmd
@@ -121,6 +125,10 @@ fn run(args: RunArgs) -> Result<i32> {
     let repo = RepoConfig::discover(&cwd)?;
     let task = repo.task(&args.task)?;
     let command = runner::command(&task.cmd, &args.args, repo.dir());
+    let max_wait = match args.max_wait {
+        Some(secs) => Some(secs),
+        None => max_wait_from_env()?,
+    };
 
     if let Some(held) = env::var_os(HELD_ENV).filter(|v| !v.is_empty()) {
         return run_nested(&held, command);
@@ -176,7 +184,7 @@ fn run(args: RunArgs) -> Result<i32> {
         exit_code: None,
     };
     let result = (|| {
-        let max_wait = args.max_wait.map(Duration::from_secs);
+        let max_wait = max_wait.map(Duration::from_secs);
         let turn = if machine.measure_only {
             // Admitted whatever the capacity and place in line: the run
             // behaves as without loadmaster, and is only recorded.
@@ -415,6 +423,24 @@ fn held() -> Result<i32> {
         ));
     }
     Ok(0)
+}
+
+/// `$LOADMASTER_MAX_WAIT`, where empty means unset, as for LOADMASTER_HELD:
+/// a script can turn the limit off for its steps by setting it to "".
+fn max_wait_from_env() -> Result<Option<u64>> {
+    let Some(value) = env::var_os(MAX_WAIT_ENV).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let value = value.to_string_lossy().into_owned();
+    value
+        .trim()
+        .parse()
+        .map(Some)
+        .map_err(|_| Error::InvalidEnv {
+            var: MAX_WAIT_ENV,
+            value,
+            expected: "a whole number of seconds",
+        })
 }
 
 fn spawn_failure_code(err: &io::Error) -> i32 {

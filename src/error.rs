@@ -48,6 +48,13 @@ pub enum Error {
     )]
     InvalidHeld { value: String },
 
+    #[error("{var}={value} is invalid: expected {expected}")]
+    InvalidEnv {
+        var: &'static str,
+        value: String,
+        expected: &'static str,
+    },
+
     #[error("cannot determine the home directory: HOME is not set")]
     NoHome,
 
