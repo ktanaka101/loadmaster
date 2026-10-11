@@ -193,3 +193,24 @@ fn a_nested_run_from_another_checkout_is_rejected() {
     sandbox.release("hold");
     assert!(wait(&mut holder).success());
 }
+
+#[test]
+fn a_relative_machine_config_means_the_same_file_in_a_nested_run() {
+    // Started from `repo/sub` with LOADMASTER_CONFIG=../machine.toml: the
+    // outer run reads `repo/machine.toml` (capacity 4) and caps the weight
+    // of 8 at 4. The task runs in `repo`, where the same relative path names
+    // the sandbox's machine.toml (capacity 8): the nested run must judge by
+    // the same capacity, and fit.
+    let sandbox = Sandbox::new(8, "");
+    let tasks = task("outer", 8, &[BIN, "run", "inner"]) + &sh_task("inner", 8, "echo ran");
+    std::fs::write(sandbox.repo.join(".loadmaster.toml"), tasks).unwrap();
+    std::fs::write(sandbox.repo.join("machine.toml"), "capacity = 4\n").unwrap();
+    let sub = sandbox.repo.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut cmd = sandbox.cmd(&["run", "outer"]);
+    cmd.current_dir(&sub)
+        .env("LOADMASTER_CONFIG", "../machine.toml");
+    let output = output(cmd);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "ran\n");
+}

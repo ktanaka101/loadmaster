@@ -339,6 +339,10 @@ The running task gets two environment variables:
   [Nested runs](#nested-runs) and
   [Guarding a script](#guarding-a-script)).
 
+It also gets `LOADMASTER_STATE_DIR` and `LOADMASTER_CONFIG` as absolute paths,
+so a `loadmaster` it runs finds the same queue and machine config, though the
+task runs in the directory of `.loadmaster.toml`.
+
 If you need shell features, for example to use `LOADMASTER_WEIGHT`, call a
 shell explicitly. The trailing `"sh"` becomes `$0`, so the extra arguments
 arrive as `"$@"`:

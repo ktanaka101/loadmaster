@@ -104,8 +104,8 @@ fn not_found(start: &Path, repo_root: Option<&Path>, beyond: Option<&Path>) -> S
     };
     if let Some(beyond) = beyond {
         message += &format!(
-            "\n{} belongs to an enclosing repository (such as the main checkout of this \
-             worktree) and is not used: commit {REPO_CONFIG_FILE} on this branch",
+            "\n{} is outside this repository (in the main checkout a worktree lives in, \
+             for example) and is not used: commit {REPO_CONFIG_FILE} on this branch",
             beyond.display()
         );
     }

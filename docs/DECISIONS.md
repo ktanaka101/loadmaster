@@ -286,13 +286,16 @@ code 125) that says what to change:
 
 - The holder must be a running job started from the same checkout, the check
   `loadmaster held` makes. A stale or made-up `LOADMASTER_HELD`, or one that
-  leaked into another worktree, would otherwise let a run skip the queue.
-- The inner task's weight (capped at the capacity) must not exceed the
-  holder's, and every resource it uses must be in the holder's `uses` with at
-  least the same amount. Otherwise its load would run outside the accounting:
-  a heavy check inside a light one would overload the machine, and an e2e run
-  inside a task that holds no database would break the per-checkout limit
-  that keeps two runs off one database. Amounts are compared as declared.
+  leaked into another worktree, would otherwise let a run skip the queue. A
+  repository with more than one `.loadmaster.toml` has one checkout per file,
+  so a task cannot nest the tasks of another file.
+- The inner task's weight, capped at the capacity the holder got in line
+  with, must not exceed the holder's, and every resource it uses must be in
+  the holder's `uses` with at least the same amount. Otherwise its load would
+  run outside the accounting: a heavy check inside a light one would overload
+  the machine, and an e2e run inside a task that holds no database would break
+  the per-checkout limit that keeps two runs off one database. Amounts are
+  compared as declared.
 - Several nested runs at once inside one holder are not added up: like a task
   that starts more workers than its weight, that is the task's own business.
 
@@ -338,8 +341,9 @@ not every agent has them.
   that is where a CLI user expects them and what the documentation shows.
   `LOADMASTER_CONFIG` and `LOADMASTER_STATE_DIR` override them (the tests use
   this for isolation). Relative overrides are resolved against the current
-  directory, and the resolved state directory is passed on to the task, so a
-  nested run finds the same queue even though the task runs elsewhere.
+  directory, and the resolved state directory and machine config path are
+  passed on to the task, so a nested run finds the same queue and the same
+  capacity even though the task runs elsewhere.
 - The state directory is created with mode 0700: it holds command lines and
   paths.
 

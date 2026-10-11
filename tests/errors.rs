@@ -118,7 +118,7 @@ fn a_worktree_does_not_use_the_config_of_the_checkout_it_lives_in() {
     let output = output(cmd);
     assert_eq!(output.status.code(), Some(125));
     assert!(
-        stderr(&output).contains("belongs to an enclosing repository"),
+        stderr(&output).contains("is outside this repository"),
         "{}",
         stderr(&output)
     );

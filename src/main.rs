@@ -377,8 +377,10 @@ fn run_admitted(
     command
         .env(HELD_ENV, ticket.id().to_string())
         .env(WEIGHT_ENV, task.weight.to_string())
-        // Absolute, so nested runs find the same queue from any directory.
-        .env(config::STATE_DIR_ENV, state_dir);
+        // Absolute, so nested runs find the same queue and machine config
+        // from any directory: the task runs where .loadmaster.toml is.
+        .env(config::STATE_DIR_ENV, state_dir)
+        .env(config::CONFIG_ENV, config::machine_config_path()?);
     let (db, id) = (state_dir.join(STATE_DB_FILE), ticket.id());
     // Runs on another thread, so it opens its own connection.
     let register = move |group| -> Result<()> { Queue::open(&db)?.record_child(id, group) };
@@ -447,7 +449,12 @@ fn run_nested(value: &str, repo: &RepoConfig, task: &Task, mut command: Command)
             ),
         })
     };
-    let weight = task.weight.min(MachineConfig::load()?.capacity);
+    // Capped at the capacity the holder's slot was granted under.
+    let capacity = match holder.capacity {
+        Some(capacity) => capacity,
+        None => MachineConfig::load()?.capacity,
+    };
+    let weight = task.weight.min(capacity);
     if weight > holder.weight {
         return does_not_fit(
             format!(

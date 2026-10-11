@@ -540,7 +540,7 @@ mod tests {
         );
         assert!(
             msg.contains(&format!(
-                "{} belongs to an enclosing repository",
+                "{} is outside this repository",
                 main.path().join(REPO_CONFIG_FILE).display()
             )),
             "{msg}"
