@@ -101,6 +101,31 @@ fn missing_repo_config_is_rejected() {
 }
 
 #[test]
+fn a_worktree_does_not_use_the_config_of_the_checkout_it_lives_in() {
+    // A worktree under the main checkout, on a branch without a config: the
+    // main checkout's tasks would run against the main checkout's code.
+    let sandbox = Sandbox::new(4, &sh_task("lint", 1, "echo main"));
+    std::fs::create_dir(sandbox.repo.join(".git")).unwrap();
+    let worktree = sandbox.repo.join(".claude/worktrees/feature");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: ../../../.git/worktrees/feature\n",
+    )
+    .unwrap();
+    let mut cmd = sandbox.cmd(&["run", "lint"]);
+    cmd.current_dir(&worktree);
+    let output = output(cmd);
+    assert_eq!(output.status.code(), Some(125));
+    assert!(
+        stderr(&output).contains("belongs to an enclosing repository"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty());
+}
+
+#[test]
 fn broken_machine_config_is_rejected() {
     let (sandbox, mut holder) = busy_sandbox();
     for (text, expected) in [

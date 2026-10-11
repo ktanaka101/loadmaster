@@ -2,7 +2,6 @@
 //! Queue logic lives in the library.
 
 use std::env;
-use std::ffi::OsStr;
 use std::fs::{self, DirBuilder};
 use std::io::{self, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -138,7 +137,7 @@ fn run(args: RunArgs) -> Result<i32> {
     };
 
     if let Some(held) = env::var_os(HELD_ENV).filter(|v| !v.is_empty()) {
-        return run_nested(&held, command);
+        return run_nested(&held.to_string_lossy(), &repo, task, command);
     }
 
     let machine = MachineConfig::load()?;
@@ -433,18 +432,47 @@ fn run_admitted(
     Ok(runner::exit_code(status))
 }
 
-/// A `loadmaster run` inside a task that already holds a slot: verify the
-/// holder, then run directly. The nested task's load counts against the
-/// holder's weight.
-fn run_nested(held: &OsStr, mut command: Command) -> Result<i32> {
-    let value = held.to_string_lossy().into_owned();
-    let id: Option<JobId> = value.trim().parse().ok();
-    let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
-    match id {
-        Some(id) if queue.holder(id)?.is_some() => {}
-        _ => return Err(Error::InvalidHeld { value }),
+/// A `loadmaster run` inside a task that already holds a slot: it runs
+/// directly in that slot, since queueing for more from inside it could
+/// deadlock. So it must come from the holder's checkout and fit in what the
+/// holder holds: its weight and every resource it uses.
+fn run_nested(value: &str, repo: &RepoConfig, task: &Task, mut command: Command) -> Result<i32> {
+    let holder =
+        holder_here(value, repo.path())?.map_err(|reason| Error::InvalidHeld { reason })?;
+    let does_not_fit = |what: String, fix: String| {
+        Err(Error::NestedDoesNotFit {
+            reason: format!(
+                "{what} job #{} (`{}`) that it would run in: {fix}, or run `{}` on its own",
+                holder.id, holder.task, task.name
+            ),
+        })
+    };
+    let weight = task.weight.min(MachineConfig::load()?.capacity);
+    if weight > holder.weight {
+        return does_not_fit(
+            format!(
+                "`{}` has weight {weight}, more than the {} of",
+                task.name, holder.weight
+            ),
+            format!("give `{}` a weight of at least {weight}", holder.task),
+        );
     }
-    drop(queue);
+    for (name, &amount) in &task.uses {
+        let held = holder
+            .uses
+            .iter()
+            .find(|u| &u.name == name)
+            .map_or(0, |u| u.amount);
+        if amount > held {
+            return does_not_fit(
+                format!(
+                    "`{}` uses {amount} of `{name}`, more than the {held} of",
+                    task.name
+                ),
+                format!("add `{name} = {amount}` to the `uses` of `{}`", holder.task),
+            );
+        }
+    }
     let program = command.get_program().to_string_lossy().into_owned();
     let err = command.exec();
     say!("loadmaster: error: cannot run `{program}`: {err}");
@@ -456,8 +484,7 @@ fn run_nested(held: &OsStr, mut command: Command) -> Result<i32> {
 /// script can use it as a guard.
 fn held(args: HeldArgs) -> Result<i32> {
     let cwd = env::current_dir().map_err(|e| Error::io("cannot read the current directory", e))?;
-    let checkout =
-        RepoConfig::find(&cwd).ok_or_else(|| Error::RepoConfigNotFound { start: cwd.clone() })?;
+    let checkout = RepoConfig::locate(&cwd)?;
     let not_held = |reason: String| -> Result<i32> {
         say!(
             "loadmaster: not running through loadmaster: {reason}\n\
@@ -469,35 +496,10 @@ fn held(args: HeldArgs) -> Result<i32> {
     let Some(value) = env::var_os(HELD_ENV).filter(|v| !v.is_empty()) else {
         return not_held(format!("{HELD_ENV} is not set"));
     };
-    let value = value.to_string_lossy().into_owned();
-    let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
-    let job = match value.trim().parse::<JobId>() {
-        Ok(id) => queue.holder(id)?,
-        Err(_) => None,
+    let job = match holder_here(&value.to_string_lossy(), &checkout)? {
+        Ok(job) => job,
+        Err(reason) => return not_held(reason),
     };
-    let Some(job) = job else {
-        return not_held(format!(
-            "{HELD_ENV}={value} does not refer to a running job"
-        ));
-    };
-    // A checkout is the resolved directory of its .loadmaster.toml, as for
-    // per-checkout limits: a symlink to the same checkout matches, a worktree
-    // whose config is a symlink to another's file does not.
-    let resolved_dir = |config: &Path| config.parent().and_then(|dir| fs::canonicalize(dir).ok());
-    let here = resolved_dir(&checkout);
-    let theirs = match &job.checkout {
-        Some(dir) => Some(dir.clone()),
-        // Recorded before checkouts were.
-        None => RepoConfig::find(&job.dir).and_then(|config| resolved_dir(&config)),
-    };
-    if here.is_none() || theirs != here {
-        return not_held(format!(
-            "job #{} (`{}`) was started from another checkout, in {}",
-            job.id,
-            job.task,
-            job.dir.display()
-        ));
-    }
     if let Some(missing) = args
         .uses
         .iter()
@@ -509,6 +511,41 @@ fn held(args: HeldArgs) -> Result<i32> {
         ));
     }
     Ok(0)
+}
+
+/// The job that `value` (a LOADMASTER_HELD) names, if it is running and was
+/// started from the checkout of `config`, this checkout's .loadmaster.toml;
+/// otherwise why not. Both `held` and nested runs check this.
+fn holder_here(value: &str, config: &Path) -> Result<std::result::Result<Job, String>> {
+    let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
+    let job = match value.trim().parse::<JobId>() {
+        Ok(id) => queue.holder(id)?,
+        Err(_) => None,
+    };
+    let Some(job) = job else {
+        return Ok(Err(format!(
+            "{HELD_ENV}={value} does not refer to a running job"
+        )));
+    };
+    // A checkout is the resolved directory of its .loadmaster.toml, as for
+    // per-checkout limits: a symlink to the same checkout matches, a worktree
+    // whose config is a symlink to another's file does not.
+    let resolved_dir = |config: &Path| config.parent().and_then(|dir| fs::canonicalize(dir).ok());
+    let here = resolved_dir(config);
+    let theirs = match &job.checkout {
+        Some(dir) => Some(dir.clone()),
+        // Recorded before checkouts were.
+        None => RepoConfig::find(&job.dir).and_then(|config| resolved_dir(&config)),
+    };
+    if here.is_none() || theirs != here {
+        return Ok(Err(format!(
+            "job #{} (`{}`) was started from another checkout, in {}",
+            job.id,
+            job.task,
+            job.dir.display()
+        )));
+    }
+    Ok(Ok(job))
 }
 
 /// `$LOADMASTER_MAX_WAIT`, where empty means unset, as for LOADMASTER_HELD:

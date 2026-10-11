@@ -75,23 +75,36 @@ struct TaskFile {
 }
 
 impl RepoConfig {
-    /// Finds and loads `.loadmaster.toml` in `start` or the nearest parent
-    /// directory.
+    /// Finds and loads the repository's `.loadmaster.toml` (see
+    /// [`RepoConfig::find`]).
     pub fn discover(start: &Path) -> Result<RepoConfig> {
-        Self::find(start)
-            .ok_or_else(|| Error::RepoConfigNotFound {
+        Self::locate(start).and_then(|path| Self::load(&path))
+    }
+
+    /// Like [`RepoConfig::find`], but not finding it is an error that says
+    /// where the search looked.
+    pub fn locate(start: &Path) -> Result<PathBuf> {
+        match search(start) {
+            Search::Found(path) => Ok(path),
+            Search::NotFound { repo_root, beyond } => Err(Error::RepoConfigNotFound {
                 start: start.to_owned(),
-            })
-            .and_then(|path| Self::load(&path))
+                repo_root,
+                beyond,
+            }),
+        }
     }
 
     /// The path of `.loadmaster.toml` in `start` or the nearest parent
-    /// directory, without reading it.
+    /// directory, without reading it. The search stops at the root of the
+    /// repository `start` is in, the nearest directory with a `.git` entry
+    /// (a linked worktree or a submodule has one too): a file further up
+    /// belongs to another repository, such as the main checkout a worktree
+    /// lives in, and its tasks would run against that repository's code.
     pub fn find(start: &Path) -> Option<PathBuf> {
-        start
-            .ancestors()
-            .map(|dir| dir.join(REPO_CONFIG_FILE))
-            .find(|path| path.is_file())
+        match search(start) {
+            Search::Found(path) => Some(path),
+            Search::NotFound { .. } => None,
+        }
     }
 
     pub fn load(path: &Path) -> Result<RepoConfig> {
@@ -159,6 +172,38 @@ impl RepoConfig {
                 .map(|t| (t.name.clone(), t.weight))
                 .collect(),
         })
+    }
+}
+
+enum Search {
+    Found(PathBuf),
+    NotFound {
+        /// Where the search stopped, if `start` is in a repository.
+        repo_root: Option<PathBuf>,
+        /// A config further up, outside the repository, for the message.
+        beyond: Option<PathBuf>,
+    },
+}
+
+fn search(start: &Path) -> Search {
+    let mut ancestors = start.ancestors();
+    for dir in ancestors.by_ref() {
+        let path = dir.join(REPO_CONFIG_FILE);
+        if path.is_file() {
+            return Search::Found(path);
+        }
+        if dir.join(".git").exists() {
+            return Search::NotFound {
+                repo_root: Some(dir.to_owned()),
+                beyond: ancestors
+                    .map(|dir| dir.join(REPO_CONFIG_FILE))
+                    .find(|path| path.is_file()),
+            };
+        }
+    }
+    Search::NotFound {
+        repo_root: None,
+        beyond: None,
     }
 }
 
@@ -463,6 +508,50 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let msg = message(RepoConfig::discover(root.path()).unwrap_err());
         assert!(msg.contains("no .loadmaster.toml found"), "{msg}");
+    }
+
+    #[test]
+    fn the_search_stops_at_the_root_of_the_repository() {
+        // The main checkout has a config; a worktree inside it, on a branch
+        // without one, must not run the main checkout's tasks.
+        let main = tempfile::tempdir().unwrap();
+        std::fs::write(
+            main.path().join(REPO_CONFIG_FILE),
+            "[tasks.t]\nweight = 1\ncmd = [\"true\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir(main.path().join(".git")).unwrap();
+        let worktree = main.path().join(".claude/worktrees/feature");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}/.git/worktrees/feature\n", main.path().display()),
+        )
+        .unwrap();
+
+        assert_eq!(RepoConfig::find(&worktree.join("src")), None);
+        let msg = message(RepoConfig::discover(&worktree.join("src")).unwrap_err());
+        assert!(
+            msg.contains(&format!(
+                "up to the root of its repository, {}",
+                worktree.display()
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "{} belongs to an enclosing repository",
+                main.path().join(REPO_CONFIG_FILE).display()
+            )),
+            "{msg}"
+        );
+        // Within the main checkout, its own config is found.
+        let sub = main.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(
+            RepoConfig::find(&sub),
+            Some(main.path().join(REPO_CONFIG_FILE))
+        );
     }
 
     #[test]

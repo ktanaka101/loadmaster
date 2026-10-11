@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::REPO_CONFIG_FILE;
 use crate::queue::JobId;
@@ -8,8 +8,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("no {REPO_CONFIG_FILE} found in {} or any parent directory", start.display())]
-    RepoConfigNotFound { start: PathBuf },
+    #[error("{}", not_found(start, repo_root.as_deref(), beyond.as_deref()))]
+    RepoConfigNotFound {
+        start: PathBuf,
+        repo_root: Option<PathBuf>,
+        beyond: Option<PathBuf>,
+    },
 
     #[error("cannot read {}: {source}", path.display())]
     ReadConfig { path: PathBuf, source: io::Error },
@@ -29,11 +33,18 @@ pub enum Error {
     },
 
     #[error(
-        "LOADMASTER_HELD={value} does not refer to a running loadmaster job\n\
-         `loadmaster run` was started with LOADMASTER_HELD set, but that job is gone or never existed; \
+        "{reason}\n\
+         `loadmaster run` was started with LOADMASTER_HELD set, so it would run in that job's slot; \
          unset LOADMASTER_HELD if it leaked into this environment"
     )]
-    InvalidHeld { value: String },
+    InvalidHeld { reason: String },
+
+    #[error(
+        "{reason}\n\
+         a nested `loadmaster run` uses the slot of the job that holds it, and waiting for more \
+         from inside that slot could deadlock"
+    )]
+    NestedDoesNotFit { reason: String },
 
     #[error("{var}={value} is invalid: expected {expected}")]
     InvalidEnv {
@@ -73,6 +84,32 @@ impl Error {
             source,
         }
     }
+}
+
+fn not_found(start: &Path, repo_root: Option<&Path>, beyond: Option<&Path>) -> String {
+    let mut message = match repo_root {
+        Some(root) if root == start => format!(
+            "no {REPO_CONFIG_FILE} found in {}, the root of its repository",
+            start.display()
+        ),
+        Some(root) => format!(
+            "no {REPO_CONFIG_FILE} found in {} or its parents up to the root of its repository, {}",
+            start.display(),
+            root.display()
+        ),
+        None => format!(
+            "no {REPO_CONFIG_FILE} found in {} or any parent directory",
+            start.display()
+        ),
+    };
+    if let Some(beyond) = beyond {
+        message += &format!(
+            "\n{} belongs to an enclosing repository (such as the main checkout of this \
+             worktree) and is not used: commit {REPO_CONFIG_FILE} on this branch",
+            beyond.display()
+        );
+    }
+    message
 }
 
 fn format_tasks(tasks: &[(String, u32)]) -> String {

@@ -271,8 +271,30 @@ each job starts at the same time whether or not the jobs that got in line
 after it exist. The soak test adds resources and a second checkout and checks
 every limit from inside the tasks.
 
-Nested runs still skip every check, so an outer task must declare what its
-nested runs use.
+A nested run takes no part in admission: it has to fit in its holder's
+slot (see [Nested runs](#nested-runs)).
+
+## Nested runs
+
+A `loadmaster run` inside a task (one that sees `LOADMASTER_HELD`) runs
+directly in the holder's slot instead of queueing. Queueing could deadlock:
+the inner job could wait for capacity, or for a resource, that only the
+holder's own job will free, or behind a job that waits for that.
+
+So the inner run must fit where it runs, and anything else is an error (exit
+code 125) that says what to change:
+
+- The holder must be a running job started from the same checkout, the check
+  `loadmaster held` makes. A stale or made-up `LOADMASTER_HELD`, or one that
+  leaked into another worktree, would otherwise let a run skip the queue.
+- The inner task's weight (capped at the capacity) must not exceed the
+  holder's, and every resource it uses must be in the holder's `uses` with at
+  least the same amount. Otherwise its load would run outside the accounting:
+  a heavy check inside a light one would overload the machine, and an e2e run
+  inside a task that holds no database would break the per-checkout limit
+  that keeps two runs off one database. Amounts are compared as declared.
+- Several nested runs at once inside one holder are not added up: like a task
+  that starts more workers than its weight, that is the task's own business.
 
 ## Checking that a script runs through the queue
 
@@ -280,12 +302,12 @@ nested runs use.
 started it. Permission rules and hooks only see an agent's own commands, and
 not every agent has them.
 
-- It accepts what a nested run accepts, a `LOADMASTER_HELD` that names a
-  running job, and also requires that job to have been started from the same
-  checkout, in the sense of per-checkout limits: the resolved directory of the
-  `.loadmaster.toml` found from the current directory. Otherwise a value that
-  leaked into another worktree would pass. The file is only located, not
-  parsed, so a config edited while the job runs makes no difference.
+- It makes the check a nested run makes: `LOADMASTER_HELD` must name a
+  running job started from the same checkout, in the sense of per-checkout
+  limits (the resolved directory of the `.loadmaster.toml` found from the
+  current directory). Otherwise a value that leaked into another worktree
+  would pass. The file is only located, not parsed, so a config edited while
+  the job runs makes no difference.
 - It does not check the task's name. A guarded script can be run by several
   tasks, and by a nested run, whose job is the outer task's. What such a
   script depends on is a resource: `--uses NAME` also requires the job to use
@@ -303,6 +325,14 @@ not every agent has them.
 
 - Tasks run in the directory containing `.loadmaster.toml`, so `cmd` can
   always be written relative to the repository root.
+- The search for `.loadmaster.toml` goes up from the current directory and
+  stops at the root of its repository: the nearest directory with a `.git`
+  entry, which linked worktrees and submodules have as a file. A file further
+  up belongs to another repository. The case that mattered: a worktree inside
+  the main checkout (under `.claude/worktrees/`, say) on a branch without the
+  file used to find the main checkout's, and quietly ran its tasks against the
+  main checkout's code. Now it fails and names the file it did not use.
+  Outside any repository the search goes up to `/`.
 - Config and state follow the XDG layout on macOS as well
   (`~/.config/loadmaster/config.toml`, `~/.local/state/loadmaster/`), because
   that is where a CLI user expects them and what the documentation shows.
@@ -344,7 +374,8 @@ transaction would remove this cost; it is left out until it matters.
   new runs. Weights are summed as 64-bit integers, so even `capacity =
   4294967295` cannot overflow the admission check.
 - Nested runs skip the capacity check and inherit the holder's
-  `LOADMASTER_WEIGHT`: they run inside the holder's slot.
+  `LOADMASTER_WEIGHT`: they run inside the holder's slot, which they must fit
+  (see [Nested runs](#nested-runs)).
 - A weight above the capacity counts as the whole capacity, and the task runs
   alone. Weights are committed with the repository while the capacity belongs
   to each machine, so a repository's weights have to work on smaller machines

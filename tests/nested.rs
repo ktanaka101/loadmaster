@@ -1,6 +1,7 @@
 //! Acceptance criteria 4 and 10: nested `loadmaster run` runs under the
-//! holder's slot without deadlocking, and a stale or bogus LOADMASTER_HELD is
-//! rejected instead of silently bypassing the queue.
+//! holder's slot without deadlocking, and a stale, bogus or leaked
+//! LOADMASTER_HELD, or a nested task that does not fit in the holder's slot,
+//! is rejected instead of silently bypassing the queue.
 
 mod common;
 
@@ -71,7 +72,7 @@ fn stale_or_bogus_held_is_rejected() {
             .unwrap();
         assert_eq!(output.status.code(), Some(125), "HELD={value:?}");
         assert!(
-            stderr(&output).contains("does not refer to a running loadmaster job"),
+            stderr(&output).contains("does not refer to a running job"),
             "HELD={value:?}: {}",
             stderr(&output)
         );
@@ -119,4 +120,76 @@ fn nested_run_finds_the_queue_with_a_relative_state_dir() {
     let output = output(cmd);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(sandbox.path("inner.ran").exists());
+}
+
+fn with_uses(task: String, uses: &str) -> String {
+    task.replacen("cmd = ", &format!("uses = {uses}\ncmd = "), 1)
+}
+
+#[test]
+fn a_nested_run_must_fit_in_the_slot_it_runs_in() {
+    let sandbox = Sandbox::new(8, "");
+    let tasks = "[resources.db]\ncapacity = 1\n\n".to_owned()
+        + &task("small-outer", 2, &[BIN, "run", "heavy"])
+        + &task("no-db-outer", 4, &[BIN, "run", "needs-db"])
+        + &with_uses(task("db-outer", 4, &[BIN, "run", "needs-db"]), "{ db = 1 }")
+        + &sh_task("heavy", 4, "echo ran")
+        + &with_uses(sh_task("needs-db", 1, "echo ran"), "{ db = 1 }");
+    std::fs::write(sandbox.repo.join(".loadmaster.toml"), tasks).unwrap();
+
+    let too_heavy = sandbox.run(&["run", "small-outer"]);
+    assert_eq!(too_heavy.status.code(), Some(125));
+    let err = stderr(&too_heavy);
+    assert!(
+        err.contains("`heavy` has weight 4, more than the 2 of job #"),
+        "{err}"
+    );
+    assert!(
+        err.contains("give `small-outer` a weight of at least 4"),
+        "{err}"
+    );
+    assert!(stdout(&too_heavy).is_empty());
+
+    let no_db = sandbox.run(&["run", "no-db-outer"]);
+    assert_eq!(no_db.status.code(), Some(125));
+    let err = stderr(&no_db);
+    assert!(err.contains("`needs-db` uses 1 of `db`"), "{err}");
+    assert!(
+        err.contains("add `db = 1` to the `uses` of `no-db-outer`"),
+        "{err}"
+    );
+
+    let fits = sandbox.run(&["run", "db-outer"]);
+    assert!(fits.status.success(), "{}", stderr(&fits));
+    assert_eq!(stdout(&fits), "ran\n");
+}
+
+#[test]
+fn a_nested_run_from_another_checkout_is_rejected() {
+    // A LOADMASTER_HELD that leaked into another worktree.
+    let sandbox = sandbox("inner.ran");
+    let other = sandbox.path("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::copy(
+        sandbox.repo.join(".loadmaster.toml"),
+        other.join(".loadmaster.toml"),
+    )
+    .unwrap();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let id = sandbox.job("hold").unwrap().id.to_string();
+
+    let mut cmd = sandbox.cmd(&["run", "inner"]);
+    cmd.current_dir(&other).env("LOADMASTER_HELD", &id);
+    let output = output(cmd);
+    assert_eq!(output.status.code(), Some(125));
+    assert!(
+        stderr(&output).contains("was started from another checkout"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!sandbox.path("inner.ran").exists());
+
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
 }

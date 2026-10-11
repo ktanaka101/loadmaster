@@ -234,12 +234,14 @@ budget, and no single call can bring its own idea of the capacity.
 ### Repository: `.loadmaster.toml`
 
 loadmaster looks for `.loadmaster.toml` in the current directory and then in
-each parent directory. Tasks run in the directory that contains it.
+each parent directory, up to the root of the repository it is in (the nearest
+directory with a `.git`, which linked worktrees and submodules have too), and
+no further. Tasks run in the directory that contains it.
 
-Commit it on every branch your worktrees use. If a worktree lives inside the
-main checkout (for example under `.claude/worktrees/`) and its branch has no
-`.loadmaster.toml`, the search finds the main checkout's file, and the tasks
-quietly run against the main checkout's code.
+Commit it on every branch your worktrees use. A worktree inside the main
+checkout (for example under `.claude/worktrees/`) whose branch has no
+`.loadmaster.toml` does not pick up the main checkout's file, whose tasks would
+run against the main checkout's code: loadmaster says so and fails.
 
 | Key | Meaning |
 | --- | --- |
@@ -275,10 +277,13 @@ far off: in a demo project, vitest with 4 workers kept 3.8 cores busy, but
 Playwright with 4 workers only 1.2, because browser tests mostly wait. A
 weight that is too high costs real time: with e2e weighted 8 instead of 2, five
 agents verifying at once took 126 seconds instead of 40, all of it spent
-waiting. Weights are a single number: if memory rather than CPU is what runs
-out, size them by memory instead. Once tasks run through loadmaster,
-`loadmaster report` shows the cores each one really kept busy (`CORES`),
-measured the same way.
+waiting. If memory or something else rather than CPU runs out, declare it as
+a [resource](#resources-besides-cpu) instead of inflating the weight. Once
+tasks run through loadmaster, `loadmaster report` shows the cores each one
+really kept busy (`CORES`), measured the same way. It counts only the task's
+own processes: load the task causes elsewhere, such as in Docker containers
+or a database server it talks to, is not in it, so size such tasks by hand
+(`docker stats` and the load average help).
 
 ### Resources besides CPU
 
@@ -321,6 +326,10 @@ A job waiting for a resource holds back only that resource: a lint that needs
 no database can start while an e2e run waits for one, as long as it leaves the
 e2e run the CPU it will need. A job waiting for CPU still holds back everyone
 behind it. See [How it works](#how-it-works).
+
+Make manual operations on a resource tasks too, such as resetting the e2e
+database by hand: `uses = { e2e-db = 1 }` then makes them wait for the runs
+using it, and keeps new runs off it until they are done.
 
 The running task gets two environment variables:
 
@@ -371,6 +380,13 @@ that already passed. Set `LOADMASTER_MAX_WAIT` to an empty string for them, as
 above, and give the script itself a timeout that covers the waits. An agent
 that needs to keep its place across tool timeouts can run the checks one
 command at a time instead.
+
+Not every check has to be a task. A job waiting for CPU holds back every job
+behind it, so a quick check queued behind a heavy one waits for it, even with
+cores free; that is what keeps heavy jobs from starving. A check that keeps a
+core busy for a few seconds, such as a single test file, can instead run
+outside the queue and never wait. Leave room for such checks in the capacity
+(the default keeps 2 cores out of it).
 
 ### Machine: `~/.config/loadmaster/config.toml`
 
@@ -438,14 +454,18 @@ one with outcome `lost`.
 
 If a task itself calls `loadmaster run`, the inner call must not queue: it
 would wait forever for the slot its own parent holds. The inner call sees
-`LOADMASTER_HELD`, checks in the queue that this job is really running, and
-then runs directly, without taking another slot. A stale or bogus
-`LOADMASTER_HELD` is an error, not a free pass.
+`LOADMASTER_HELD` and runs directly in that job's slot, without taking
+another one, so it has to fit there:
 
-The inner task's load counts against the outer task's weight, so give the outer
-task a weight, and `uses`, that cover everything it runs. Nested runs keep a task that
-happens to call loadmaster, such as a script that is also run on its own, from
-deadlocking; to run several checks in a row, prefer
+- the job must be running and must have been started from the same checkout,
+  so a stale, made-up or leaked `LOADMASTER_HELD` is not a free pass;
+- the inner task's weight must not exceed the outer task's, and every resource
+  it uses must be in the outer task's `uses`, with at least the same amount.
+
+Otherwise the inner call fails with exit code 125 and says what to change.
+Give the outer task a weight and `uses` that cover everything it runs. Nested
+runs keep a task that happens to call loadmaster, such as a script that is
+also run on its own, from deadlocking; to run several checks in a row, prefer
 [one `loadmaster run` per check](#one-check-per-task).
 
 ### Giving up without losing your place
@@ -517,7 +537,7 @@ stop a running job, signal its task's process group, e.g. `kill -TERM -12346`.
 | task's code | The task ran and exited normally. |
 | 128 + n | The task was killed by signal n, or loadmaster was interrupted by signal n while waiting. |
 | 75 | `--max-wait` elapsed. The job keeps its place in line; run the same command again to resume. |
-| 125 | loadmaster itself failed: unknown task, invalid config, invalid `LOADMASTER_HELD` or `LOADMASTER_MAX_WAIT`, bad arguments. |
+| 125 | loadmaster itself failed: unknown task, invalid config, no `.loadmaster.toml` in this repository, invalid `LOADMASTER_HELD` or `LOADMASTER_MAX_WAIT`, a nested task that does not fit in its holder's slot, bad arguments. |
 | 126 | The task's program could not be executed. |
 | 127 | The task's program was not found. |
 
