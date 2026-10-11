@@ -214,3 +214,32 @@ fn a_relative_machine_config_means_the_same_file_in_a_nested_run() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "ran\n");
 }
+
+#[test]
+fn a_holder_that_recorded_no_capacity_is_judged_by_the_uncapped_weight() {
+    // A job queued by a version that did not record the capacity: the inner
+    // weight is not capped, which can only be stricter.
+    let sandbox = Sandbox::new(4, "");
+    let tasks = sh_task("hold", 4, &sandbox.hold_script("hold")) + &sh_task("inner", 8, "echo ran");
+    std::fs::write(sandbox.repo.join(".loadmaster.toml"), tasks).unwrap();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let id = sandbox.job("hold").unwrap().id;
+    rusqlite::Connection::open(sandbox.state.join(loadmaster::queue::STATE_DB_FILE))
+        .unwrap()
+        .execute("UPDATE jobs SET capacity = NULL WHERE id = ?1", [id])
+        .unwrap();
+
+    let mut cmd = sandbox.cmd(&["run", "inner"]);
+    cmd.env("LOADMASTER_HELD", id.to_string());
+    let output = output(cmd);
+    assert_eq!(output.status.code(), Some(125), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("`inner` has weight 8, more than the 4 of"),
+        "{}",
+        stderr(&output)
+    );
+
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+}

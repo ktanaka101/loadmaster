@@ -449,12 +449,12 @@ fn run_nested(value: &str, repo: &RepoConfig, task: &Task, mut command: Command)
             ),
         })
     };
-    // Capped at the capacity the holder's slot was granted under.
-    let capacity = match holder.capacity {
-        Some(capacity) => capacity,
-        None => MachineConfig::load()?.capacity,
-    };
-    let weight = task.weight.min(capacity);
+    // Capped at the capacity the holder's slot was granted under. A holder
+    // that recorded none (queued by a version from before 0.1) is judged by
+    // the uncapped weight, which can only be stricter.
+    let weight = holder
+        .capacity
+        .map_or(task.weight, |capacity| task.weight.min(capacity));
     if weight > holder.weight {
         return does_not_fit(
             format!(
