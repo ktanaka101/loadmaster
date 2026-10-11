@@ -238,7 +238,18 @@ The weight does not change with the arguments: `loadmaster run test -- one.test.
 still counts as 4. Extra arguments come after the fixed ones, so leave out of
 `cmd` whatever callers should be able to pass (a path, for example), and note
 that relative paths are resolved from the directory containing
-`.loadmaster.toml`.
+`.loadmaster.toml`. When the cost depends a lot on the arguments, as for a
+whole test suite and a single test file, define a task for each:
+
+```toml
+[tasks.test]
+weight = 8
+cmd = ["npx", "vitest", "run"]
+
+[tasks.test-file]
+weight = 1
+cmd = ["npx", "vitest", "run", "--maxWorkers=1"]
+```
 
 Choosing weights: measure, don't guess. Run the task alone and divide its CPU
 time by its wall time:
@@ -294,14 +305,23 @@ steps:
 ```bash
 #!/bin/sh
 set -e
+export LOADMASTER_MAX_WAIT=  # no limit for the steps; see below
 loadmaster run lint
 loadmaster run test
 loadmaster run e2e
 ```
 
-Such a script stops at exit code 75 as at any other failure, and running it
-again repeats the checks that already passed. To avoid that, have agents run
-the checks one command at a time instead of through the script.
+This is a trade-off, made on purpose: a series gets back in line for each
+step, so it finishes later than if it held the machine throughout, and in
+exchange the short checks that agents run while they iterate don't wait
+behind it.
+
+The steps of a script should not give up waiting: exit code 75 would stop the
+script like any other failure, and running it again would repeat the steps
+that already passed. Set `LOADMASTER_MAX_WAIT` to an empty string for them, as
+above, and give the script itself a timeout that covers the waits. An agent
+that needs to keep its place across tool timeouts can run the checks one
+command at a time instead.
 
 ### Machine: `~/.config/loadmaster/config.toml`
 
@@ -483,6 +503,26 @@ accidents, not a security boundary.
 Tools you don't control, such as `npx vitest` run directly, still bypass the
 queue; in Claude Code, [blocking direct execution](#3-block-direct-execution)
 catches those.
+
+### Where loadmaster must be installed
+
+Scripts that go through loadmaster need it wherever they run: on every
+developer's machine, in CI, in containers and in agent sandboxes. Either route
+only the scripts that agents use and let CI call the tools directly, or install
+loadmaster in CI too (a prebuilt binary or mise). On a small CI runner, a
+weight above the capacity simply runs alone. An agent that sandboxes its
+commands must also be allowed to write to the state directory, or loadmaster
+fails with exit code 125 (see the sandbox setting for Claude Code below).
+
+### Switching over with existing worktrees
+
+Each worktree runs the scripts of its own branch. Until the loadmaster setup
+has reached every branch you work on, worktrees on older branches keep running
+checks the old way, and loadmaster cannot see that load. Merge the setup into
+those branches (or rebase them) before relying on it. If they used another
+coordination mechanism, such as a lock file, keep taking that lock inside the
+new tasks' `cmd` while old worktrees remain, so that both sides still see each
+other; remove it once the last old worktree is gone.
 
 ## Using it with Claude Code
 
