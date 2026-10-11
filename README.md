@@ -35,7 +35,7 @@ a stream of small ones.
 | Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. Ready-made Claude Code settings: instructions, timeouts, permissions, a hook that blocks direct runs. |
 | Platforms | macOS and Linux. Not Windows. |
 | Integration cost | One binary, one `.loadmaster.toml` per repository, a few lines of agent instructions. Removing it means deleting those, `~/.local/state/loadmaster` and `~/.config/loadmaster`. |
-| Status | 0.1, new. See [Status](#status) for what has and hasn't been verified. |
+| Status | 0.1, new. Verified with tests, soak tests and real Claude Code sessions with biome, vitest and Playwright; see [Status](#status). |
 | License | MIT or Apache-2.0 |
 
 ## Is it for you?
@@ -93,10 +93,28 @@ loadmaster is new (0.1). What has been verified:
   whole machine, that time has to go somewhere, and waiting replaces the
   timeouts it would otherwise cause.
 
-Not verified yet: weeks of real use, and real tools such as vitest or
-Playwright. loadmaster only starts commands, so any tool should work, but see
-[Limitations](#limitations) for tools that use the terminal, leave daemons
-behind or start their own process groups.
+- With real tools (biome, vitest, Playwright with a `webServer`) on the same
+  Mac, five agents verifying at once (`test`, then `e2e`, each in its own
+  worktree):
+
+  | Setup | Wall time | vitest | Playwright |
+  | --- | --- | --- | --- |
+  | Run directly, default parallelism | 39–45 s | all 5 runs failed: 120 tests timed out | passed |
+  | Run directly, 4 workers each | 36 s | passed | passed |
+  | loadmaster, measured weights (capacity 12, test 4, e2e 2) | 39–40 s | passed | passed |
+  | loadmaster, e2e weighted 8 (capacity 8) | 126 s | passed | passed |
+
+  The same tests pass alone in 3 seconds. With weights that match what the
+  tasks really use, loadmaster removed the false failures at no cost in time;
+  an overestimated weight made everyone wait.
+- Five real Claude Code sessions then ran lint, test and e2e three times each
+  on that project with the measured weights: all 45 checks passed through
+  loadmaster (longest wait 8.6 s), and the hook blocked a direct
+  `npx vitest run`.
+
+Not verified yet: weeks of real use. loadmaster only starts commands, so other
+tools should work too, but see [Limitations](#limitations) for tools that use
+the terminal, leave daemons behind or start their own process groups.
 
 ## Install
 
@@ -113,7 +131,8 @@ Add `.loadmaster.toml` to the repository root and commit it, so every worktree
 shares it:
 
 ```toml
-# weight ≈ how many CPU cores the task keeps busy
+# weight ≈ how many CPU cores the task keeps busy; measure yours
+# (see "Choosing weights" below)
 [tasks.lint]
 weight = 1
 cmd = ["npx", "biome", "check", "."]
@@ -123,7 +142,7 @@ weight = 4
 cmd = ["npx", "vitest", "run", "--maxWorkers=4"]
 
 [tasks.e2e]
-weight = 8
+weight = 2
 cmd = ["npx", "playwright", "test", "--workers=4"]
 ```
 
@@ -205,13 +224,26 @@ still counts as 4. Extra arguments come after the fixed ones, so leave out of
 that relative paths are resolved from the directory containing
 `.loadmaster.toml`.
 
-Choosing weights: count the cores a task keeps busy, workers included. A
-Playwright run with 4 workers drives 4 browsers plus the app under test, so 8
-is a reasonable start; a vitest run with 4 workers is about 4. Weights are a
-single number: if memory rather than CPU is what runs out, size them by memory
-instead. A weight above half the capacity also guarantees that two runs of the
-task never overlap, which helps when they would fight over a port. Afterwards,
-`history.jsonl` shows how long jobs waited and ran.
+Choosing weights: measure, don't guess. Run the task alone and divide its CPU
+time by its wall time:
+
+```bash
+/usr/bin/time -p npx playwright test --workers=4
+```
+
+`(user + sys) / real` is the number of cores it keeps busy. Guesses are easily
+far off: in a demo project, vitest with 4 workers kept 3.8 cores busy, but
+Playwright with 4 workers only 1.2, because browser tests mostly wait. A
+weight that is too high costs real time: with e2e weighted 8 instead of 2, five
+agents verifying at once took 126 seconds instead of 40, all of it spent
+waiting. Weights are a single number: if memory rather than CPU is what runs
+out, size them by memory instead. Afterwards, `history.jsonl` shows how long
+jobs waited and ran.
+
+Tasks that bind a fixed port, such as an e2e suite's dev server, collide when
+two worktrees run them at once. Either give each worktree its own port, or
+give the task a weight above half the capacity, which guarantees that two runs
+never overlap.
 
 The running task gets two environment variables:
 
