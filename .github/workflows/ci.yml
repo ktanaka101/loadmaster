@@ -24,3 +24,10 @@ jobs:
         run: cargo test --release --locked --test soak -- --ignored --nocapture
         env:
           LOADMASTER_SOAK_SECS: "30"
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo build --locked --all-targets

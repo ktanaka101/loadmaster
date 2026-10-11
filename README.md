@@ -122,8 +122,9 @@ the terminal, leave daemons behind or start their own process groups.
 cargo install --locked --git https://github.com/ktanaka101/loadmaster
 ```
 
-Add `--rev <commit>` to pin a version, and check it with `loadmaster --version`.
-macOS and Linux are supported; building needs a Rust toolchain.
+Building needs Rust 1.88 or later (`rustup update` if yours is older). Add
+`--rev <commit>` to pin a version; `cargo install --list` shows which commit is
+installed. macOS and Linux are supported.
 
 ## Quick start
 
@@ -430,9 +431,19 @@ Deny the direct commands and allow loadmaster, in `.claude/settings.json` or
 }
 ```
 
-If Claude Code runs Bash commands in its sandbox, allow writes to the state
-directory (`~/.local/state/loadmaster`), or `loadmaster` fails with exit code
-125 because it cannot open its queue.
+If Claude Code runs Bash commands in its sandbox, `loadmaster` fails with exit
+code 125 ("cannot create ...: Operation not permitted") until the sandbox may
+write to the state directory. Allow it in `~/.claude/settings.json`:
+
+```json
+{
+  "sandbox": {
+    "filesystem": {
+      "allowWrite": ["~/.local/state/loadmaster"]
+    }
+  }
+}
+```
 
 Claude Code ignores `permissions.allow` in a project's `.claude/settings.json`
 until that workspace is trusted, and every git worktree is a workspace of its
@@ -501,9 +512,12 @@ loadmaster is deliberately small:
   pager, is stopped by the OS; Ctrl-C still ends it.
 - A task that leaves a daemon running in its own process group holds its slot
   until the daemon exits (loadmaster warns about it).
-- Processes a task starts in a process group or session of their own (some
-  tools launch browsers this way) are not tracked after the task's own group
-  is gone. They normally exit together with their parent.
+- Processes a task starts in a process group or session of their own are not
+  tracked after the task's own group is gone, and do not always exit with it:
+  when a Playwright run is stopped with SIGTERM (as a Claude Code timeout
+  does), its `webServer` keeps running and holding its port, so the next run
+  fails with "already used". This happens without loadmaster too; SIGINT
+  shuts it down cleanly.
 - `history.jsonl` is never rotated.
 
 ## Development
