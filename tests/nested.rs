@@ -1,0 +1,122 @@
+//! Acceptance criteria 4 and 10: nested `loadmaster run` runs under the
+//! holder's slot without deadlocking, and a stale or bogus LOADMASTER_HELD is
+//! rejected instead of silently bypassing the queue.
+
+mod common;
+
+use common::*;
+use loadmaster::queue::JobState;
+
+fn sandbox(ran_marker: &str) -> Sandbox {
+    let probe = Sandbox::new(4, "");
+    // `outer` takes the whole capacity, then calls `loadmaster run inner`,
+    // which also weighs 4: without nesting support this would deadlock.
+    let tasks = task("outer", 4, &[BIN, "run", "inner", "--", "from-outer"])
+        + &sh_task(
+            "inner",
+            4,
+            &format!(
+                "echo ran > {}; echo \"inner held=$LOADMASTER_HELD weight=$LOADMASTER_WEIGHT args=$*\"",
+                q(&probe.path(ran_marker))
+            ),
+        )
+        + &sh_task("hold", 4, &probe.hold_script("hold"));
+    std::fs::write(probe.repo.join(".loadmaster.toml"), tasks).unwrap();
+    probe
+}
+
+#[test]
+fn nested_run_does_not_deadlock() {
+    let sandbox = sandbox("inner.ran");
+    let output = sandbox.run(&["run", "outer"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    let held: i64 = out
+        .trim()
+        .strip_prefix("inner held=")
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected output: {out:?}"));
+    assert!(held > 0);
+    assert!(out.ends_with("weight=4 args=from-outer\n"), "{out}");
+    assert!(sandbox.snapshot().jobs.is_empty());
+}
+
+#[test]
+fn stale_or_bogus_held_is_rejected() {
+    let sandbox = sandbox("inner.ran");
+
+    // A job that finished: its ID is dead.
+    assert!(sandbox.run(&["run", "outer"]).status.success());
+    std::fs::remove_file(sandbox.path("inner.ran")).unwrap();
+    let finished = sandbox.run(&["status"]); // sanity: queue is empty
+    assert!(stdout(&finished).contains("no jobs"));
+
+    // A job that is waiting, not running, is not a holder either.
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let mut waiter = sandbox.spawn(&["run", "inner"]);
+    wait_until("a waiting job", || {
+        sandbox
+            .job("inner")
+            .is_some_and(|j| j.state == JobState::Waiting)
+    });
+    let waiting_id = sandbox.job("inner").unwrap().id.to_string();
+    let running_id = sandbox.job("hold").unwrap().id;
+    let assert_rejected = |value: &str| {
+        let output = sandbox
+            .cmd(&["run", "inner"])
+            .env("LOADMASTER_HELD", value)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(125), "HELD={value:?}");
+        assert!(
+            stderr(&output).contains("does not refer to a running loadmaster job"),
+            "HELD={value:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            !sandbox.path("inner.ran").exists(),
+            "HELD={value:?} ran the task"
+        );
+    };
+    assert_rejected(&waiting_id);
+    signal(waiter.id(), libc::SIGTERM);
+    wait(&mut waiter);
+
+    for value in [
+        "1",         // the finished outer job
+        "999999",    // never existed
+        &waiting_id, // gone now
+        "not-a-number",
+        " ",
+    ] {
+        assert_rejected(value);
+    }
+
+    // A live holder is accepted, even while the capacity is full.
+    let output = sandbox
+        .cmd(&["run", "inner"])
+        .env("LOADMASTER_HELD", running_id.to_string())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(sandbox.path("inner.ran").exists());
+
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+}
+
+#[test]
+fn nested_run_finds_the_queue_with_a_relative_state_dir() {
+    let sandbox = sandbox("inner.ran");
+    let sub = sandbox.repo.join("packages/app");
+    std::fs::create_dir_all(&sub).unwrap();
+    // Relative to `packages/app`; the task itself runs in the repo root.
+    let mut cmd = sandbox.cmd(&["run", "outer"]);
+    cmd.current_dir(&sub)
+        .env("LOADMASTER_STATE_DIR", "../../../state");
+    let output = output(cmd);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(sandbox.path("inner.ran").exists());
+}
