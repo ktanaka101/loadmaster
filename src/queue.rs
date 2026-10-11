@@ -82,14 +82,6 @@ pub enum JobState {
 }
 
 impl JobState {
-    fn as_str(self) -> &'static str {
-        match self {
-            JobState::Waiting => "waiting",
-            JobState::Parked => "parked",
-            JobState::Running => "running",
-        }
-    }
-
     fn parse(s: &str) -> rusqlite::Result<JobState> {
         match s {
             "waiting" => Ok(JobState::Waiting),
@@ -385,17 +377,14 @@ impl Queue {
         Ok(self.write(|_| Ok(()))?.1)
     }
 
-    /// Whether `id` is a running job that is still alive, i.e. a valid
-    /// holder for nested `loadmaster run` calls.
-    pub fn is_live_holder(&self, id: JobId) -> Result<bool> {
-        let (state, _) = self.write(|tx| {
-            Ok(tx
-                .query_row("SELECT state FROM jobs WHERE id = ?1", [id], |r| {
-                    r.get::<_, String>(0)
-                })
-                .optional()?)
-        })?;
-        Ok(state.as_deref() == Some(JobState::Running.as_str()))
+    /// Job `id`, if it is running and still alive, i.e. a valid holder for
+    /// nested `loadmaster run` calls and `loadmaster held`.
+    pub fn holder(&self, id: JobId) -> Result<Option<Job>> {
+        Ok(self
+            .snapshot()?
+            .jobs
+            .into_iter()
+            .find(|job| job.id == id && job.state == JobState::Running))
     }
 
     /// Records the process group of job `id`'s task, so the slot stays held

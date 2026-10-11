@@ -32,7 +32,7 @@ a stream of small ones.
 | Approach | Every task has a weight (≈ CPU cores it keeps busy), the machine has a capacity. A job starts only when it is first in line and its weight fits. |
 | Interface | A command wrapper: `loadmaster run <task> [-- args]`. No daemon or server; processes coordinate through a SQLite file. |
 | Crash safety | Places and slots of killed processes are reclaimed automatically (PID plus start time, so reused PIDs don't fool it). A task keeps its slot while it runs, even if `loadmaster` itself is killed. |
-| Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. Ready-made Claude Code settings: instructions, timeouts, permissions, a hook that blocks direct runs. |
+| Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. `loadmaster held` lets scripts refuse to run outside the queue, whatever the agent. Ready-made Claude Code settings: instructions, timeouts, permissions, a hook that blocks direct runs. |
 | Measuring | `loadmaster report` shows failures, timeouts, run and wait times and the cores each task really used; a measure-only mode records a baseline to compare with. See [Checking that it helps](#checking-that-it-helps). |
 | Platforms | macOS and Linux. Not Windows. |
 | Integration cost | One binary, one `.loadmaster.toml` per repository, a few lines of agent instructions. Removing it means deleting those, `~/.local/state/loadmaster` and `~/.config/loadmaster`. |
@@ -267,7 +267,8 @@ The running task gets two environment variables:
 - `LOADMASTER_WEIGHT`: the task's weight, so the task can size its own
   parallelism to match the slot it holds.
 - `LOADMASTER_HELD`: the ID of the job holding the slot (see
-  [Nested runs](#nested-runs)).
+  [Nested runs](#nested-runs) and
+  [Guarding a script](#guarding-a-script)).
 
 If you need shell features, for example to use `LOADMASTER_WEIGHT`, call a
 shell explicitly. The trailing `"sh"` becomes `$0`, so the extra arguments
@@ -391,6 +392,7 @@ loadmaster run [--max-wait SECONDS] <TASK> [-- ARGS...]
 loadmaster status
 loadmaster clean
 loadmaster report [--since DURATION] [--dir TEXT]
+loadmaster held
 ```
 
 - `run`: run a task once its weight fits.
@@ -401,6 +403,9 @@ loadmaster report [--since DURATION] [--dir TEXT]
   limits it to a recent period, `--dir myapp` to checks run from directories
   whose path contains `myapp`. See
   [Checking that it helps](#checking-that-it-helps).
+- `held`: exit with 0 if this process runs inside a loadmaster job started
+  from this checkout, and with 1 (saying why on stderr) if not; see
+  [Guarding a script](#guarding-a-script). Its own failures exit with 125.
 
 ```text
 $ loadmaster status
@@ -453,8 +458,28 @@ the task. The tasks' `cmd` must call the tools themselves
 `["npm", "test"]` calls itself forever, because the inner `loadmaster run test`
 runs directly inside the outer one's slot (see [Nested runs](#nested-runs)).
 
-Running a tool directly (`npx vitest`) still bypasses the queue; in Claude
-Code, [blocking direct execution](#3-block-direct-execution) catches that.
+### Guarding a script
+
+A script that must only run through the queue, such as one that starts an
+e2e database, can check that it does:
+
+```bash
+loadmaster held || exit 1
+```
+
+`loadmaster held` succeeds when `LOADMASTER_HELD`, which every task gets,
+names a running job that was started from the same checkout (the directory
+with `.loadmaster.toml`); nested runs count. Otherwise it exits with 1 and
+says why on stderr, including how to run the task through loadmaster. This
+works whatever starts the script, unlike permission rules and hooks, which
+only see an agent's own commands. A stale or made-up `LOADMASTER_HELD`, or one
+from another checkout, fails; one copied into another shell of the same
+checkout still passes while its job runs, so this too is a guardrail against
+accidents, not a security boundary.
+
+Tools you don't control, such as `npx vitest` run directly, still bypass the
+queue; in Claude Code, [blocking direct execution](#3-block-direct-execution)
+catches those.
 
 ## Using it with Claude Code
 
@@ -677,8 +702,9 @@ cargo test
 
 Besides unit tests, this runs integration tests that start real `loadmaster`
 processes: many jobs at once, a big job among a stream of small ones, `kill -9`
-of waiting and running jobs, nested runs, exit codes and config errors. Design
-decisions and their reasons are in [docs/DECISIONS.md](docs/DECISIONS.md).
+of waiting and running jobs, nested runs, `loadmaster held`, exit codes and
+config errors. Design decisions and their reasons are in
+[docs/DECISIONS.md](docs/DECISIONS.md).
 
 A soak test simulates five agents calling `loadmaster run` the way Claude
 Code's Bash tool does (timeouts that SIGTERM and then SIGKILL the process

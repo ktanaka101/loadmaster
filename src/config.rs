@@ -57,16 +57,23 @@ struct TaskFile {
 }
 
 impl RepoConfig {
-    /// Finds `.loadmaster.toml` in `start` or the nearest parent directory.
+    /// Finds and loads `.loadmaster.toml` in `start` or the nearest parent
+    /// directory.
     pub fn discover(start: &Path) -> Result<RepoConfig> {
-        start
-            .ancestors()
-            .map(|dir| dir.join(REPO_CONFIG_FILE))
-            .find(|path| path.is_file())
+        Self::find(start)
             .ok_or_else(|| Error::RepoConfigNotFound {
                 start: start.to_owned(),
             })
             .and_then(|path| Self::load(&path))
+    }
+
+    /// The path of `.loadmaster.toml` in `start` or the nearest parent
+    /// directory, without reading it.
+    pub fn find(start: &Path) -> Option<PathBuf> {
+        start
+            .ancestors()
+            .map(|dir| dir.join(REPO_CONFIG_FILE))
+            .find(|path| path.is_file())
     }
 
     pub fn load(path: &Path) -> Result<RepoConfig> {

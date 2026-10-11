@@ -3,7 +3,7 @@
 
 use std::env;
 use std::ffi::OsStr;
-use std::fs::DirBuilder;
+use std::fs::{self, DirBuilder};
 use std::io::{self, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -26,6 +26,8 @@ use loadmaster::{Error, Result};
 
 /// `--max-wait` elapsed; the job keeps its place in line (EX_TEMPFAIL).
 const EXIT_GAVE_UP: i32 = 75;
+/// `loadmaster held`: this process is not inside a job of this checkout.
+const EXIT_NOT_HELD: i32 = 1;
 /// loadmaster itself failed, following the `env`/`timeout` convention.
 const EXIT_ERROR: i32 = 125;
 const EXIT_CANNOT_EXECUTE: i32 = 126;
@@ -63,6 +65,9 @@ enum Cmd {
     Clean,
     /// Summarize the history log: results, run and wait times, load
     Report(ReportArgs),
+    /// Exit 0 if this process runs inside a loadmaster job started from this
+    /// checkout, 1 if not; for scripts that must only run through the queue
+    Held,
 }
 
 #[derive(Args)]
@@ -102,6 +107,7 @@ fn main() {
         Cmd::Status => status(),
         Cmd::Clean => clean(),
         Cmd::Report(args) => report(args),
+        Cmd::Held => held(),
     };
     let code = result.unwrap_or_else(|e| {
         say!("loadmaster: error: {e}");
@@ -358,7 +364,7 @@ fn run_nested(held: &OsStr, mut command: Command) -> Result<i32> {
     let id: Option<JobId> = value.trim().parse().ok();
     let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
     match id {
-        Some(id) if queue.is_live_holder(id)? => {}
+        Some(id) if queue.holder(id)?.is_some() => {}
         _ => return Err(Error::InvalidHeld { value }),
     }
     drop(queue);
@@ -366,6 +372,49 @@ fn run_nested(held: &OsStr, mut command: Command) -> Result<i32> {
     let err = command.exec();
     say!("loadmaster: error: cannot run `{program}`: {err}");
     Ok(spawn_failure_code(&err))
+}
+
+/// Whether this process runs inside a job started from this checkout: the
+/// check made for nested runs, plus the checkout. Silent when it does, so a
+/// script can use it as a guard.
+fn held() -> Result<i32> {
+    let cwd = env::current_dir().map_err(|e| Error::io("cannot read the current directory", e))?;
+    let checkout =
+        RepoConfig::find(&cwd).ok_or_else(|| Error::RepoConfigNotFound { start: cwd.clone() })?;
+    let not_held = |reason: String| -> Result<i32> {
+        say!(
+            "loadmaster: not running through loadmaster: {reason}\n\
+             loadmaster: start it with `loadmaster run <task>`; the tasks are in {}",
+            checkout.display()
+        );
+        Ok(EXIT_NOT_HELD)
+    };
+    let Some(value) = env::var_os(HELD_ENV).filter(|v| !v.is_empty()) else {
+        return not_held(format!("{HELD_ENV} is not set"));
+    };
+    let value = value.to_string_lossy().into_owned();
+    let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
+    let job = match value.trim().parse::<JobId>() {
+        Ok(id) => queue.holder(id)?,
+        Err(_) => None,
+    };
+    let Some(job) = job else {
+        return not_held(format!(
+            "{HELD_ENV}={value} does not refer to a running job"
+        ));
+    };
+    // Resolved, so a symlink to the same checkout matches.
+    let here = fs::canonicalize(&checkout).ok();
+    let theirs = RepoConfig::find(&job.dir).and_then(|path| fs::canonicalize(path).ok());
+    if here.is_none() || theirs != here {
+        return not_held(format!(
+            "job #{} (`{}`) was started from another checkout, in {}",
+            job.id,
+            job.task,
+            job.dir.display()
+        ));
+    }
+    Ok(0)
 }
 
 fn spawn_failure_code(err: &io::Error) -> i32 {

@@ -238,13 +238,17 @@ fn parked_head_blocks_until_it_expires() {
 fn live_holder_check() {
     let f = fixture();
     let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-    assert!(!f.queue.is_live_holder(ticket.id()).unwrap(), "waiting");
+    assert_eq!(f.queue.holder(ticket.id()).unwrap(), None, "waiting");
     ticket.try_admit(8).unwrap();
-    assert!(f.queue.is_live_holder(ticket.id()).unwrap());
-    assert!(!f.queue.is_live_holder(ticket.id() + 100).unwrap());
+    let holder = f.queue.holder(ticket.id()).unwrap().unwrap();
+    assert_eq!(
+        (holder.id, holder.dir.as_path()),
+        (ticket.id(), Path::new("/repo"))
+    );
+    assert_eq!(f.queue.holder(ticket.id() + 100).unwrap(), None);
     let id = ticket.id();
     drop(ticket);
-    assert!(!f.queue.is_live_holder(id).unwrap());
+    assert_eq!(f.queue.holder(id).unwrap(), None);
 }
 
 #[test]

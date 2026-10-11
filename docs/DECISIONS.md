@@ -144,6 +144,9 @@ milliseconds, so it is accepted rather than paid for with a more complex wait.
 - 128 + n when the task dies from signal n, and also when loadmaster itself is
   interrupted by signal n while waiting. loadmaster does not re-raise the
   signal on itself, so the caller always gets an ordinary exit code.
+- 1 from `loadmaster held` for "not running through loadmaster", the way
+  `test` and `grep` say "no", so a guard script can tell it from loadmaster
+  failing (125, for example when there is no `.loadmaster.toml`).
 
 ## Resuming after `--max-wait`
 
@@ -186,6 +189,30 @@ The `jobs` table uses `INTEGER PRIMARY KEY AUTOINCREMENT`. A plain
 `INTEGER PRIMARY KEY` would also preserve arrival order, but it can hand out an
 old ID again once the table empties, and then a leaked `LOADMASTER_HELD` could
 validate against an unrelated new job.
+
+## Checking that a script runs through the queue
+
+`loadmaster held` lets a script refuse to run outside the queue, whatever
+started it. Permission rules and hooks only see an agent's own commands, and
+not every agent has them.
+
+- It accepts what a nested run accepts, a `LOADMASTER_HELD` that names a
+  running job, and also requires that job to have been started from the same
+  checkout: the `.loadmaster.toml` found from the job's directory and the one
+  found from the current directory must be the same file once symlinks are
+  resolved. Otherwise a value that leaked into another worktree would pass.
+  The files are only located, not parsed, so a config edited while the job
+  runs makes no difference.
+- It does not check the task's name. A guarded script can be run by several
+  tasks, and by a nested run, whose job is the outer task's.
+- It does not check that the caller descends from the task's process. Tools
+  start helpers in process groups of their own, and orphaned processes are
+  re-parented, so such a check would refuse legitimate runs. A value copied
+  into another shell of the same checkout therefore passes while its job runs,
+  as it does for nested runs. Like the hook, this is a guardrail against
+  accidents, not a security boundary.
+- It prints nothing when the check passes, and the reason and how to run the
+  task through loadmaster when it fails.
 
 ## Where things run and live
 
