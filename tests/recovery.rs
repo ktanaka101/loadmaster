@@ -148,10 +148,16 @@ fn sigterm_or_sigint_while_waiting_leaves_the_line() {
 fn sigterm_while_running_is_forwarded_to_the_task_group() {
     let log = tempfile::NamedTempFile::new().unwrap();
     let log = q(log.path());
-    // `sh` runs the trap only after its foreground `sleep 30` ends, so a quick
-    // exit proves the signal reached `sleep` too, i.e. the whole group.
-    let script =
-        format!("trap 'echo got-term >> {log}; exit 42' TERM; echo ready >> {log}; sleep 30");
+    // `sh` runs the trap only after its foreground command ends, so a quick
+    // exit proves the signal reached that command too, i.e. the whole group.
+    // "ready" comes from the command itself, a shell without the trap that
+    // then becomes `sleep`: a signal sent between `sh` forking a command
+    // and the command's exec would hit the trap handler the fork inherited,
+    // and be lost with it on exec.
+    let script = format!(
+        "trap 'echo got-term >> {log}; exit 42' TERM; \
+         sh -c 'echo ready >> \"$1\"; exec sleep 30' sh {log}"
+    );
     let sandbox = Sandbox::new(4, &sh_task("serve", 4, &script));
     let mut runner = sandbox.spawn(&["run", "serve"]);
     let read_log = || std::fs::read_to_string(log.trim_matches('\'')).unwrap_or_default();

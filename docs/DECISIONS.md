@@ -128,6 +128,10 @@ milliseconds, so it is accepted rather than paid for with a more complex wait.
   incomplete. An empty
   listing of a group that `killpg` says exists is no evidence either. In both
   cases the group stays alive until a clean listing or ESRCH says otherwise.
+  This happens on macOS too: right after a group is killed with SIGKILL,
+  about one kill in three had an instant in which `killpg` found the group
+  but `proc_listpgrppids` listed nobody (measured; it lasted one sample, and
+  the next try listed the zombies).
 - On Linux, a thread-group leader that called `pthread_exit` shows as a zombie
   while its other threads keep running; a zombie whose `num_threads` is above
   one counts as running. `/proc/<pid>/stat` is parsed as bytes, since process
