@@ -38,7 +38,7 @@ port a checkout has.
 | Measuring | `loadmaster report` shows failures, timeouts, run and wait times and the cores each task really used; a measure-only mode records a baseline to compare with. See [Checking that it helps](#checking-that-it-helps). |
 | Platforms | macOS and Linux. On Windows, WSL2 should work (it runs the Linux binary) but is not tested yet; native Windows is not supported. |
 | Integration cost | One binary, one `.loadmaster.toml` per repository, a few lines of agent instructions. Removing it means deleting those, `~/.local/state/loadmaster` and `~/.config/loadmaster`. |
-| Status | 0.4, new. Verified with tests, soak tests and real Claude Code sessions with biome, vitest and Playwright; see [Status](#status). |
+| Status | 0.5, new. Verified with tests, soak tests and real Claude Code sessions with biome, vitest and Playwright; see [Status](#status). |
 | License | MIT or Apache-2.0 |
 
 ## Is it for you?
@@ -77,7 +77,7 @@ Not sure? Record a baseline first and compare; see
 
 ## Status
 
-loadmaster is new (0.4). What has been verified:
+loadmaster is new (0.5). What has been verified:
 
 - Integration tests that start real `loadmaster` processes check that the
   capacity is never exceeded (from the tasks' own records), that big jobs are
@@ -86,9 +86,10 @@ loadmaster is new (0.4). What has been verified:
   in a container without an init process.
 - A soak test simulates five agents with Claude Code-style timeouts (SIGTERM,
   then SIGKILL of the process group), re-runs after exit code 75, and crashes,
-  in two checkouts with two resources besides CPU. 1412 runs in 10 minutes on
-  macOS and 428 in 3 minutes on Linux exceeded no limit, every task got
-  through, and nothing was left behind.
+  in two checkouts with two resources besides CPU, while jobs are canceled at
+  random. 1656 runs (503 of them canceled) in 10 minutes on macOS and 503 in
+  3 minutes on Linux exceeded no limit, every task got through, and nothing
+  was left behind.
 - A simulation checks, on random workloads with several resources, that no
   job is ever delayed by jobs that got in line after it; rules broken on
   purpose are caught.
@@ -149,7 +150,7 @@ arm64, statically linked) are on the
 mise use -g github:ktanaka101/loadmaster
 ```
 
-Append `@0.4.0` to pin a version. Without mise, download the archive for your
+Append `@0.5.0` to pin a version. Without mise, download the archive for your
 platform, such as `loadmaster-aarch64-apple-darwin.tar.gz`, and put the
 `loadmaster` binary it contains on your `PATH`.
 
@@ -161,7 +162,7 @@ another distribution, are not seen. This has not been tested yet.
 To build from source instead (Rust 1.88 or later):
 
 ```bash
-cargo install --locked --git https://github.com/ktanaka101/loadmaster --tag v0.4.0
+cargo install --locked --git https://github.com/ktanaka101/loadmaster --tag v0.5.0
 ```
 
 ## Quick start
