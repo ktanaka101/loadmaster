@@ -792,9 +792,18 @@ fn act_directly(tx: &Transaction, job: Job) -> Result<Canceled> {
             wanted > owner_done
                 && (wanted > signal_done || signal_owner != Some(owner.start_time as i64))
         }
-        // Its task: SIGKILL as often as it takes, SIGTERM only if nobody has
-        // sent it one.
-        None => kill || owner_done.max(signal_done) < 0,
+        // Its task: SIGKILL as often as it takes, SIGTERM only if it has had
+        // none: from its loadmaster (which records what it sent before it
+        // hands the slot over) or from a cancel straight to its group. A
+        // signal that went to its loadmaster is not one to the task.
+        None => {
+            let to_task = if signal_owner.is_none() {
+                signal_done
+            } else {
+                -1
+            };
+            kill || owner_done.max(to_task) < 0
+        }
     };
     if !send {
         return Ok(Canceled::Requested(job));

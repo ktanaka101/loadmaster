@@ -248,13 +248,14 @@ impl Forwarder {
     }
 
     fn send(&mut self, group: &ProcessGroup, signal: i32) {
-        if signal == libc::SIGTERM {
-            if self.term_sent {
-                return;
-            }
+        if signal == libc::SIGTERM && self.term_sent {
+            return;
+        }
+        // Only a SIGTERM that was sent counts: one the OS refused (a task
+        // that changed its user, say) may be tried again.
+        if group.signal(signal).is_ok() && signal == libc::SIGTERM {
             self.term_sent = true;
         }
-        let _ = group.signal(signal);
         // SIGCONT lets a stopped task (e.g. one that touched the terminal)
         // act on the signal.
         let _ = group.signal(libc::SIGCONT);

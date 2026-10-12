@@ -345,7 +345,10 @@ that one agent works in.
   passes on the signals that arrived meanwhile and records whether the task
   had a SIGTERM, in the same write transaction as the handover, so a
   `cancel`, which signals those processes itself, sends them none either.
-  SIGKILL is there to force a task: `--kill`, as often as it takes.
+  Signals that arrive after the handover are not passed on: the processes
+  left behind are the job from then on, and `cancel` reaches them; passing
+  them on unrecorded would let a cancel send a second SIGTERM. SIGKILL is
+  there to force a task: `--kill`, as often as it takes.
 - A job has one request row, kept until the job is gone, with the strongest
   stop asked for (several `cancel`s are that one row) and the strongest one
   done, by its `loadmaster` and by a `cancel` signalling the job itself. Its
