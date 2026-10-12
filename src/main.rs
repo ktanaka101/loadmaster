@@ -848,7 +848,13 @@ fn cancel(args: CancelArgs) -> Result<i32> {
             .map(|job| job.id)
             .collect()
     } else {
-        args.ids.clone()
+        // Each once: a second SIGTERM would reach the task again.
+        let mut named = std::collections::BTreeSet::new();
+        args.ids
+            .iter()
+            .copied()
+            .filter(|&id| named.insert(id))
+            .collect()
     };
     let mut out = String::new();
     // Each job signalled, and what it was doing for how long.

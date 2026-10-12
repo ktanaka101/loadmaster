@@ -65,13 +65,15 @@ fn cancels_a_running_job_through_its_loadmaster() {
     let mut holder = sandbox.spawn(&["run", "hold"]);
     wait_until("the task to start", || sandbox.started("hold"));
 
-    let output = sandbox.run(&["cancel", "1"]);
+    // Named twice, signalled once.
+    let output = sandbox.run(&["cancel", "1", "1"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
         stdout(&output).starts_with("canceled #1 `hold` (running for "),
         "{}",
         stdout(&output)
     );
+    assert_eq!(stdout(&output).lines().count(), 1, "{}", stdout(&output));
     assert_eq!(
         wait(&mut holder).code(),
         Some(3),
