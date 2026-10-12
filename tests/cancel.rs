@@ -302,3 +302,26 @@ fn says_why_when_it_must_signal_but_may_not() {
     sandbox.release("hold");
     assert!(wait(&mut holder).success());
 }
+
+#[test]
+fn a_signal_the_task_survives_does_not_swallow_a_cancel() {
+    // SIGHUP reloads the task, as for a daemon; a cancel afterwards must
+    // still send its SIGTERM.
+    let probe = Sandbox::new(4, "");
+    let script = format!(
+        "trap 'echo hup >> {log}' HUP; trap 'echo term >> {log}; exit 3' TERM; {}",
+        probe.hold_script("hold"),
+        log = q(&probe.path("signals"))
+    );
+    std::fs::write(probe.repo.join(".loadmaster.toml"), sh_task("hold", 1, &script)).unwrap();
+    let sandbox = probe;
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    signal(holder.id(), libc::SIGHUP);
+    wait_until("the task to get SIGHUP", || sandbox.read("signals").contains("hup"));
+
+    let output = sandbox.run(&["cancel", "1"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(wait(&mut holder).code(), Some(3));
+    assert_eq!(sandbox.read("signals"), "hup\nterm\n");
+}

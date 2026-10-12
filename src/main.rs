@@ -456,12 +456,12 @@ fn run_admitted(
     // wait ends and the run begins here.
     let started = Instant::now();
     record.wait_ms = millis(started.duration_since(wait_started));
-    // A request to kill always goes through; one to stop only if nothing
-    // has told the task to end yet (see `runner::wait`).
-    let canceled = |ending: bool| {
+    // A request to kill always goes through; one to stop only if the task
+    // has had no SIGTERM yet (see `runner::wait`).
+    let canceled = |term_sent: bool| {
         // A failed look (a busy database) only puts it off to the next one.
         let kill = ticket.cancel_requested().ok()??;
-        if !kill && ending {
+        if !kill && term_sent {
             return None;
         }
         say!(
@@ -901,6 +901,8 @@ fn cancel(args: CancelArgs) -> Result<i32> {
     // request, or they were signalled. Nothing is sent to them again.
     let mut settled = std::collections::BTreeSet::new();
     let mut killed_orphans = std::collections::BTreeSet::new();
+    // Jobs to be killed: by --kill, or by a request this command took back.
+    let mut to_kill = std::collections::BTreeSet::new();
     for id in ids {
         if Some(id) == own {
             say!("loadmaster: not canceling job #{id}: this command runs in it");
@@ -962,7 +964,8 @@ fn cancel(args: CancelArgs) -> Result<i32> {
                 // A job killed through its loadmaster may have started its
                 // task in the meantime: with --kill, that is killed too,
                 // which a second SIGKILL cannot harm.
-                if args.kill && job.is_orphaned() && killed_orphans.insert(job.id) {
+                let kill = args.kill || to_kill.contains(&job.id);
+                if kill && job.is_orphaned() && killed_orphans.insert(job.id) {
                     queue.signal_now(job.id, true)?;
                 }
                 continue;
@@ -975,6 +978,9 @@ fn cancel(args: CancelArgs) -> Result<i32> {
             if unanswered && let Some(kill) = queue.take_back_cancel(job.id)? {
                 settled.insert(job.id);
                 // As asked by every `cancel` whose request this was.
+                if kill {
+                    to_kill.insert(job.id);
+                }
                 queue.signal_now(job.id, kill || args.kill)?;
             }
         }
@@ -1064,35 +1070,27 @@ fn open_queue() -> Result<(PathBuf, Queue)> {
             _ => Error::io(format!("cannot create {}", dir.display()), e),
         });
     }
-    let path = dir.join(STATE_DB_FILE);
-    let failure = match Queue::open(&path) {
-        Ok(queue) if !queue.is_read_only() => return Ok((dir, queue)),
-        Ok(_) => Error::QueueReadOnly { path },
-        Err(e) => e,
-    };
-    // SQLite's errors don't say whether the directory is to blame (its
-    // database could be a directory, say), so see whether a file can be
-    // made in it.
+    // Made sure of first: SQLite's errors don't say whether the directory is
+    // to blame (its database could be a directory, say), and it opens a
+    // database it may not write for reading without saying so.
     let probe = dir.join(format!(".write-test-{}", std::process::id()));
     match fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .open(&probe)
     {
         Ok(_) => {
             let _ = fs::remove_file(&probe);
-            Err(failure)
         }
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
-            ) =>
-        {
-            Err(not_writable(failure.to_string()))
-        }
-        Err(_) => Err(failure),
+        Err(e) => return Err(not_writable(e.to_string())),
     }
+    let path = dir.join(STATE_DB_FILE);
+    let queue = Queue::open(&path)?;
+    if queue.is_read_only() {
+        return Err(Error::QueueReadOnly { path });
+    }
+    Ok((dir, queue))
 }
 
 fn print(text: &str) {

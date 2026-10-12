@@ -220,30 +220,30 @@ const CANCEL_CHECK_EVERY: u32 = 10;
 
 /// Waits for the task's leader to exit, forwarding intercepted signals to the
 /// whole process group in the meantime, and the signal `canceled` asks for,
-/// which it is asked every few polls. A cancel's SIGTERM is sent only if
-/// no signal that ends the task has reached it yet: a second one would cut
-/// short the clean-up the first started. `canceled` is told whether one has.
+/// which it is asked every few polls. `canceled` is told whether the task
+/// has had a SIGTERM already, so a cancel's is not sent as a second one,
+/// which would cut short the clean-up the first started.
 pub fn wait(
     task: &mut Task,
     signals: &Signals,
     mut canceled: impl FnMut(bool) -> Option<i32>,
 ) -> io::Result<ExitStatus> {
     let mut polls = 0u32;
-    let mut ending = false;
+    let mut term_sent = false;
     loop {
         let exited = task.child.try_wait()?;
         // Forward even if the leader just exited: others in its group may
         // still be running.
-        ending |= forward_pending(&task.group, signals);
+        term_sent |= forward_pending(&task.group, signals).contains(&libc::SIGTERM);
         if let Some(status) = exited {
             return Ok(status);
         }
         polls = polls.wrapping_add(1);
         if polls.is_multiple_of(CANCEL_CHECK_EVERY)
-            && let Some(signal) = canceled(ending)
+            && let Some(signal) = canceled(term_sent)
             && task.group.is_alive()
         {
-            ending = true;
+            term_sent |= signal == libc::SIGTERM;
             let _ = task.group.signal(signal);
             let _ = task.group.signal(libc::SIGCONT);
         }
@@ -254,19 +254,19 @@ pub fn wait(
 /// Forwards intercepted signals that arrived since the last call to the
 /// task's process group, if it still has running members. The check goes by
 /// the leader's start time, so a group ID the OS has since reused is never hit.
-/// Returns whether it forwarded any.
-pub fn forward_pending(group: &ProcessGroup, signals: &Signals) -> bool {
+/// Returns the signals it forwarded.
+pub fn forward_pending(group: &ProcessGroup, signals: &Signals) -> Vec<i32> {
     let pending = signals.take();
     if pending.is_empty() || !group.is_alive() {
-        return false;
+        return Vec::new();
     }
-    for signal in pending {
+    for &signal in &pending {
         // SIGCONT lets a stopped task (e.g. one that touched the terminal)
         // act on the signal.
         let _ = group.signal(signal);
         let _ = group.signal(libc::SIGCONT);
     }
-    true
+    pending
 }
 
 /// The exit code that mirrors `status`: the child's own code, or 128+n if it

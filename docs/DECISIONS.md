@@ -347,11 +347,13 @@ that one agent works in.
   task exiting, so it is also sent SIGCONT. Where the fallback is not allowed
   either, `cancel` says why and how to stop the job instead. A task whose
   `loadmaster` is gone is signalled directly, which a sandbox may not allow.
-- A job's `loadmaster` sends its task a cancel's SIGTERM only if no signal
-  that ends it has reached it yet, whether from a cancel or forwarded from
-  its own: a second one would cut short the clean-up the first started (as
-  in a handler registered with `process.once`). A later `--kill` still goes
-  through, and a SIGTERM request does not undo a pending SIGKILL one.
+- A job's `loadmaster` sends its task a cancel's SIGTERM only if the task
+  has had no SIGTERM yet, whether from a cancel or forwarded: a second one
+  would cut short the clean-up the first started (as in a handler
+  registered with `process.once`). Other signals don't count, since a task
+  may carry on after them (SIGHUP reloads many). A later `--kill` still goes
+  through, and a SIGTERM request does not undo a pending SIGKILL one; a
+  request taken back for SIGKILL is followed through like `--kill`.
 - It waits until the jobs have left the queue, so the caller knows the slot
   is free, and says after 10 seconds which ones are still stopping. It never
   escalates to SIGKILL by itself: a task that takes long to stop is usually
@@ -481,8 +483,8 @@ sessions):
   database file": the person who reads it has to change the agent's
   settings, not loadmaster's. SQLite's errors don't say whether the
   directory is to blame, and it opens a database it may not write for
-  reading without saying so, so a read-only connection or a failed open is
-  put down to the directory only if a file cannot be made in it either.
+  reading without saying so, so each command first makes (and removes) a
+  file in the directory, and says so if it cannot.
 - Reading other processes' start times and listing process groups work, so
   a sandboxed `loadmaster` sees jobs started outside its sandbox, waits
   behind them and reclaims them once they are dead.
