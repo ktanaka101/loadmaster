@@ -73,17 +73,21 @@ const SAME_JOB: Duration = Duration::from_secs(120);
 /// Joins history entries into checks, roughly in the order they ended.
 pub fn checks(entries: &[Entry]) -> Vec<Check> {
     // `loadmaster cancel` logs its own record, besides the run's: when each
-    // canceled job got in line, by job ID.
-    let mut canceled: HashMap<i64, Vec<u64>> = HashMap::new();
+    // canceled job got in line, by job ID, task and directory (IDs start
+    // over if the queue database is deleted).
+    let mut canceled: HashMap<(i64, &str, &str), Vec<u64>> = HashMap::new();
     for entry in entries.iter().filter(|e| e.outcome == Outcome::Canceled) {
-        canceled.entry(entry.job).or_default().push(entry.queued_at);
+        canceled
+            .entry((entry.job, &entry.task, &entry.dir))
+            .or_default()
+            .push(entry.queued_at);
     }
     let mut checks = joined(entries.iter().filter(|e| e.outcome != Outcome::Canceled));
     for check in &mut checks {
         let same =
             |&queued_at: &u64| queued_at.abs_diff(check.queued_at) <= SAME_JOB.as_millis() as u64;
         if canceled
-            .get(&check.job)
+            .get(&(check.job, check.task.as_str(), check.dir.as_str()))
             .is_some_and(|times| times.iter().any(same))
         {
             check.result = CheckResult::Canceled;
@@ -783,6 +787,9 @@ mod tests {
             canceled(3, 3_000),
             // The same ID long after: the database was recreated.
             exited(1, 10_000_000, 0, 10, 0),
+            // And soon after, for another task.
+            exited(4, 20_000_000, 0, 10, 1),
+            entry(4, "lint", Outcome::Canceled, 20_000_000, 0),
         ];
         let results: Vec<CheckResult> = checks(&entries).iter().map(|c| c.result).collect();
         assert_eq!(
@@ -791,6 +798,7 @@ mod tests {
                 CheckResult::Canceled,
                 CheckResult::Canceled,
                 CheckResult::Passed,
+                CheckResult::Failed,
                 CheckResult::Canceled,
             ]
         );
@@ -799,7 +807,7 @@ mod tests {
             out.contains("left out 3 check(s) stopped with `loadmaster cancel`\n"),
             "{out}"
         );
-        assert!(out.contains(": 1 check(s), "), "{out}");
+        assert!(out.contains(": 2 check(s), "), "{out}");
     }
 
     #[test]

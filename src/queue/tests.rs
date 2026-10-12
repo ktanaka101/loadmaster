@@ -653,6 +653,45 @@ fn a_job_waiting_for_a_resource_says_what_it_sets_aside() {
 }
 
 #[test]
+fn a_smaller_limit_ahead_is_named_as_the_cause() {
+    // A job queued under capacity 1 is parked ahead: the job behind it fits
+    // in its own capacity of 8, but respects that one's.
+    let mut small = job(1, JobState::Parked, 1, vec![], "/a");
+    small.capacity = Some(1);
+    let jobs = [small, job(2, Waiting, 4, vec![], "/b")];
+    assert_eq!(
+        said(decide(&jobs, 2, 8).unwrap()),
+        "1 ahead; waits for 4 cores (#1 `job1`, ahead, got in line with a limit of 1)"
+    );
+}
+
+#[test]
+fn what_a_waiting_job_sets_aside_includes_unlimited_resources() {
+    // Job 2 records no limit for `gpu`, but sets it aside, and job 3, which
+    // has one, waits for it.
+    let gpu = |capacity| Use {
+        name: "gpu".into(),
+        amount: 1,
+        capacity,
+        per_checkout: None,
+    };
+    let jobs = [
+        job(1, Running, 1, vec![db(1)], "/a"),
+        job(2, Waiting, 1, vec![db(1), gpu(None)], "/a"),
+        job(3, Waiting, 1, vec![gpu(Some(1))], "/b"),
+    ];
+    assert_eq!(
+        said(decide(&jobs, 2, 8).unwrap()),
+        "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
+         sets aside 1 core, `db` and `gpu`"
+    );
+    assert_eq!(
+        said(decide(&jobs, 3, 8).unwrap()),
+        "1 ahead; waits for `gpu` (1 free, but 1 set aside for #2 `job2`); sets aside 1 core"
+    );
+}
+
+#[test]
 fn a_job_short_of_cpu_holds_back_everyone_behind_it() {
     let jobs = [
         job(1, Running, 6, vec![], "/a"),

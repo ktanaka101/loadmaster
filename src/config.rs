@@ -433,7 +433,12 @@ fn check_min_version(path: &Path, text: &str) -> Result<()> {
         .ok_or_else(|| invalid(format!("`min_version` must be {expected}")))?;
     let needed = version_parts(required)
         .ok_or_else(|| invalid(format!("`min_version` is `{required}`, not {expected}")))?;
-    let current = version_parts(VERSION).expect("the crate version is valid");
+    // This build's own version may carry a pre-release or build suffix,
+    // which does not count here.
+    let release = VERSION.split(['-', '+']).next().unwrap_or(VERSION);
+    let Some(current) = version_parts(release) else {
+        return Ok(());
+    };
     if needed > current {
         return Err(Error::VersionTooOld {
             path: path.to_owned(),
@@ -443,10 +448,9 @@ fn check_min_version(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// "0.5.0", "0.5" or "1" as (major, minor, patch); a pre-release suffix of
-/// this crate's own version is ignored.
+/// "0.5.0", "0.5" or "1" as (major, minor, patch). Pre-release and build
+/// suffixes are not accepted: a minimum is a release.
 fn version_parts(text: &str) -> Option<(u64, u64, u64)> {
-    let text = text.split_once('-').map_or(text, |(release, _)| release);
     let mut parts = text.split('.').map(|part| {
         (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
             .then(|| part.parse::<u64>().ok())
@@ -639,6 +643,14 @@ mod tests {
             ),
             ("min_version = \"0.5.0.1\"\n", "`min_version` is `0.5.0.1`"),
             ("min_version = \"0..1\"\n", "`min_version` is `0..1`"),
+            (
+                "min_version = \"0.4.0-???\"\n",
+                "`min_version` is `0.4.0-???`",
+            ),
+            (
+                "min_version = \"0.4.0+local\"\n",
+                "`min_version` is `0.4.0+local`",
+            ),
         ] {
             let msg = message(parse(text).unwrap_err());
             assert!(msg.contains(expected), "{text:?}: {msg}");

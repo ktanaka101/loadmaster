@@ -246,8 +246,9 @@ If you are an AI agent working in a repository that already uses loadmaster
   waiting job waits for.
 - **To stop your own checks, use `loadmaster cancel`**: `loadmaster cancel
   --here` stops every job started from your checkout, `loadmaster cancel 43`
-  one job (IDs are in `loadmaster status`). Never stop checks by matching
-  command lines (`pkill -f vitest`): other agents run the same commands.
+  one job (IDs are in `loadmaster status`); if other agents work in the same
+  checkout, cancel by ID. Never stop checks by matching command lines
+  (`pkill -f vitest`): other agents run the same commands.
 
 ## Configuration
 
@@ -602,7 +603,7 @@ loadmaster held [--uses RESOURCE]
 $ loadmaster status
 6/8 in use (capacity set in /Users/you/.config/loadmaster/config.toml)
 e2e-db: 1/2 in use
-load average 22.9 over the last minute, on 14 cores: more than the cores, from work outside the queue or tasks that use more cores than their weight (see `loadmaster report`)
+load average 22.9 over the last minute, on 14 cores: more than the cores, often from work outside the queue or tasks that use more cores than their weight (see `loadmaster report`); on Linux, processes waiting for disks count too
 
 ID  STATE    TASK  WEIGHT  USES      PID    PGID   FOR   DIR
 41  running  test  4       -         10687  10689  3.0s  /Users/you/src/app-wt1

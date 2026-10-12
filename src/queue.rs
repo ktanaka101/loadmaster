@@ -256,6 +256,10 @@ pub enum Cause {
     },
     /// A job ahead is short of it too: it gets it first.
     Behind(JobRef),
+    /// It is within the job's own limit, but a job ahead got in line with a
+    /// smaller `limit` (processes can disagree on one), and jobs behind
+    /// respect that.
+    LimitAhead { limit: u64, by: JobRef },
 }
 
 /// A job named in an explanation.
@@ -335,6 +339,9 @@ impl fmt::Display for Shortage {
                     "it"
                 };
                 write!(f, " (behind {job}, which waits for {them} too)")
+            }
+            Cause::LimitAhead { limit, by } => {
+                write!(f, " ({by}, ahead, got in line with a limit of {limit})")
             }
         }
     }
@@ -488,45 +495,54 @@ impl Queue {
         }
     }
 
-    /// Stops job `id` for `loadmaster cancel`: a waiting job leaves the line
-    /// and a running one's task ends, both through the job's loadmaster
-    /// process, which handles the SIGTERM as any other; a parked job loses
-    /// its place. With `kill`, SIGKILL instead, sent to a running job's task
-    /// (its loadmaster must stay to free the slot and log the result) or to
-    /// a waiting job's loadmaster. A task whose loadmaster is gone is
-    /// signalled directly. Logs a `canceled` record, so the report can leave
-    /// the check out.
+    /// Stops job `id` for `loadmaster cancel` (see [`Queue::stop`]) and logs
+    /// a `canceled` record, so the report can leave the check out.
     pub fn cancel(&self, id: JobId, kill: bool) -> Result<Canceled> {
-        let (job, _) = self.write(|tx| {
-            let job = load_jobs(tx)?.into_iter().find(|job| job.id == id);
-            if let Some(job) = job.as_ref().filter(|job| job.state == JobState::Parked) {
-                tx.execute("DELETE FROM jobs WHERE id = ?1", [job.id])?;
-            }
-            Ok(job)
-        })?;
-        let Some(job) = job else {
-            return Ok(Canceled::NotFound);
-        };
-        let parked = job.state == JobState::Parked;
-        if !parked
-            && !signal_job(&job, kill)
-                .map_err(|e| Error::io(format!("cannot signal job #{id}"), e))?
-        {
-            // It ended in the meantime.
-            return Ok(Canceled::NotFound);
+        let canceled = self.stop(id, kill)?;
+        if let Canceled::DroppedPlace(job) | Canceled::Signaled(job) = &canceled {
+            let now = SystemTime::now();
+            self.log(&Record {
+                run_ms: job
+                    .started_at
+                    .map(|at| millis(now.duration_since(at).unwrap_or_default())),
+                ..record(job, Outcome::Canceled, job.started_at.unwrap_or(now))
+            });
         }
-        let now = SystemTime::now();
-        self.log(&Record {
-            run_ms: job
-                .started_at
-                .map(|at| millis(now.duration_since(at).unwrap_or_default())),
-            ..record(&job, Outcome::Canceled, job.started_at.unwrap_or(now))
-        });
-        Ok(if parked {
-            Canceled::DroppedPlace(job)
-        } else {
-            Canceled::Signaled(job)
-        })
+        Ok(canceled)
+    }
+
+    /// Stops job `id`, without logging: a waiting job leaves the line and a
+    /// running one's task ends, both through the job's loadmaster process,
+    /// which handles the SIGTERM as any other; a parked job loses its place.
+    /// With `kill`, SIGKILL instead, sent to a running job's task (its
+    /// loadmaster must stay to free the slot and log the result) or to a
+    /// waiting job's loadmaster. A task whose loadmaster is gone is signalled
+    /// directly. Also for a canceled job whose state has changed since.
+    pub fn stop(&self, id: JobId, kill: bool) -> Result<Canceled> {
+        // The job can change between reading and signalling it: a signal
+        // that finds nobody (it parked, say, and its loadmaster exited) reads
+        // it again, and the write reaps it if nothing holds it any more.
+        for _ in 0..10 {
+            let (job, _) = self.write(|tx| {
+                let job = load_jobs(tx)?.into_iter().find(|job| job.id == id);
+                if let Some(job) = job.as_ref().filter(|job| job.state == JobState::Parked) {
+                    tx.execute("DELETE FROM jobs WHERE id = ?1", [job.id])?;
+                }
+                Ok(job)
+            })?;
+            let Some(job) = job else {
+                return Ok(Canceled::NotFound);
+            };
+            if job.state == JobState::Parked {
+                return Ok(Canceled::DroppedPlace(job));
+            }
+            if signal_job(&job, kill)
+                .map_err(|e| Error::io(format!("cannot signal job #{id}"), e))?
+            {
+                return Ok(Canceled::Signaled(job));
+            }
+        }
+        Ok(Canceled::NotFound)
     }
 
     /// Gets in line, or takes over a parked job with the same
@@ -666,27 +682,33 @@ pub enum Canceled {
 /// Signals a job for [`Queue::cancel`]; `Ok(false)` if it is gone.
 fn signal_job(job: &Job, kill: bool) -> std::io::Result<bool> {
     let signal = if kill { libc::SIGKILL } else { libc::SIGTERM };
-    if job.state == JobState::Running
-        && let Some(child) = job.child
-        && (kill || !job.owner_alive())
-    {
-        if !child.is_alive() {
-            return Ok(false);
-        }
-        return match child.signal(signal) {
-            Ok(()) => {
-                // Lets a stopped task act on it.
-                let _ = child.signal(libc::SIGCONT);
-                Ok(true)
+    let owner = job.owner.filter(|owner| owner.is_alive());
+    let sent = match job.child {
+        Some(child) if job.state == JobState::Running && (kill || owner.is_none()) => {
+            if !child.is_alive() {
+                return Ok(false);
             }
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(false),
-            Err(e) => Err(e),
-        };
+            match child.signal(signal) {
+                Ok(()) => {
+                    // Lets a stopped task act on it.
+                    let _ = child.signal(libc::SIGCONT);
+                    true
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        _ => match owner {
+            Some(owner) => owner.signal(signal)?,
+            None => return Ok(false),
+        },
+    };
+    // A stopped loadmaster (Ctrl-Z) acts on nothing, not even on its task
+    // exiting, until it is continued.
+    if let Some(owner) = owner {
+        owner.signal(libc::SIGCONT)?;
     }
-    match job.owner {
-        Some(owner) => owner.signal(signal),
-        None => Ok(false),
-    }
+    Ok(sent)
 }
 
 /// A history record for a job that its loadmaster process did not log
@@ -937,6 +959,8 @@ struct Reserved<'a> {
     amount: u64,
     /// The smallest limit among them: processes may disagree on a limit.
     limit: u64,
+    /// The job that got in line with it.
+    limited_by: &'a Job,
     for_jobs: Vec<&'a Job>,
 }
 
@@ -982,21 +1006,21 @@ fn assess(jobs: &[Job], capacity: u32, only: Option<JobId>) -> Vec<(JobId, Admis
                     short: Vec::new(),
                     reserves: Vec::new(),
                 };
-                for (&(dim, amount, _), &(fits, limit)) in demands.iter().zip(&fits) {
+                for (&(dim, amount, own_limit), &(fits, limit)) in demands.iter().zip(&fits) {
                     if fits {
-                        // Unlimited resources keep nobody waiting.
-                        if limit != u64::MAX {
-                            wait.reserves.push((dim.need(), amount));
-                        }
+                        // Even a resource unlimited for this job: others
+                        // may have a limit for it.
+                        wait.reserves.push((dim.need(), amount));
                         continue;
                     }
                     let in_use = used_of(&dim);
+                    let reserved = set_aside.get(&dim);
                     let cause = if let Some(first) = short.get(&dim) {
                         Cause::Behind(JobRef::of(first))
-                    } else if in_use + amount > limit {
+                    } else if in_use + amount > own_limit {
                         Cause::InUse {
                             used: in_use,
-                            limit,
+                            limit: own_limit,
                             by: used
                                 .get(&dim)
                                 .map_or(&[][..], |(_, by)| by)
@@ -1004,10 +1028,16 @@ fn assess(jobs: &[Job], capacity: u32, only: Option<JobId>) -> Vec<(JobId, Admis
                                 .map(|job| JobRef::of(job))
                                 .collect(),
                         }
+                    } else if let Some(r) = reserved.filter(|_| in_use + amount > limit) {
+                        // Within its own limit, but a job ahead got in line
+                        // with a smaller one.
+                        Cause::LimitAhead {
+                            limit,
+                            by: JobRef::of(r.limited_by),
+                        }
                     } else {
                         // It fits next to the running jobs, so what is
                         // set aside is what keeps it out.
-                        let reserved = set_aside.get(&dim);
                         Cause::SetAside {
                             free: limit - in_use,
                             reserved: reserved.map_or(0, |r| r.amount),
@@ -1038,10 +1068,13 @@ fn assess(jobs: &[Job], capacity: u32, only: Option<JobId>) -> Vec<(JobId, Admis
                 let entry = set_aside.entry(dim).or_insert(Reserved {
                     amount: 0,
                     limit,
+                    limited_by: job,
                     for_jobs: Vec::new(),
                 });
                 entry.amount += amount;
-                entry.limit = entry.limit.min(limit);
+                if limit < entry.limit {
+                    (entry.limit, entry.limited_by) = (limit, job);
+                }
                 entry.for_jobs.push(job);
             } else {
                 short.entry(dim).or_insert(job);

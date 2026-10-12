@@ -289,10 +289,12 @@ every check behind it stopped. That only showed in a separate experiment. So
 the admission rule explains its own decision, rather than a second piece of
 code guessing at it: for each dimension a job does not fit, it says whether
 running jobs use too much of it (naming the ones that hold a resource),
-whether it would fit but is set aside for jobs ahead (naming them), or
-whether a job ahead waits for it too (naming the first). It also lists what
-the waiting job sets aside meanwhile, which is the cost it puts on the jobs
-behind it. `status` shows this for every waiting job and the waiting
+whether it would fit but is set aside for jobs ahead (naming them), whether
+a job ahead waits for it too (naming the first), or whether a job ahead got
+in line with a smaller limit, which the jobs behind it respect (naming that
+job). It also lists what the waiting job sets aside meanwhile, which is the
+cost it puts on the jobs behind it, including resources it has no limit for:
+other jobs may have one. `status` shows this for every waiting job and the waiting
 messages for their own; both use the same words. The simulation checks, at
 every step, that the explanation agrees with the decision each job gets and
 that every waiting job has a reason.
@@ -323,16 +325,30 @@ that one agent works in.
   escalates to SIGKILL by itself: a task that takes long to stop is usually
   cleaning up (an e2e environment, say), and cutting that short leaves the
   next run a mess. `--kill` sends SIGKILL to the running task when asked.
+- A job can change while it is canceled. One that gave up waiting at that
+  moment parks: its place is dropped, also when its `loadmaster` has already
+  exited and the signal finds nobody. With `--kill`, a waiting job's
+  `loadmaster` is killed; if the job was admitted in between, its task runs
+  on without it, so `cancel` kills the task too once it sees the change. A
+  SIGTERM is not sent twice, since the first is normally forwarded already
+  and the task would get it twice; the 10-second note covers the rest.
+- A `loadmaster` stopped with Ctrl-Z acts on nothing, not even on its task
+  exiting, so it is sent SIGCONT after the signal.
+- A PID is checked by its start time right before the signal, as when a
+  signal is forwarded to a task's group: a PID the OS hands out again within
+  that instant would get it. macOS has no pidfd to close that gap, and the
+  OS would have to go through its whole PID space in between.
 - `--here` leaves out the job it runs in (`LOADMASTER_HELD`), so a script
   inside a task can clear the rest of its checkout without ending itself.
+  Agents sharing one checkout cancel by ID instead.
 - The command logs a `canceled` record for each job besides the run's own
   record, as the reaper does for `lost` jobs, and the report leaves those
   checks out: a cancel says nothing about the machine. Marking the job in the
   database instead would need a new schema version, which older `loadmaster`
   versions refuse; different branches run different versions on one
   machine, so the database format is kept for as long as it can be. The
-  report matches the record to the run by job ID and by when the job got in
-  line.
+  report matches the record to the run by job ID, task and directory, and by
+  when the job got in line (IDs start over if the database is deleted).
 
 ## Load outside the queue
 
@@ -475,7 +491,9 @@ transaction would remove this cost; it is left out until it matters.
   machine, and while it waits everyone behind it waits), a resource with no
   limit anywhere, and a task whose run, waiting for a resource held by a
   long run, sets aside enough cores to keep other tasks out. Warnings depend
-  on the machine's capacity and do not fail the check.
+  on the machine's capacity and do not fail the check. Under measure-only,
+  where nothing waits, there are none, and a capacity of 1 (a small CI
+  runner) does not get one per task.
 - A weight above the capacity counts as the whole capacity, and the task runs
   alone. Weights are committed with the repository while the capacity belongs
   to each machine, so a repository's weights have to work on smaller machines

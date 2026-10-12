@@ -179,6 +179,7 @@ fn run(args: RunArgs) -> Result<i32> {
     // weight can exceed a small machine's capacity: the task then takes all
     // of it.
     if task.weight > machine.capacity
+        && !machine.measure_only
         && let Some(note) = check::whole_machine(task, machine.capacity)
     {
         say!("loadmaster: {note} (capacity {})", machine.capacity_source);
@@ -663,8 +664,9 @@ fn load_line() -> String {
     };
     let mut line = format!("load average {load:.1} over the last minute, on {cores} cores");
     if load > cores as f64 {
-        line += ": more than the cores, from work outside the queue or tasks that use \
-                 more cores than their weight (see `loadmaster report`)";
+        line += ": more than the cores, often from work outside the queue or tasks that \
+                 use more cores than their weight (see `loadmaster report`); on Linux, \
+                 processes waiting for disks count too";
     }
     line + "\n"
 }
@@ -879,9 +881,20 @@ fn cancel(args: CancelArgs) -> Result<i32> {
         return Ok(0);
     }
     // Gone once its loadmaster has left the line, or its task has exited and
-    // freed the slot.
+    // freed the slot. A job can change as it is signalled: one that gave up
+    // waiting (exit code 75) at that moment keeps its place, which is
+    // dropped rather than left to expire. With --kill, a waiting job's
+    // loadmaster was killed, so if the job had been admitted meanwhile its
+    // task runs on: it is killed too. (A second SIGTERM is not sent: the
+    // first one has normally been forwarded already, and the task would get
+    // it twice.)
     let started = Instant::now();
     let mut hinted = false;
+    let state = |job: &Job| (job.state, job.is_orphaned(), job.child.is_some());
+    let mut seen: Vec<(JobId, (JobState, bool, bool))> = stopping
+        .iter()
+        .map(|(job, _)| (job.id, state(job)))
+        .collect();
     loop {
         let jobs = queue.snapshot()?.jobs;
         let left: Vec<&Job> = jobs
@@ -891,10 +904,14 @@ fn cancel(args: CancelArgs) -> Result<i32> {
         if left.is_empty() {
             break;
         }
-        // A job that gave up waiting (exit code 75) just as it was signalled
-        // keeps its place: drop it rather than wait for it to expire.
-        for job in left.iter().filter(|job| job.state == JobState::Parked) {
-            queue.cancel(job.id, false)?;
+        for job in &left {
+            let Some((_, last)) = seen.iter_mut().find(|(id, _)| *id == job.id) else {
+                continue;
+            };
+            if *last != state(job) && (args.kill || job.state == JobState::Parked) {
+                queue.stop(job.id, args.kill)?;
+            }
+            *last = state(job);
         }
         if !hinted && started.elapsed() >= CANCEL_HINT_AFTER {
             hinted = true;
