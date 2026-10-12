@@ -185,7 +185,7 @@ fn detached_slot_is_held_until_the_group_exits() {
     live.try_admit(8).unwrap();
     let task = LiveGroup::start();
     f.queue.record_child(live.id(), task.group).unwrap();
-    live.detach().unwrap();
+    live.hand_over(|| false).unwrap();
 
     let gone = f.queue.enqueue(&request("lint", 2, &[]), f.me).unwrap();
     gone.try_admit(8).unwrap();
@@ -196,7 +196,7 @@ fn detached_slot_is_held_until_the_group_exits() {
         leader_start_time: None,
     };
     f.queue.record_child(gone.id(), dead_group).unwrap();
-    gone.detach().unwrap();
+    gone.hand_over(|| false).unwrap();
 
     let snapshot = f.queue.snapshot().unwrap();
     assert_eq!(snapshot.reaped.len(), 1);
@@ -444,7 +444,7 @@ fn a_detached_job_is_not_logged_when_reaped() {
         leader_start_time: None,
     };
     f.queue.record_child(ticket.id(), gone).unwrap();
-    ticket.detach().unwrap();
+    ticket.hand_over(|| false).unwrap();
     assert_eq!(f.queue.reap().unwrap().len(), 1);
     assert!(history(&f).is_empty());
 }
@@ -558,14 +558,7 @@ fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
     // Asking again for no more than was done does nothing: no second SIGTERM.
     f.queue.stop(ticket.id(), false).unwrap();
     assert!(!f.queue.cancel_pending(ticket.id()).unwrap());
-    assert_eq!(f.queue.claim_fallback(ticket.id()).unwrap(), None);
     assert_eq!(ticket.cancel_requested().unwrap(), None);
-    // A SIGTERM its loadmaster forwarded from outside counts too.
-    let other = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
-    other.record_term_sent().unwrap();
-    f.queue.stop(other.id(), false).unwrap();
-    assert!(!f.queue.cancel_pending(other.id()).unwrap());
-    assert_eq!(other.cancel_requested().unwrap(), None);
     // Asking for SIGKILL is new; nothing goes above it.
     f.queue.stop(ticket.id(), true).unwrap();
     assert_eq!(ticket.cancel_requested().unwrap(), Some(true));
@@ -578,25 +571,24 @@ fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
 }
 
 #[test]
-fn a_fallback_signal_is_claimed_once_and_leaves_the_request() {
+fn a_sigterm_recorded_at_handover_is_not_sent_again() {
+    // The task left processes behind after its loadmaster passed a SIGTERM
+    // on; a cancel, which signals them itself, must not send another.
     let f = fixture();
     let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-    // From two cancels, neither acted on by the job's loadmaster.
-    f.queue.stop(ticket.id(), true).unwrap();
-    f.queue.stop(ticket.id(), false).unwrap();
-    assert_eq!(
-        f.queue.claim_fallback(ticket.id()).unwrap(),
-        Some((true, -1))
-    );
-    assert_eq!(
-        f.queue.claim_fallback(ticket.id()).unwrap(),
-        None,
-        "claimed once"
-    );
-    assert!(!f.queue.cancel_pending(ticket.id()).unwrap());
-    // The loadmaster still finds it once it can act: one that ignored the
-    // signal (started with SIGTERM ignored) learns it this way.
-    assert_eq!(ticket.cancel_requested().unwrap(), Some(true));
+    assert_eq!(ticket.try_admit(8).unwrap(), Admission::Admitted);
+    let left_behind = LiveGroup::start();
+    f.queue
+        .record_child(ticket.id(), left_behind.group)
+        .unwrap();
+    let id = ticket.id();
+    ticket.hand_over(|| true).unwrap();
+    assert!(matches!(
+        f.queue.stop(id, false).unwrap(),
+        Canceled::Requested(_)
+    ));
+    assert!(!f.queue.cancel_pending(id).unwrap());
+    assert!(left_behind.group.is_alive(), "not signalled");
 }
 
 #[test]

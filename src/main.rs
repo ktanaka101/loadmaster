@@ -489,23 +489,20 @@ fn run_admitted(
             task.name,
             child.group.pgid
         );
-        // Whether they had a SIGTERM must outlive this process: a cancel of
-        // the job then sends them no second one.
-        forwarder.forward_pending(&child.group, signals);
-        if forwarder.term_sent()
-            && let Err(e) = ticket.record_term_sent()
-        {
-            say!("loadmaster: warning: could not record the SIGTERM sent to job #{id}: {e}");
-        }
-        ticket.detach()
+        // Signals that arrived meanwhile still go to them, and whether they
+        // had a SIGTERM is recorded, in one step with the handover, so a
+        // cancel of the job sends them no second one.
+        ticket.hand_over(|| {
+            forwarder.forward_pending(&child.group, signals);
+            forwarder.term_sent()
+        })
     } else {
         drop(ticket);
         Ok(())
     };
-    // Signals that arrived while the slot was being handed over or released
-    // (even if that failed) still go to what is left of the task.
-    forwarder.forward_pending(&child.group, signals);
     if let Err(e) = handed_over {
+        // The job keeps its owner, so signals still go to what is left.
+        forwarder.forward_pending(&child.group, signals);
         // As with a failed release: the task's result stands, and the job
         // keeps its owner, so it is reclaimed once its processes are gone.
         say!(
