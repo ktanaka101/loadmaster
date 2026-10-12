@@ -830,8 +830,8 @@ What to compare between the two periods:
   kept busy (CPU time divided by run time), for the median run and the
   busiest tenth of runs. A weight far above them makes jobs wait for nothing.
   A `!` after CORES P90 marks a task whose busiest tenth kept more than 1.2
-  times its weight busy: those runs take more than their slot, and the machine
-  runs above its capacity; raise the weight. Read them from the admission
+  times its weight busy: those runs use more than their slot accounts for, so
+  the machine can run above its capacity; raise the weight. Read them from the admission
   period; under contention they read low.
 - **above capacity ... of the time checks ran**: how often the weights of the
   checks running at once (measure-only) or asking to run (admission) added up

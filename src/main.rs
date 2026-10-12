@@ -210,6 +210,14 @@ fn run(args: RunArgs) -> Result<i32> {
         ok: None,
         uses: task.uses.clone(),
     };
+    // Set once this run's line is written: a place that gave up logs before
+    // it is parked, since a parked job has no owner whose loss would be.
+    let mut logged = false;
+    let log = |record: &Record| {
+        if let Err(e) = history::append(&state_dir, record) {
+            say!("loadmaster: warning: cannot write the history log: {e}");
+        }
+    };
     let result = (|| {
         let max_wait = max_wait.map(Duration::from_secs);
         let turn = if machine.measure_only {
@@ -235,6 +243,13 @@ fn run(args: RunArgs) -> Result<i32> {
                 used,
                 waiting_for,
             } => {
+                // Logged first: killed before parking, the job is reaped and
+                // logged as lost, which the report joins to this record;
+                // killed after parking, nothing else would log it.
+                record.outcome = Outcome::GaveUp;
+                record.exit_code = Some(EXIT_GAVE_UP);
+                log(&record);
+                logged = true;
                 ticket.park()?;
                 say!(
                     "loadmaster: gave up waiting for `{}` after {} ({}, {used}/{} in use{})\n\
@@ -247,7 +262,6 @@ fn run(args: RunArgs) -> Result<i32> {
                     format_waiting_for(&waiting_for),
                     PARK_TTL.as_secs(),
                 );
-                record.outcome = Outcome::GaveUp;
                 Ok(EXIT_GAVE_UP)
             }
             Turn::Interrupted(signal) => {
@@ -258,6 +272,9 @@ fn run(args: RunArgs) -> Result<i32> {
         }
     })();
     // Every run that got in line leaves exactly one history line.
+    if logged {
+        return result;
+    }
     match &result {
         Ok(code) => {
             record.exit_code = Some(*code);
@@ -270,9 +287,7 @@ fn run(args: RunArgs) -> Result<i32> {
             record.exit_code = Some(EXIT_ERROR);
         }
     }
-    if let Err(e) = history::append(&state_dir, &record) {
-        say!("loadmaster: warning: cannot write the history log: {e}");
-    }
+    log(&record);
     result
 }
 

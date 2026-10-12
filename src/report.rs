@@ -287,8 +287,8 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
             to starting (or to the end, if it never started).\n";
     if flagged {
         out += &format!(
-            "!: at least one run in ten kept more than {OVER_WEIGHT} times its weight in cores \
-             busy: raise the\nweight, or the machine runs above its capacity.\n"
+            "!: at least a tenth of the runs kept more than {OVER_WEIGHT} times their weight in \
+             cores busy:\nthey use more than their slot accounts for; raise the weight.\n"
         );
     }
     out
@@ -540,12 +540,16 @@ fn local_time(text: &str) -> Option<u64> {
     tm.tm_isdst = -1;
     // SAFETY: `tm` is valid for the duration of the call.
     let secs = unsafe { libc::mktime(&mut tm) };
-    // mktime moves a day that does not exist (February 30) into the next
-    // month; such a date is not accepted.
-    if secs == -1 || tm.tm_mon != month - 1 || tm.tm_mday != day {
+    // mktime moves a time that does not exist into one that does: February
+    // 30 into March, 02:30 on the night clocks skip from 02:00 to 03:00 into
+    // 03:30. Such a time is not accepted.
+    let moved = (tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min) != (month - 1, day, hour, minute);
+    if secs == -1 || moved {
         return None;
     }
-    u64::try_from(secs).ok()?.checked_mul(1000)
+    // A time before 1970 in UTC (midnight on 1970-01-01 east of Greenwich)
+    // means "from the start".
+    u64::try_from(secs.max(0)).ok()?.checked_mul(1000)
 }
 
 /// A number followed by `m`, `h`, `d` or `w`.
@@ -954,7 +958,7 @@ mod tests {
         let text = render(&entries, &options());
         assert!(
             text.contains(
-                "!: at least one run in ten kept more than 1.2 times its weight in cores busy"
+                "!: at least a tenth of the runs kept more than 1.2 times their weight in cores busy"
             ),
             "{text}"
         );

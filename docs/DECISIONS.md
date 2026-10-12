@@ -415,7 +415,12 @@ got in line writes exactly one line, whatever happened afterwards: a
 `loadmaster` killed with SIGKILL cannot write its own, so the process that
 reaps its job writes a `lost` line for it, after the reaping is committed.
 That needs the capacity and mode of the job, which are therefore kept in the
-queue database. JSON Lines is easy to analyze with `jq`. It is not rotated.
+queue database. A run that gives up writes its line before it parks its
+job: a parked job has no owner whose loss could be logged, so a `loadmaster`
+killed after parking (while its message to a full stderr blocks, say) would
+otherwise leave no line. Killed before parking, its job is reaped and logged
+as `lost`, and the report joins that line to the `gave_up` one as a single
+check. JSON Lines is easy to analyze with `jq`. It is not rotated.
 Fields added later are optional when read back, so older logs still work with
 `loadmaster report`.
 
@@ -423,15 +428,12 @@ Known gaps, each needing an unusual combination of events, accepted rather
 than paid for with per-attempt IDs and logging inside the queue's
 transactions:
 
-- A `loadmaster` killed right after removing, parking or handing over its job
-  but before writing its line leaves no line.
+- A `loadmaster` killed right after removing or handing over its job but
+  before writing its line leaves no line.
 - If releasing or handing over a finished job fails (the database stayed
   locked for the whole 60-second busy timeout), `loadmaster` warns, exits with
   the task's code and logs its result, and the job is later also logged as
   `lost`. The slot stays held until the task's processes are gone either way.
-- A run that gave up can, in theory, append its `gave_up` line after a re-run
-  that resumed its place has already finished; `report` then counts two
-  checks.
 - While a `loadmaster` from before `lost` logging is still running during an
   upgrade, it can reap jobs without logging them.
 
@@ -466,7 +468,9 @@ so users need a way to find out from their own use.
   (recorded from its exit status), or a `lost` run whose task had started, is
   killed: the harm admission is meant to remove. A signal while waiting, a
   `lost` run that was still waiting, and a place given up and never resumed
-  left the line: the cost of waiting. The two used to share one column, and
+  left the line: the cost of waiting. A `lost` run counts as started once
+  its task's process group was recorded, since the task is let through right
+  after that; a job admitted but killed before then never ran. The two used to share one column, and
   the first real user had to tell them apart by hand (run time 0); a period
   of admission would otherwise look worse for its timeouts in line than a
   baseline that never waits. `lost` records say whether the task had started

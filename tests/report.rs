@@ -243,3 +243,24 @@ fn the_resources_a_task_used_are_logged_and_shown() {
     // TASK WEIGHT USES
     assert_eq!(row.split_whitespace().nth(2), Some("db=1"), "{text}");
 }
+
+#[test]
+fn local_times_that_do_not_exist_are_rejected() {
+    let sandbox = Sandbox::new(4, &task("pass", 1, &["true"]));
+    let report = |tz: &str, since: &str| {
+        let mut cmd = sandbox.cmd(&["report", "--since", since]);
+        cmd.env("TZ", tz);
+        output(cmd)
+    };
+    // Clocks in New York skip from 02:00 to 03:00 on 2026-03-08.
+    let skipped = report("America/New_York", "2026-03-08T02:30");
+    assert_eq!(skipped.status.code(), Some(125), "{}", stderr(&skipped));
+    assert!(
+        report("America/New_York", "2026-03-08T03:30")
+            .status
+            .success()
+    );
+    // Before 1970 in UTC, which is still a valid start.
+    let early = report("Asia/Tokyo", "1970-01-01");
+    assert!(early.status.success(), "{}", stderr(&early));
+}

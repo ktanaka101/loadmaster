@@ -326,7 +326,9 @@ impl Queue {
                 load: None,
                 signal: None,
                 exit_code: None,
-                started: Some(job.state == JobState::Running),
+                // The task is let through right after its group is
+                // recorded; a job admitted but killed before that never ran.
+                started: Some(job.child.is_some()),
                 ok: None,
                 uses: job
                     .uses

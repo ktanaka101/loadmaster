@@ -340,6 +340,11 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
     // Killed while running; its task has exited too.
     let running = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
     running.try_admit(8).unwrap();
+    let gone = ProcessGroup {
+        pgid: f.me.pid,
+        leader_start_time: Some(f.me.start_time + 1),
+    };
+    f.queue.record_child(running.id(), gone).unwrap();
     f.queue
         .conn
         .execute(
@@ -349,6 +354,18 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
         )
         .unwrap();
     std::mem::forget(running);
+    // Killed once admitted, but before its task was started: the task never
+    // ran, since it is let through only after its group is recorded.
+    let admitted = f.queue.enqueue(&request("build", 1, &[]), f.me).unwrap();
+    admitted.try_admit(8).unwrap();
+    f.queue
+        .conn
+        .execute(
+            "UPDATE jobs SET owner_start = owner_start + 1 WHERE id = ?1",
+            [admitted.id()],
+        )
+        .unwrap();
+    std::mem::forget(admitted);
     // Gave up and expired: already logged as gave_up by its owner.
     let parked = f.queue.enqueue(&request("e2e", 2, &[]), f.me).unwrap();
     let parked_id = parked.id();
@@ -366,17 +383,22 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
     f.queue.reap().unwrap();
     assert!(f.queue.snapshot().unwrap().jobs.is_empty());
     let records = history(&f);
-    assert_eq!(records.len(), 2, "{records:?}");
-    for (record, task) in records.iter().zip(["lint", "test"]) {
+    assert_eq!(records.len(), 3, "{records:?}");
+    for ((record, task), started) in records
+        .iter()
+        .zip(["lint", "test", "build"])
+        .zip([false, true, false])
+    {
         assert_eq!(record["task"], task);
         assert_eq!(record["outcome"], "lost");
         assert_eq!(record["capacity"], 8);
         assert_eq!(record["exit_code"], serde_json::Value::Null);
+        assert_eq!(record["started"], started, "{task}");
     }
     assert_eq!(records[1]["wait_ms"], 250);
     // Reaped once, logged once.
     f.queue.reap().unwrap();
-    assert_eq!(history(&f).len(), 2);
+    assert_eq!(history(&f).len(), 3);
 }
 
 #[test]
