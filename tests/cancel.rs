@@ -371,3 +371,66 @@ fn a_second_cancel_does_not_signal_a_job_already_stopping() {
     assert_eq!(wait(&mut holder).code(), Some(3));
     assert_eq!(sandbox.read("signals"), "term\n", "one SIGTERM");
 }
+
+#[test]
+fn a_loadmaster_that_ignored_the_fallback_signal_still_takes_the_request() {
+    // It ignores SIGTERM and is stopped, so the signal that stands in for
+    // the request does nothing; once continued, it finds the request.
+    let sandbox = sandbox();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let mut cmd = sandbox.cmd(&["run", "test"]);
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut waiter = cmd.spawn().unwrap();
+    wait_for_state(&sandbox, "test", JobState::Waiting);
+    signal(waiter.id(), libc::SIGSTOP);
+    let mut cancel = sandbox.spawn(&["cancel", "2"]);
+    std::thread::sleep(std::time::Duration::from_millis(2_500));
+    signal(waiter.id(), libc::SIGCONT);
+
+    assert!(wait(&mut cancel).success());
+    assert_eq!(wait(&mut waiter).code(), Some(143));
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+}
+
+#[test]
+fn processes_left_behind_get_no_second_sigterm() {
+    // The task's leader ends at once on SIGTERM, leaving a process that
+    // logs every SIGTERM and runs until `done` exists: its slot is handed
+    // over to it, and a second cancel must leave it alone.
+    let probe = Sandbox::new(4, "");
+    let (log, done) = (q(&probe.path("signals")), q(&probe.path("done")));
+    let script = format!(
+        "sh -c 'trap \"echo term >> {log}\" TERM; while [ ! -e {done} ]; do sleep 0.05; done' & \
+         trap 'exit 3' TERM; {}",
+        probe.hold_script("hold")
+    );
+    std::fs::write(
+        probe.repo.join(".loadmaster.toml"),
+        sh_task("hold", 1, &script),
+    )
+    .unwrap();
+    let sandbox = probe;
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let mut first = sandbox.spawn(&["cancel", "1"]);
+    assert_eq!(wait(&mut holder).code(), Some(3));
+    wait_until("the slot to be handed over", || {
+        sandbox.job("hold").is_some_and(|j| j.is_orphaned())
+    });
+
+    let mut second = sandbox.spawn(&["cancel", "1"]);
+    std::thread::sleep(std::time::Duration::from_millis(2_500));
+    std::fs::write(sandbox.path("done"), "").unwrap();
+    assert!(wait(&mut first).success());
+    assert!(wait(&mut second).success());
+    assert_eq!(sandbox.read("signals"), "term\n", "one SIGTERM");
+}

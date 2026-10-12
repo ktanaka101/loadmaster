@@ -513,7 +513,10 @@ one with outcome `lost`.
     runs untracked.
 - **Signals**: SIGINT, SIGTERM or SIGHUP while waiting leaves the line. While
   the task runs, they are forwarded to the task's process group, and
-  loadmaster waits for the task to exit before freeing the slot. Signals that
+  loadmaster waits for the task to exit before freeing the slot. SIGTERM is
+  passed on once, whoever sends it, so a second one cannot cut short the
+  clean-up the first started; SIGKILL (or `loadmaster cancel --kill`) forces
+  a task to end. Signals that
   were ignored when loadmaster started (as under `nohup`) stay ignored. Every
   process in the group gets the signal, as with Ctrl-C in a terminal, so a
   wrapper script that forwards signals to its child makes the child get each
@@ -589,9 +592,10 @@ loadmaster held [--uses RESOURCE]
   the line, and a running job's task gets SIGTERM, once, as described under
   [Signals](#how-it-works), with the slot freed once it exits. That needs no
   permission to signal another agent's processes, which sandboxes do not
-  give. A job whose `loadmaster` does not take the request (from a version
-  before 0.6, or stopped with Ctrl-Z) or is gone is signalled directly
-  instead, where that is allowed. A kept place (exit code 75) is dropped.
+  give. A job whose `loadmaster` does not act on the request in time (from a
+  version before 0.6, or stopped with Ctrl-Z) or is gone is signalled
+  directly instead, where that is allowed. Canceling a job again asks for
+  nothing more unless it adds `--kill`. A kept place (exit code 75) is dropped.
   `--kill` asks for SIGKILL instead, for a task that does not stop; it gets
   no chance to clean up. `loadmaster report` leaves canceled checks out.
   Exits with 0 once the jobs are gone.

@@ -253,3 +253,25 @@ fn ignored_signals_stay_ignored() {
     sandbox.release("hold");
     assert!(wait(&mut runner).success());
 }
+
+#[test]
+fn sigterm_reaches_the_task_once() {
+    // The task logs each SIGTERM and carries on until released.
+    let probe = Sandbox::new(4, "");
+    let script = format!(
+        "trap 'echo term >> {}' TERM; {}",
+        q(&probe.path("signals")),
+        probe.hold_script("hold")
+    );
+    std::fs::write(probe.repo.join(".loadmaster.toml"), sh_task("hold", 1, &script)).unwrap();
+    let sandbox = probe;
+    let mut runner = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    signal(runner.id(), libc::SIGTERM);
+    wait_until("the first SIGTERM", || sandbox.read("signals").contains("term"));
+    signal(runner.id(), libc::SIGTERM);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    sandbox.release("hold");
+    assert!(wait(&mut runner).success());
+    assert_eq!(sandbox.read("signals"), "term\n");
+}

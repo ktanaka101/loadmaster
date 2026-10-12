@@ -471,7 +471,8 @@ fn run_admitted(
         );
         Some(cancel_signal(kill))
     };
-    let status = runner::wait(&mut child, signals, canceled)
+    let mut forwarder = runner::Forwarder::default();
+    let status = runner::wait(&mut child, signals, &mut forwarder, canceled)
         .map_err(|e| Error::io("cannot wait for the task", e))?;
     // Measured before the slot is released, which may wait for the database.
     record.run_ms = Some(millis(started.elapsed()));
@@ -495,7 +496,7 @@ fn run_admitted(
     };
     // Signals that arrived while the slot was being handed over or released
     // (even if that failed) still go to what is left of the task.
-    runner::forward_pending(&child.group, signals);
+    forwarder.forward_pending(&child.group, signals);
     if let Err(e) = handed_over {
         // As with a failed release: the task's result stands, and the job
         // keeps its owner, so it is reclaimed once its processes are gone.
@@ -897,18 +898,12 @@ fn cancel(args: CancelArgs) -> Result<i32> {
     let mut out = String::new();
     // Each job asked to stop, and what it was doing for how long.
     let mut stopping: Vec<(Job, String)> = Vec::new();
-    // Jobs that need no more from this command: their loadmaster took the
-    // request, or they were signalled. Nothing is sent to them again.
-    let mut settled = std::collections::BTreeSet::new();
-    let mut killed_orphans = std::collections::BTreeSet::new();
-    // Jobs to be killed: by --kill, or by a request this command took back.
-    let mut to_kill = std::collections::BTreeSet::new();
     for id in ids {
         if Some(id) == own {
             say!("loadmaster: not canceling job #{id}: this command runs in it");
             continue;
         }
-        let (job, signalled) = match queue.cancel(id, args.kill)? {
+        let job = match queue.cancel(id, args.kill)? {
             Canceled::NotFound if args.here => continue,
             Canceled::NotFound => {
                 say!("loadmaster: job #{id} is not in the queue");
@@ -918,12 +913,8 @@ fn cancel(args: CancelArgs) -> Result<i32> {
                 out += &format!("dropped the kept place of #{id} `{}`\n", job.task);
                 continue;
             }
-            Canceled::Requested(job) => (job, false),
-            Canceled::Signaled(job) => (job, true),
+            Canceled::Requested(job) | Canceled::Signaled(job) => job,
         };
-        if signalled {
-            settled.insert(job.id);
-        }
         let (what, since) = match job.state {
             JobState::Running => ("running", job.started_at),
             _ => ("waiting", Some(job.enqueued_at)),
@@ -938,12 +929,15 @@ fn cancel(args: CancelArgs) -> Result<i32> {
         return Ok(0);
     }
     // Gone once its loadmaster has left the line, or its task has exited and
-    // freed the slot. A job's loadmaster acts on the request; one that has
-    // not taken it in time (a version that does not read requests, or one
-    // stopped with Ctrl-Z), or that is gone, is signalled instead, if this
-    // process may. A job can change meanwhile: one that gave up waiting
-    // (exit code 75) keeps its place, which is dropped rather than left to
-    // expire, and a re-run that resumes the place takes the request on.
+    // freed the slot. The request in the queue records what was asked and
+    // what was done, so nothing is sent twice (see `Queue::stop`). A job's
+    // loadmaster acts on it; one that has not in time (a version that does
+    // not read requests, or one stopped with Ctrl-Z) is signalled instead,
+    // where that is allowed, and still acts on the request once it can. A
+    // job whose loadmaster is gone has its task signalled. A job can change
+    // meanwhile: one that gave up waiting (exit code 75) keeps its place,
+    // which is dropped rather than left to expire, and a re-run that resumes
+    // the place takes the request on.
     let started = Instant::now();
     let mut hinted = false;
     loop {
@@ -956,32 +950,12 @@ fn cancel(args: CancelArgs) -> Result<i32> {
             break;
         }
         for job in &left {
-            if job.state == JobState::Parked {
+            if job.state == JobState::Parked || job.is_orphaned() {
                 queue.stop(job.id, args.kill)?;
-                continue;
-            }
-            if settled.contains(&job.id) {
-                // A job killed through its loadmaster may have started its
-                // task in the meantime: with --kill, that is killed too,
-                // which a second SIGKILL cannot harm.
-                let kill = args.kill || to_kill.contains(&job.id);
-                if kill && job.is_orphaned() && killed_orphans.insert(job.id) {
-                    queue.signal_now(job.id, true)?;
-                }
-                continue;
-            }
-            if !queue.cancel_pending(job.id)? {
-                settled.insert(job.id);
-                continue;
-            }
-            let unanswered = job.is_orphaned() || started.elapsed() >= CANCEL_ANSWER_WITHIN;
-            if unanswered && let Some(kill) = queue.take_back_cancel(job.id)? {
-                settled.insert(job.id);
-                // As asked by every `cancel` whose request this was.
-                if kill {
-                    to_kill.insert(job.id);
-                }
-                queue.signal_now(job.id, kill || args.kill)?;
+            } else if started.elapsed() >= CANCEL_ANSWER_WITHIN
+                && let Some(kill) = queue.claim_fallback(job.id)?
+            {
+                queue.signal_now(job.id, kill)?;
             }
         }
         if !hinted && started.elapsed() >= CANCEL_HINT_AFTER {

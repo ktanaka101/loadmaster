@@ -86,15 +86,18 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64 + 1;
 
 /// Requests from `loadmaster cancel`, for the job's own loadmaster to act on:
 /// in an agent's sandbox, a process may not signal one started by another
-/// command. One row per job, kept once taken, so that a later cancel that
-/// asks for no more than was done does nothing. Older versions never read
-/// this table and work without it, so it is added without a new schema
-/// version, which they would refuse.
+/// command. One row per job, kept until the job is gone, with the strongest
+/// stop asked for and the strongest one done, by the job's loadmaster and by
+/// a `cancel` that signalled the job itself (0 SIGTERM, 1 SIGKILL, -1 none):
+/// a later cancel that asks for no more than was done does nothing. Older
+/// versions never read this table and work without it, so it is added
+/// without a new schema version, which they would refuse.
 const CANCEL_REQUESTS: &str = "
 CREATE TABLE IF NOT EXISTS cancel_requests (
-    job   INTEGER PRIMARY KEY,
-    kill  INTEGER NOT NULL,
-    taken INTEGER NOT NULL DEFAULT 0
+    job         INTEGER PRIMARY KEY,
+    kill        INTEGER NOT NULL,
+    owner_done  INTEGER NOT NULL DEFAULT -1,
+    signal_done INTEGER NOT NULL DEFAULT -1
 );
 ";
 
@@ -445,15 +448,18 @@ impl Queue {
     }
 
     fn ensure_cancel_requests(&self) -> Result<()> {
-        // Usually it exists; don't take the write lock then.
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master
-                            WHERE type = 'table' AND name = 'cancel_requests')",
+        // Usually it is there as it should be; don't take the write lock
+        // then. One of another shape is from a build before any release, and
+        // requests only matter while their jobs run: it is made anew.
+        let current: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('cancel_requests')
+                            WHERE name = 'signal_done')",
             [],
             |r| r.get(0),
         )?;
-        if !exists {
+        if !current {
             let tx = self.begin()?;
+            tx.execute_batch("DROP TABLE IF EXISTS cancel_requests")?;
             tx.execute_batch(CANCEL_REQUESTS)?;
             tx.commit()?;
         }
@@ -569,56 +575,71 @@ impl Queue {
                 };
                 if job.state == JobState::Parked {
                     delete_job(tx, job.id)?;
-                    return Ok(Some(Canceled::DroppedPlace(job)));
+                    return Ok(Some((Canceled::DroppedPlace(job), None)));
                 }
+                tx.execute(
+                    "INSERT INTO cancel_requests (job, kill) VALUES (?1, ?2)
+                     ON CONFLICT (job) DO UPDATE SET kill = max(kill, excluded.kill)",
+                    params![job.id, kill],
+                )?;
                 if job.owner_alive() {
-                    // A SIGKILL request is not turned back into a SIGTERM
-                    // one, and one taken already stays taken unless this one
-                    // asks for more. (SET reads the row as it was.)
-                    tx.execute(
-                        "INSERT INTO cancel_requests (job, kill) VALUES (?1, ?2)
-                         ON CONFLICT (job) DO UPDATE
-                         SET taken = taken AND excluded.kill <= kill,
-                             kill = max(kill, excluded.kill)",
-                        params![job.id, kill],
-                    )?;
-                    return Ok(Some(Canceled::Requested(job)));
+                    return Ok(Some((Canceled::Requested(job), None)));
                 }
-                Ok(Some(Canceled::Signaled(job)))
+                // Its loadmaster is gone: its task is signalled from here.
+                // SIGKILL as often as it takes, SIGTERM only if nobody has
+                // sent it one.
+                let (kill, done): (bool, i64) = tx.query_row(
+                    "SELECT kill, max(owner_done, signal_done) FROM cancel_requests
+                     WHERE job = ?1",
+                    [job.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                if !kill && done >= 0 {
+                    return Ok(Some((Canceled::Requested(job), None)));
+                }
+                tx.execute(
+                    "UPDATE cancel_requests SET signal_done = max(signal_done, kill)
+                     WHERE job = ?1",
+                    [job.id],
+                )?;
+                Ok(Some((Canceled::Signaled(job), Some(kill))))
             })?;
             match found {
                 None => return Ok(Canceled::NotFound),
-                Some(Canceled::Signaled(job)) => {
+                Some((Canceled::Signaled(job), Some(kill))) => {
                     if signal_directly(&job, kill).map_err(|source| cannot_signal(&job, source))? {
                         return Ok(Canceled::Signaled(job));
                     }
                 }
-                Some(other) => return Ok(other),
+                Some((other, _)) => return Ok(other),
             }
         }
         Ok(Canceled::NotFound)
     }
 
-    /// Whether a request for job `id` is still waiting for its loadmaster.
+    /// Whether a stop has been asked for job `id` that nobody has done yet.
     pub fn cancel_pending(&self, id: JobId) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM cancel_requests WHERE job = ?1 AND NOT taken)",
+            "SELECT EXISTS (SELECT 1 FROM cancel_requests
+                            WHERE job = ?1 AND kill > max(owner_done, signal_done))",
             [id],
             |r| r.get(0),
         )?)
     }
 
-    /// Takes back a request that job `id`'s loadmaster has not acted on
-    /// (one from a version that does not read them, or one that is stopped),
-    /// so the caller can signal it instead: whether it asked for SIGKILL, or
-    /// `None` if the loadmaster has taken it (or another `cancel` took it
-    /// back). Requests from several `cancel`s are one: whoever takes it acts
-    /// on all of them.
-    pub fn take_back_cancel(&self, id: JobId) -> Result<Option<bool>> {
+    /// Claims the signal that stands in for job `id`'s request when its
+    /// loadmaster has not acted on it (one from a version that does not read
+    /// requests, or one that is stopped): whether it is SIGKILL, or `None`
+    /// if that much has been done already, by its loadmaster or by another
+    /// `cancel`. The request stays, so the loadmaster acts on it once it
+    /// can; it sends its task no second SIGTERM.
+    pub fn claim_fallback(&self, id: JobId) -> Result<Option<bool>> {
         let tx = self.begin()?;
         let kill = tx
             .query_row(
-                "DELETE FROM cancel_requests WHERE job = ?1 AND NOT taken RETURNING kill",
+                "UPDATE cancel_requests SET signal_done = kill
+                 WHERE job = ?1 AND kill > owner_done AND kill > signal_done
+                 RETURNING kill",
                 [id],
                 |r| r.get(0),
             )
@@ -909,17 +930,25 @@ impl Ticket<'_> {
         self.resumed
     }
 
-    /// A request from `loadmaster cancel`, taken so it is acted on once:
-    /// `Some(true)` to kill the task, `Some(false)` to stop it with SIGTERM.
+    /// A request from `loadmaster cancel` that this job's loadmaster has
+    /// not acted on, taken so it is acted on once: `Some(true)` to kill the
+    /// task, `Some(false)` to stop it with SIGTERM.
     pub fn cancel_requested(&self) -> Result<Option<bool>> {
         // Almost always there is none; look without the write lock first.
-        if !self.queue.cancel_pending(self.id)? {
+        let pending: bool = self.queue.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM cancel_requests
+                            WHERE job = ?1 AND kill > owner_done)",
+            [self.id],
+            |r| r.get(0),
+        )?;
+        if !pending {
             return Ok(None);
         }
         let tx = self.queue.begin()?;
         let kill: Option<bool> = tx
             .query_row(
-                "UPDATE cancel_requests SET taken = 1 WHERE job = ?1 AND NOT taken
+                "UPDATE cancel_requests SET owner_done = kill
+                 WHERE job = ?1 AND kill > owner_done
                  RETURNING kill",
                 [self.id],
                 |r| r.get(0),

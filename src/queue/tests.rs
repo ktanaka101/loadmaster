@@ -551,23 +551,20 @@ fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
         f.queue.stop(ticket.id(), false).unwrap(),
         Canceled::Requested(_)
     ));
+    assert!(f.queue.cancel_pending(ticket.id()).unwrap());
     assert_eq!(ticket.cancel_requested().unwrap(), Some(false));
     assert_eq!(ticket.cancel_requested().unwrap(), None, "taken once");
 
     // Asking again for no more than was done does nothing: no second SIGTERM.
     f.queue.stop(ticket.id(), false).unwrap();
     assert!(!f.queue.cancel_pending(ticket.id()).unwrap());
-    assert_eq!(f.queue.take_back_cancel(ticket.id()).unwrap(), None);
+    assert_eq!(f.queue.claim_fallback(ticket.id()).unwrap(), None);
     assert_eq!(ticket.cancel_requested().unwrap(), None);
-    // Asking for SIGKILL is new.
+    // Asking for SIGKILL is new; nothing goes above it.
     f.queue.stop(ticket.id(), true).unwrap();
     assert_eq!(ticket.cancel_requested().unwrap(), Some(true));
     f.queue.stop(ticket.id(), false).unwrap();
-    assert_eq!(
-        ticket.cancel_requested().unwrap(),
-        None,
-        "nothing above SIGKILL"
-    );
+    assert_eq!(ticket.cancel_requested().unwrap(), None);
 
     let id = ticket.id();
     drop(ticket);
@@ -575,15 +572,22 @@ fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
 }
 
 #[test]
-fn a_request_taken_back_is_the_strongest_one() {
+fn a_fallback_signal_is_claimed_once_and_leaves_the_request() {
     let f = fixture();
     let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-    // From two cancels, neither taken by the job's loadmaster.
+    // From two cancels, neither acted on by the job's loadmaster.
     f.queue.stop(ticket.id(), true).unwrap();
     f.queue.stop(ticket.id(), false).unwrap();
-    assert_eq!(f.queue.take_back_cancel(ticket.id()).unwrap(), Some(true));
-    assert_eq!(f.queue.take_back_cancel(ticket.id()).unwrap(), None);
-    assert_eq!(ticket.cancel_requested().unwrap(), None, "taken back");
+    assert_eq!(f.queue.claim_fallback(ticket.id()).unwrap(), Some(true));
+    assert_eq!(
+        f.queue.claim_fallback(ticket.id()).unwrap(),
+        None,
+        "claimed once"
+    );
+    assert!(!f.queue.cancel_pending(ticket.id()).unwrap());
+    // The loadmaster still finds it once it can act: one that ignored the
+    // signal (started with SIGTERM ignored) learns it this way.
+    assert_eq!(ticket.cancel_requested().unwrap(), Some(true));
 }
 
 #[test]
