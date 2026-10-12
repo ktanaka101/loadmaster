@@ -759,8 +759,9 @@ a chained command no longer matches allow rules such as Claude Code's
 Tools that run commands in a sandbox (Codex by default, Claude Code when its
 sandbox is on, and others) must let them write to loadmaster's state
 directory, `~/.local/state/loadmaster` (or `$XDG_STATE_HOME/loadmaster`, or
-`LOADMASTER_STATE_DIR`). Until they may, every `loadmaster` command fails with
-exit code 125 and says that it cannot write there. Nothing else needs to be
+`LOADMASTER_STATE_DIR`). Until they may, the commands that use the queue
+(`run`, `status`, `cancel`, `held`, `clean`) fail with exit code 125 and say
+that they cannot write there. Nothing else needs to be
 allowed: inside such a sandbox, loadmaster still sees and reclaims the jobs of
 other agents, and `loadmaster cancel` works although the sandbox does not let
 one command signal processes that another started (it leaves a request in the

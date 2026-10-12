@@ -558,9 +558,14 @@ fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
     assert_eq!(ticket.cancel_requested().unwrap(), None, "taken once");
 
     f.queue.stop(ticket.id(), false).unwrap();
-    assert!(f.queue.take_back_cancel(ticket.id()).unwrap());
+    f.queue.stop(ticket.id(), true).unwrap();
+    assert_eq!(
+        f.queue.take_back_cancel(ticket.id()).unwrap(),
+        Some(true),
+        "taken back as the strongest request"
+    );
     assert_eq!(ticket.cancel_requested().unwrap(), None, "taken back");
-    assert!(!f.queue.take_back_cancel(ticket.id()).unwrap());
+    assert_eq!(f.queue.take_back_cancel(ticket.id()).unwrap(), None);
 
     f.queue.stop(ticket.id(), false).unwrap();
     let id = ticket.id();

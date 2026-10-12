@@ -336,16 +336,21 @@ that one agent works in.
   one, and different branches run different versions on one machine. A job
   of an older `loadmaster` does not take its request, so after 2 seconds
   `cancel` takes the request back and signals the job instead, where that is
-  allowed (checked by PID and start time). Taking a request and taking it
-  back are each one delete in a write transaction, so exactly one of them
-  wins, and the job is never told twice. The same fallback reaches a
+  allowed (checked by PID and start time), by the job's state as read right
+  before: if a waiting job's `loadmaster` was killed after its task had
+  started, `--kill` kills the task too once `cancel` sees it running on its
+  own. Taking a request and taking it back are each one delete in a write
+  transaction, so exactly one of them wins, and the job is never told
+  twice. Requests from several `cancel`s are one row, and whoever takes it
+  acts on the strongest of them. The same fallback reaches a
   `loadmaster` stopped with Ctrl-Z, which acts on nothing, not even on its
   task exiting, so it is also sent SIGCONT. Where the fallback is not allowed
   either, `cancel` says why and how to stop the job instead. A task whose
   `loadmaster` is gone is signalled directly, which a sandbox may not allow.
-- A job's `loadmaster` sends its task SIGTERM for a cancel at most once: a
-  second one would cut short the clean-up the first started (as in a
-  handler registered with `process.once`). A later `--kill` still goes
+- A job's `loadmaster` sends its task a cancel's SIGTERM only if no signal
+  that ends it has reached it yet, whether from a cancel or forwarded from
+  its own: a second one would cut short the clean-up the first started (as
+  in a handler registered with `process.once`). A later `--kill` still goes
   through, and a SIGTERM request does not undo a pending SIGKILL one.
 - It waits until the jobs have left the queue, so the caller knows the slot
   is free, and says after 10 seconds which ones are still stopping. It never
@@ -470,10 +475,14 @@ sandbox on macOS (measured with `codex sandbox` and real `codex exec`
 sessions):
 
 - Writes outside the workspace and the temp directories are denied, so the
-  state directory has to be added as a writable root. Until it is, every
-  command fails with exit code 125, and the error names the state directory
-  and the sandbox rather than SQLite's "unable to open database file": the
-  person who reads it has to change the agent's settings, not loadmaster's.
+  state directory has to be added as a writable root. Until it is, the
+  commands that use the queue fail with exit code 125, and the error names
+  the state directory and the sandbox rather than SQLite's "unable to open
+  database file": the person who reads it has to change the agent's
+  settings, not loadmaster's. SQLite's errors don't say whether the
+  directory is to blame, and it opens a database it may not write for
+  reading without saying so, so a read-only connection or a failed open is
+  put down to the directory only if a file cannot be made in it either.
 - Reading other processes' start times and listing process groups work, so
   a sandboxed `loadmaster` sees jobs started outside its sandbox, waits
   behind them and reclaims them once they are dead.

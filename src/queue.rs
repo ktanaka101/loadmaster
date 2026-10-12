@@ -435,6 +435,12 @@ impl Queue {
         Ok(queue)
     }
 
+    /// Whether SQLite could only open the database for reading, as it does
+    /// without telling when it may not write to it.
+    pub fn is_read_only(&self) -> bool {
+        self.conn.is_readonly(rusqlite::MAIN_DB).unwrap_or(false)
+    }
+
     fn ensure_cancel_requests(&self) -> Result<()> {
         // Usually it exists; don't take the write lock then.
         let exists: bool = self.conn.query_row(
@@ -576,17 +582,7 @@ impl Queue {
             match found {
                 None => return Ok(Canceled::NotFound),
                 Some(Canceled::Signaled(job)) => {
-                    let sent =
-                        signal_directly(&job, kill).map_err(|source| Error::CannotSignal {
-                            id,
-                            why: format!(
-                                "its loadmaster is gone, and its task's process group {} could not \
-                             be signalled",
-                                job.child.map_or(0, |c| c.pgid)
-                            ),
-                            source,
-                        })?;
-                    if sent {
+                    if signal_directly(&job, kill).map_err(|source| cannot_signal(&job, source))? {
                         return Ok(Canceled::Signaled(job));
                     }
                 }
@@ -607,12 +603,46 @@ impl Queue {
 
     /// Takes back a request that job `id`'s loadmaster has not acted on
     /// (one from a version that does not read them, or one that is stopped),
-    /// so the caller can signal it instead; false if it has acted on it.
-    pub fn take_back_cancel(&self, id: JobId) -> Result<bool> {
+    /// so the caller can signal it instead: whether it asked for SIGKILL, or
+    /// `None` if the loadmaster has taken it (or another `cancel` took it
+    /// back). Requests from several `cancel`s are one: whoever takes it acts
+    /// on all of them.
+    pub fn take_back_cancel(&self, id: JobId) -> Result<Option<bool>> {
         let tx = self.begin()?;
-        let taken = tx.execute("DELETE FROM cancel_requests WHERE job = ?1", [id])?;
+        let kill = tx
+            .query_row(
+                "DELETE FROM cancel_requests WHERE job = ?1 RETURNING kill",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
         tx.commit()?;
-        Ok(taken == 1)
+        Ok(kill)
+    }
+
+    /// Signals job `id` without a request, by its state as read right
+    /// before: for a job whose loadmaster does not take requests, or is gone.
+    /// A parked job loses its place instead.
+    pub fn signal_now(&self, id: JobId, kill: bool) -> Result<Canceled> {
+        for _ in 0..10 {
+            let (job, _) = self.write(|tx| {
+                let job = load_jobs(tx)?.into_iter().find(|job| job.id == id);
+                if let Some(job) = job.as_ref().filter(|job| job.state == JobState::Parked) {
+                    delete_job(tx, job.id)?;
+                }
+                Ok(job)
+            })?;
+            let Some(job) = job else {
+                return Ok(Canceled::NotFound);
+            };
+            if job.state == JobState::Parked {
+                return Ok(Canceled::DroppedPlace(job));
+            }
+            if signal_directly(&job, kill).map_err(|source| cannot_signal(&job, source))? {
+                return Ok(Canceled::Signaled(job));
+            }
+        }
+        Ok(Canceled::NotFound)
     }
 
     /// Gets in line, or takes over a parked job with the same
@@ -750,6 +780,26 @@ pub enum Canceled {
     Requested(Job),
     /// Its loadmaster is gone, so its task was signalled directly.
     Signaled(Job),
+}
+
+/// Why signalling `job` directly failed, for `loadmaster cancel`.
+fn cannot_signal(job: &Job, source: std::io::Error) -> Error {
+    let why = match job.owner.filter(|owner| owner.is_alive()) {
+        Some(owner) => format!(
+            "its loadmaster (process {}) did not take the request, as a version before 0.6 or \
+             a stopped one does not, and could not be signalled",
+            owner.pid
+        ),
+        None => format!(
+            "its loadmaster is gone, and its task's process group {} could not be signalled",
+            job.child.map_or(0, |c| c.pgid)
+        ),
+    };
+    Error::CannotSignal {
+        id: job.id,
+        why,
+        source,
+    }
 }
 
 fn delete_job(tx: &Transaction, id: JobId) -> Result<()> {

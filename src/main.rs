@@ -456,16 +456,14 @@ fn run_admitted(
     // wait ends and the run begins here.
     let started = Instant::now();
     record.wait_ms = millis(started.duration_since(wait_started));
-    // SIGTERM once, as for clean-up that a second one would cut short; a
-    // request to kill still goes through.
-    let mut term_sent = false;
-    let canceled = || {
+    // A request to kill always goes through; one to stop only if nothing
+    // has told the task to end yet (see `runner::wait`).
+    let canceled = |ending: bool| {
         // A failed look (a busy database) only puts it off to the next one.
         let kill = ticket.cancel_requested().ok()??;
-        if !kill && term_sent {
+        if !kill && ending {
             return None;
         }
-        term_sent |= !kill;
         say!(
             "loadmaster: `{}` was canceled with `loadmaster cancel`; sending it {}",
             task.name,
@@ -902,6 +900,7 @@ fn cancel(args: CancelArgs) -> Result<i32> {
     // Jobs that need no more from this command: their loadmaster took the
     // request, or they were signalled. Nothing is sent to them again.
     let mut settled = std::collections::BTreeSet::new();
+    let mut killed_orphans = std::collections::BTreeSet::new();
     for id in ids {
         if Some(id) == own {
             say!("loadmaster: not canceling job #{id}: this command runs in it");
@@ -960,6 +959,12 @@ fn cancel(args: CancelArgs) -> Result<i32> {
                 continue;
             }
             if settled.contains(&job.id) {
+                // A job killed through its loadmaster may have started its
+                // task in the meantime: with --kill, that is killed too,
+                // which a second SIGKILL cannot harm.
+                if args.kill && job.is_orphaned() && killed_orphans.insert(job.id) {
+                    queue.signal_now(job.id, true)?;
+                }
                 continue;
             }
             if !queue.cancel_pending(job.id)? {
@@ -967,23 +972,10 @@ fn cancel(args: CancelArgs) -> Result<i32> {
                 continue;
             }
             let unanswered = job.is_orphaned() || started.elapsed() >= CANCEL_ANSWER_WITHIN;
-            if unanswered && queue.take_back_cancel(job.id)? {
+            if unanswered && let Some(kill) = queue.take_back_cancel(job.id)? {
                 settled.insert(job.id);
-                queue::signal_directly(job, args.kill).map_err(|source| Error::CannotSignal {
-                    id: job.id,
-                    why: match job.owner {
-                        Some(owner) if !job.is_orphaned() => format!(
-                            "its loadmaster (process {}) did not take the request, as a \
-                             version before 0.6 or a stopped one does not, and could not be \
-                             signalled",
-                            owner.pid
-                        ),
-                        _ => {
-                            "its loadmaster is gone, and its task could not be signalled".to_owned()
-                        }
-                    },
-                    source,
-                })?;
+                // As asked by every `cancel` whose request this was.
+                queue.signal_now(job.id, kill || args.kill)?;
             }
         }
         if !hinted && started.elapsed() >= CANCEL_HINT_AFTER {
@@ -1072,21 +1064,34 @@ fn open_queue() -> Result<(PathBuf, Queue)> {
             _ => Error::io(format!("cannot create {}", dir.display()), e),
         });
     }
-    match Queue::open(&dir.join(STATE_DB_FILE)) {
-        Ok(queue) => Ok((dir, queue)),
-        Err(Error::Database(e))
+    let path = dir.join(STATE_DB_FILE);
+    let failure = match Queue::open(&path) {
+        Ok(queue) if !queue.is_read_only() => return Ok((dir, queue)),
+        Ok(_) => Error::QueueReadOnly { path },
+        Err(e) => e,
+    };
+    // SQLite's errors don't say whether the directory is to blame (its
+    // database could be a directory, say), so see whether a file can be
+    // made in it.
+    let probe = dir.join(format!(".write-test-{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            Err(failure)
+        }
+        Err(e)
             if matches!(
-                e.sqlite_error_code(),
-                Some(
-                    rusqlite::ErrorCode::CannotOpen
-                        | rusqlite::ErrorCode::ReadOnly
-                        | rusqlite::ErrorCode::PermissionDenied
-                )
+                e.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
             ) =>
         {
-            Err(not_writable(e.to_string()))
+            Err(not_writable(failure.to_string()))
         }
-        Err(e) => Err(e),
+        Err(_) => Err(failure),
     }
 }
 

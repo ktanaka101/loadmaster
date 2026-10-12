@@ -91,6 +91,9 @@ pub enum Error {
     )]
     StateDirNotWritable { dir: PathBuf, detail: String },
 
+    #[error("cannot write to the queue database {}: check its permissions", path.display())]
+    QueueReadOnly { path: PathBuf },
+
     #[error("job #{0} disappeared from the queue")]
     JobVanished(JobId),
 

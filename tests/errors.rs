@@ -203,22 +203,53 @@ fn a_state_directory_it_may_not_write_is_named() {
     }
     let sandbox = Sandbox::new(4, &task("lint", 1, &["true"]));
     let locked = sandbox.path("locked");
-    std::fs::create_dir(&locked).unwrap();
-    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
-    // One it may not create, and one that exists but it may not write in.
-    for dir in [locked.join("state"), locked.clone()] {
-        let mut cmd = sandbox.cmd(&["run", "lint"]);
-        cmd.env("LOADMASTER_STATE_DIR", &dir);
-        let output = output(cmd);
-        assert_eq!(output.status.code(), Some(125));
-        let err = stderr(&output);
-        assert!(
-            err.contains(&format!(
-                "cannot write to the state directory {}",
+    // A queue that exists, so SQLite can still open it for reading.
+    let mut first = sandbox.cmd(&["run", "lint"]);
+    first.env("LOADMASTER_STATE_DIR", &locked);
+    assert!(output(first).status.success());
+    let mode = |mode| std::os::unix::fs::PermissionsExt::from_mode(mode);
+    std::fs::set_permissions(&locked, mode(0o500)).unwrap();
+    // One it may not create, one that exists but it may not write in, and
+    // one with a queue in it.
+    let empty = sandbox.path("empty");
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::set_permissions(&empty, mode(0o500)).unwrap();
+    for dir in [empty.join("state"), empty.clone(), locked.clone()] {
+        for args in [&["run", "lint"][..], &["status"]] {
+            let mut cmd = sandbox.cmd(args);
+            cmd.env("LOADMASTER_STATE_DIR", &dir);
+            let output = output(cmd);
+            assert_eq!(
+                output.status.code(),
+                Some(125),
+                "{args:?} in {}",
                 dir.display()
-            )) && err.contains("in an agent's sandbox, allow writing to it"),
-            "{err}"
-        );
+            );
+            let err = stderr(&output);
+            assert!(
+                err.contains(&format!(
+                    "cannot write to the state directory {}",
+                    dir.display()
+                )) && err.contains("in an agent's sandbox, allow writing to it"),
+                "{args:?} in {}: {err}",
+                dir.display()
+            );
+        }
     }
-    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&locked, mode(0o700)).unwrap();
+    std::fs::set_permissions(&empty, mode(0o700)).unwrap();
+}
+
+#[test]
+fn a_broken_queue_is_not_blamed_on_permissions() {
+    let sandbox = Sandbox::new(4, &task("lint", 1, &["true"]));
+    std::fs::create_dir(sandbox.state.join("state.db")).unwrap();
+    let output = sandbox.run(&["status"]);
+    assert_eq!(output.status.code(), Some(125));
+    let err = stderr(&output);
+    assert!(err.contains("state database error"), "{err}");
+    assert!(
+        !err.contains("cannot write to the state directory"),
+        "{err}"
+    );
 }
