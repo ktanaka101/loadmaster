@@ -356,12 +356,15 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
     std::mem::forget(running);
     // Killed once admitted, but before its task was started: the task never
     // ran, since it is let through only after its group is recorded.
+    // It waited, as checks that never started do, until it ended.
     let admitted = f.queue.enqueue(&request("build", 1, &[]), f.me).unwrap();
     admitted.try_admit(8).unwrap();
     f.queue
         .conn
         .execute(
-            "UPDATE jobs SET owner_start = owner_start + 1 WHERE id = ?1",
+            "UPDATE jobs SET owner_start = owner_start + 1, enqueued_at = enqueued_at - 5000,
+                 started_at = enqueued_at - 4750
+             WHERE id = ?1",
             [admitted.id()],
         )
         .unwrap();
@@ -396,6 +399,10 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
         assert_eq!(record["started"], started, "{task}");
     }
     assert_eq!(records[1]["wait_ms"], 250);
+    assert!(
+        records[2]["wait_ms"].as_u64().unwrap() >= 5000,
+        "{records:?}"
+    );
     // Reaped once, logged once.
     f.queue.reap().unwrap();
     assert_eq!(history(&f).len(), 3);

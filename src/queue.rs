@@ -305,7 +305,11 @@ impl Queue {
         };
         let now = SystemTime::now();
         for job in reaped.iter().filter(|job| job.was_lost()) {
-            let waited_until = job.started_at.unwrap_or(now);
+            // A task that never started waited until it ended, here.
+            let waited_until = match job.child {
+                Some(_) => job.started_at.unwrap_or(now),
+                None => now,
+            };
             let record = Record {
                 job: job.id,
                 task: &job.task,

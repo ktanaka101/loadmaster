@@ -430,6 +430,10 @@ transactions:
 
 - A `loadmaster` killed right after removing or handing over its job but
   before writing its line leaves no line.
+- If parking a job that gave up fails (the database stayed locked for the
+  whole 60-second busy timeout), its `gave_up` line is already written and
+  its job is later logged as `lost` before it started: `report` counts a
+  check that left the line, though `loadmaster` exited with 125.
 - If releasing or handing over a finished job fails (the database stayed
   locked for the whole 60-second busy timeout), `loadmaster` warns, exits with
   the task's code and logs its result, and the job is later also logged as
