@@ -405,7 +405,8 @@ job ID, task, weight, capacity, whether the machine was in measure-only mode,
 caller directory, arguments, outcome (`exited`, `gave_up`, `interrupted`,
 `spawn_failed`, `error`, `lost`), queue time, wait and run durations, CPU
 time, the 1-minute load average when the task ended, the signal that killed
-the task, if any, and the exit code `loadmaster run` returned. Every run that
+the task, if any, the exit code `loadmaster run` returned, and for a `lost`
+run whether its task had started. Every run that
 got in line writes exactly one line, whatever happened afterwards: a
 `loadmaster` killed with SIGKILL cannot write its own, so the process that
 reaps its job writes a `lost` line for it, after the reaping is committed.
@@ -453,15 +454,25 @@ so users need a way to find out from their own use.
   up (120 seconds, plus two minutes for a busy database and clocks). A `lost`
   record carries the time the job first got in line, so it may start earlier
   than the attempts it joins.
-- **Results**: a task killed by a signal (recorded from its exit status), a
-  signal while waiting and a `lost` run are killed (usually a tool timeout);
-  exit code 0 is passed and any other code failed, so a task that exits with
-  143 on its own is a failure. Records without a `signal` field (from before
-  it was logged; `null` means "not killed") fall back to treating 129–192 as
-  killed. A place given up and never resumed, a
-  failed spawn and a loadmaster error are not run. A wait that never ended in
-  a start still counts, up to when it ended, so waits that ran into a timeout
-  are not hidden.
+- **Results**: exit code 0 is passed and any other code failed, so a task
+  that exits with 143 on its own is a failure. A task killed by a signal
+  (recorded from its exit status), or a `lost` run whose task had started, is
+  killed: the harm admission is meant to remove. A signal while waiting, a
+  `lost` run that was still waiting, and a place given up and never resumed
+  left the line: the cost of waiting. The two used to share one column, and
+  the first real user had to tell them apart by hand (run time 0); a period
+  of admission would otherwise look worse for its timeouts in line than a
+  baseline that never waits. `lost` records say whether the task had started
+  (`started`); older ones count as killed. A failed spawn and a loadmaster
+  error are not run. Records without a `signal` field (from before it was
+  logged; `null` means "not killed") fall back to treating 129–192 as killed.
+  A wait that never ended in a start still counts, up to when it ended, so
+  waits that ran into a timeout are not hidden.
+- **Cores**: CORES MED and CORES P90 are the median and 90th percentile of
+  each passed run's CPU time divided by its run time. A median alone hid a
+  task that sometimes used far more than its weight (10.7 cores against 8 in
+  the first real use, while the load average peaked); a P90 above 1.2 times
+  the weight is marked with `!`.
 - **Demand** replays the checks as if each had started the moment it got in
   line, with its real run time. Runs under contention would have been longer,
   so this underestimates the overload loadmaster prevented; it still shows

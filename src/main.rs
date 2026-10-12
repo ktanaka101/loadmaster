@@ -201,6 +201,7 @@ fn run(args: RunArgs) -> Result<i32> {
         load: None,
         signal: None,
         exit_code: None,
+        started: None,
     };
     let result = (|| {
         let max_wait = max_wait.map(Duration::from_secs);

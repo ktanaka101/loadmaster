@@ -80,12 +80,14 @@ fn report_summarizes_results_per_task() {
             .unwrap_or_else(|| panic!("no row for {task}: {text}"));
         // Everything but CORES, which depends on the machine.
         let cells: Vec<&str> = line.split_whitespace().collect();
-        [0, 1, 3, 4, 5, 6, 7].map(|i| cells[i].to_owned()).to_vec()
+        [0, 1, 4, 5, 6, 7, 8, 9]
+            .map(|i| cells[i].to_owned())
+            .to_vec()
     };
-    // TASK WEIGHT CHECKS PASSED FAILED KILLED NOT-RUN
-    assert_eq!(row("pass"), ["pass", "1", "2", "2", "0", "0", "0"]);
-    assert_eq!(row("fail"), ["fail", "1", "1", "0", "1", "0", "0"]);
-    assert_eq!(row("gone"), ["gone", "1", "1", "0", "0", "0", "1"]);
+    // TASK WEIGHT CHECKS PASSED FAILED KILLED LEFT-LINE NOT-RUN
+    assert_eq!(row("pass"), ["pass", "1", "2", "2", "0", "0", "0", "0"]);
+    assert_eq!(row("fail"), ["fail", "1", "1", "0", "1", "0", "0", "0"]);
+    assert_eq!(row("gone"), ["gone", "1", "1", "0", "0", "0", "0", "1"]);
 }
 
 #[test]
@@ -128,8 +130,43 @@ fn a_run_whose_loadmaster_is_killed_is_still_logged() {
     let text = stdout(&sandbox.run(&["report"]));
     let row = text.lines().find(|l| l.starts_with("hold ")).unwrap();
     let cells: Vec<&str> = row.split_whitespace().collect();
-    // TASK WEIGHT CORES CHECKS PASSED FAILED KILLED
-    assert_eq!(cells[3..7], ["1", "0", "0", "1"], "{text}");
+    // TASK WEIGHT CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED
+    assert_eq!(cells[4..8], ["1", "0", "0", "1"], "{text}");
+    assert_eq!(records[0]["started"], true);
+}
+
+#[test]
+fn a_run_killed_while_waiting_left_the_line() {
+    // Killed before it started: a cost of waiting, not a run killed under
+    // load.
+    let probe = Sandbox::new(4, "");
+    let tasks = sh_task("hold", 4, &probe.hold_script("hold")) + &sh_task("waits", 1, "true");
+    std::fs::write(probe.repo.join(".loadmaster.toml"), tasks).unwrap();
+    let sandbox = probe;
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let mut waiter = sandbox.spawn(&["run", "waits"]);
+    wait_until("a waiting job", || sandbox.job("waits").is_some());
+    waiter.kill().unwrap();
+    waiter.wait().unwrap();
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+    wait_until("the job to be reaped", || {
+        sandbox.snapshot().jobs.is_empty()
+    });
+
+    let records = history(&sandbox);
+    let lost = records
+        .iter()
+        .find(|r| r["task"] == "waits")
+        .unwrap_or_else(|| panic!("{records:?}"));
+    assert_eq!(lost["outcome"], "lost");
+    assert_eq!(lost["started"], false);
+    let text = stdout(&sandbox.run(&["report"]));
+    let row = text.lines().find(|l| l.starts_with("waits ")).unwrap();
+    let cells: Vec<&str> = row.split_whitespace().collect();
+    // TASK WEIGHT CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED LEFT-LINE
+    assert_eq!(cells[4..9], ["1", "0", "0", "0", "1"], "{text}");
 }
 
 #[test]
@@ -146,7 +183,7 @@ fn a_signal_is_told_apart_from_an_exit_code() {
     let text = stdout(&sandbox.run(&["report"]));
     let killed = |task: &str| {
         let row = text.lines().find(|l| l.starts_with(task)).unwrap();
-        row.split_whitespace().nth(6).unwrap().to_owned()
+        row.split_whitespace().nth(7).unwrap().to_owned()
     };
     assert_eq!(killed("killed "), "1", "{text}");
     assert_eq!(killed("exits "), "0", "{text}");

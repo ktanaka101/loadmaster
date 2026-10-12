@@ -42,10 +42,15 @@ pub enum CheckResult {
     Passed,
     /// The task exited with a non-zero code.
     Failed,
-    /// Ended by a signal while running or waiting (usually a timeout), or
-    /// its loadmaster process was killed before it could log the result.
+    /// Ended by a signal while running (usually a timeout under load), or
+    /// its loadmaster process was killed while it ran: the harm admission
+    /// is meant to remove.
     Killed,
-    /// Gave up waiting and was not re-run, or could not be started.
+    /// Stopped waiting before it started: a signal or a kill while waiting,
+    /// or it gave up and was not re-run. The cost of waiting.
+    LeftLine,
+    /// Could not be started: the program failed to start, or loadmaster
+    /// itself failed.
     NotRun,
 }
 
@@ -105,8 +110,11 @@ fn join(first: &Entry, last: &Entry) -> Check {
         Outcome::Exited if killed => CheckResult::Killed,
         Outcome::Exited if last.exit_code == Some(0) => CheckResult::Passed,
         Outcome::Exited => CheckResult::Failed,
-        Outcome::Interrupted | Outcome::Lost => CheckResult::Killed,
-        Outcome::GaveUp | Outcome::SpawnFailed | Outcome::Error => CheckResult::NotRun,
+        // Records from before `started` was logged count as killed.
+        Outcome::Lost if last.started == Some(false) => CheckResult::LeftLine,
+        Outcome::Lost => CheckResult::Killed,
+        Outcome::Interrupted | Outcome::GaveUp => CheckResult::LeftLine,
+        Outcome::SpawnFailed | Outcome::Error => CheckResult::NotRun,
     };
     Check {
         task: last.task.clone(),
@@ -232,23 +240,39 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
             .or_default()
             .push(check);
     }
+    let mut flagged = false;
     for ((admission, capacity), checks) in &sections {
         out += "\n";
-        out += &section(!admission, *capacity, checks, options.cpus);
+        let (text, any) = section(!admission, *capacity, checks, options.cpus);
+        out += &text;
+        flagged |= any;
     }
     out += "\nA check is one request, re-runs after exit code 75 included. KILLED: ended by a \
-            signal\n(usually a timeout) or loadmaster was killed. CORES: CPU time / run time. \
-            RUN: passed checks.\nWAIT: from first getting in line to starting (or to the end, \
-            if it never started).\n";
+            signal while it\nran (usually a timeout) or loadmaster was killed meanwhile. \
+            LEFT LINE: stopped before it started\n(a timeout or interrupt while waiting, or \
+            it gave up and was not re-run). NOT RUN: could not\nbe started. CORES: CPU time / \
+            run time of passed checks. RUN: passed checks. WAIT: from first\ngetting in line \
+            to starting (or to the end, if it never started).\n";
+    if flagged {
+        out += &format!(
+            "!: at least one run in ten kept more than {OVER_WEIGHT} times its weight in cores \
+             busy: raise the\nweight, or the machine runs above its capacity.\n"
+        );
+    }
     out
 }
 
+/// CORES P90 above this many times the weight is flagged: the task often
+/// keeps more cores busy than its slot accounts for.
+const OVER_WEIGHT: f64 = 1.2;
+
+/// One section of the report, and whether its table flags a task.
 fn section(
     measure_only: bool,
     capacity: Option<u32>,
     checks: &[Check],
     cpus: Option<usize>,
-) -> String {
+) -> (String, bool) {
     let mode = if measure_only {
         "measure-only"
     } else {
@@ -290,20 +314,37 @@ fn section(
         out += &format!("load average when tasks ended: median {median:.1}, p90 {p90:.1}{cpus}\n");
     }
     out += "\n";
-    out += &task_table(checks);
-    out
+    let (table, flagged) = task_table(checks);
+    out += &table;
+    (out, flagged)
 }
 
-fn task_table(checks: &[Check]) -> String {
+/// The per-task table, and whether it flags a task for using more cores than
+/// its weight.
+fn task_table(checks: &[Check]) -> (String, bool) {
     let mut by_task: BTreeMap<&str, Vec<&Check>> = BTreeMap::new();
     for check in checks {
         by_task.entry(&check.task).or_default().push(check);
     }
     let header = [
-        "TASK", "WEIGHT", "CORES", "CHECKS", "PASSED", "FAILED", "KILLED", "NOT RUN", "RUN MED",
-        "RUN P90", "WAIT MED", "WAIT P90", "WAIT MAX",
+        "TASK",
+        "WEIGHT",
+        "CORES MED",
+        "CORES P90",
+        "CHECKS",
+        "PASSED",
+        "FAILED",
+        "KILLED",
+        "LEFT LINE",
+        "NOT RUN",
+        "RUN MED",
+        "RUN P90",
+        "WAIT MED",
+        "WAIT P90",
+        "WAIT MAX",
     ];
     let mut rows = vec![header.map(String::from).to_vec()];
+    let mut flagged = false;
     for (task, checks) in by_task {
         let count = |result| {
             checks
@@ -320,6 +361,11 @@ fn task_table(checks: &[Check]) -> String {
             .collect();
         let weights = checks.iter().map(|c| c.weight);
         let (low, high) = (weights.clone().min(), weights.max());
+        let cores_p90 = percentile(&cores, 0.9);
+        let over = cores_p90
+            .zip(high)
+            .is_some_and(|(cores, weight)| cores > OVER_WEIGHT * f64::from(weight));
+        flagged |= over;
         let waits: Vec<u64> = checks.iter().map(|c| c.wait_ms).collect();
         let ms = |v: Option<u64>| {
             v.map_or("-".to_owned(), |ms| {
@@ -333,10 +379,14 @@ fn task_table(checks: &[Check]) -> String {
                 (_, high) => high.map_or("-".to_owned(), |w| w.to_string()),
             },
             percentile(&cores, 0.5).map_or("-".to_owned(), |c| format!("{c:.1}")),
+            cores_p90.map_or("-".to_owned(), |c| {
+                format!("{c:.1}{}", if over { "!" } else { "" })
+            }),
             checks.len().to_string(),
             count(CheckResult::Passed),
             count(CheckResult::Failed),
             count(CheckResult::Killed),
+            count(CheckResult::LeftLine),
             count(CheckResult::NotRun),
             ms(percentile(&runs, 0.5)),
             ms(percentile(&runs, 0.9)),
@@ -370,7 +420,7 @@ fn task_table(checks: &[Check]) -> String {
         out += &cells.join("  ");
         out += "\n";
     }
-    out
+    (out, flagged)
 }
 
 /// Parses `--since`: a number followed by `m`, `h`, `d` or `w`.
@@ -450,6 +500,7 @@ mod tests {
             load: None,
             signal: Some(None),
             exit_code: None,
+            started: None,
         }
     }
 
@@ -496,7 +547,7 @@ mod tests {
         let checks = checks(&entries);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].wait_ms, 160_000);
-        assert_eq!(checks[0].result, CheckResult::NotRun);
+        assert_eq!(checks[0].result, CheckResult::LeftLine);
     }
 
     #[test]
@@ -542,7 +593,7 @@ mod tests {
         let summary: Vec<(u64, CheckResult)> =
             checks.iter().map(|c| (c.wait_ms, c.result)).collect();
         use CheckResult::*;
-        assert_eq!(summary, [(1_000, NotRun), (0, Passed), (0, Failed)]);
+        assert_eq!(summary, [(1_000, LeftLine), (0, Passed), (0, Failed)]);
     }
 
     #[test]
@@ -563,16 +614,28 @@ mod tests {
             // A task may exit with 143 on its own.
             exited(5, 0, 0, 10, 143),
             entry(6, "test", Outcome::Interrupted, 0, 10),
+            // Records from before `started` was logged.
             entry(7, "test", Outcome::Lost, 0, 10),
-            entry(8, "test", Outcome::GaveUp, 0, 10),
-            entry(9, "test", Outcome::SpawnFailed, 0, 0),
+            Entry {
+                started: Some(true),
+                ..entry(8, "test", Outcome::Lost, 0, 10)
+            },
+            Entry {
+                started: Some(false),
+                ..entry(9, "test", Outcome::Lost, 0, 10)
+            },
+            entry(10, "test", Outcome::SpawnFailed, 0, 0),
+            entry(11, "test", Outcome::Error, 0, 0),
+            // Gave up and was not re-run.
+            entry(12, "test", Outcome::GaveUp, 0, 10),
         ];
         let results: Vec<CheckResult> = checks(&entries).iter().map(|c| c.result).collect();
         use CheckResult::*;
         assert_eq!(
             results,
             [
-                Passed, Failed, Killed, Killed, Failed, Killed, Killed, NotRun, NotRun
+                Passed, Failed, Killed, Killed, Failed, LeftLine, Killed, Killed, LeftLine, NotRun,
+                NotRun, LeftLine
             ]
         );
     }
@@ -668,12 +731,46 @@ mod tests {
             .nth(1)
             .unwrap();
         let cells: Vec<&str> = row.split_whitespace().collect();
+        // TASK WEIGHT CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED
+        // LEFT-LINE NOT-RUN RUN-MED RUN-P90 WAIT-MED WAIT-P90 WAIT-MAX
         assert_eq!(
             cells,
             [
-                "test", "4", "3.8", "1", "1", "0", "0", "0", "10s", "10s", "5.0s", "5.0s", "5.0s"
+                "test", "4", "3.8", "3.8", "1", "1", "0", "0", "0", "0", "10s", "10s", "5.0s",
+                "5.0s", "5.0s"
             ]
         );
+    }
+
+    #[test]
+    fn runs_that_use_more_cores_than_the_weight_are_flagged() {
+        let run = |job, cpu_ms| Entry {
+            cpu_ms: Some(cpu_ms),
+            ..exited(job, 0, 0, 10_000, 0)
+        };
+        let cells = |entries: &[Entry]| -> Vec<String> {
+            let text = render(entries, &options());
+            let row = text.lines().find(|l| l.starts_with("test ")).unwrap();
+            row.split_whitespace().map(String::from).collect()
+        };
+        // Weight 4; most runs keep about 4 cores busy, one in ten keeps 6.
+        let mut entries: Vec<Entry> = (1..=9).map(|job| run(job, 40_000)).collect();
+        entries.push(run(10, 60_000));
+        assert_eq!(cells(&entries)[2..4], ["4.0", "4.0"]);
+        entries.push(run(11, 60_000));
+        let flagged = cells(&entries);
+        assert_eq!(flagged[2..4], ["4.0", "6.0!"]);
+        let text = render(&entries, &options());
+        assert!(
+            text.contains(
+                "!: at least one run in ten kept more than 1.2 times its weight in cores busy"
+            ),
+            "{text}"
+        );
+        // Within a fifth of the weight: no flag.
+        let close: Vec<Entry> = (1..=10).map(|job| run(job, 46_000)).collect();
+        assert_eq!(cells(&close)[3], "4.6");
+        assert!(!render(&close, &options()).contains("!:"));
     }
 
     #[test]

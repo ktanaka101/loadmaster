@@ -123,6 +123,17 @@ loadmaster is new (0.3). What has been verified:
   loadmaster (longest wait 8.6 s), and the hook blocked a direct
   `npx vitest run`.
 
+- In real use, in a project with 39 worktrees on a 14-core Mac: with weights
+  that had been set to the whole machine, the checks waited up to 70 minutes,
+  and a timing-sensitive test, weighted as the whole machine to run it alone,
+  held back every job behind it while it waited. With weights taken from
+  `loadmaster report` and that test's exclusion moved to a resource of
+  capacity 1, the 90th-percentile wait of most tasks fell from 13 to 16
+  minutes to 2.5 to 8 over the next 158 checks (90 minutes), and none failed
+  under load. The
+  load average when jobs ended rose (median 7.5 to 15), as more ran side by
+  side; its peaks came with a task that used more cores than its weight.
+
 Not verified yet: weeks of real use. loadmaster only starts commands, so other
 tools should work too, but see [Limitations](#limitations) for tools that use
 the terminal, leave daemons behind or start their own process groups.
@@ -326,6 +337,13 @@ A job waiting for a resource holds back only that resource: a lint that needs
 no database can start while an e2e run waits for one, as long as it leaves the
 e2e run the CPU it will need. A job waiting for CPU still holds back everyone
 behind it. See [How it works](#how-it-works).
+
+That share is set aside for as long as the job waits, so keep the weights of
+tasks that share a resource with a long-running task low: while one of them
+waits, both its weight and the long-running task's are out of the capacity,
+and only the rest is left for everything else. A weight above the capacity
+minus the long-running task's is worse still: the waiting job is then short
+of CPU too and holds back everyone behind it.
 
 Make manual operations on a resource tasks too, such as resetting the e2e
 database by hand: `uses = { e2e-db = 1 }` then makes them wait for the runs
@@ -768,35 +786,43 @@ history: /Users/you/.local/state/loadmaster/history.jsonl
 weight in use: above capacity 35% of the time checks ran, peak 20
 load average when tasks ended: median 10.7, p90 16.3 (14 CPUs)
 
-TASK  WEIGHT  CORES  CHECKS  PASSED  FAILED  KILLED  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
-e2e        2    1.3       5       5       0       0        0      24s      25s      0.0s      0.0s      0.0s
-test       4    2.2       5       5       0       0        0      13s      13s      0.1s      0.2s      0.2s
+TASK  WEIGHT  CORES MED  CORES P90  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
+e2e        2        1.3        1.4       5       5       0       0          0        0      24s      25s      0.0s      0.0s      0.0s
+test       4        2.2        2.2       5       5       0       0          0        0      13s      13s      0.1s      0.2s      0.2s
 
 == admission (capacity 12): 10 check(s), 2026-10-11 11:41 to 2026-10-11 11:42
 demand: above capacity 23% of the time checks ran, peak 20 (held back by loadmaster; in use peaked at 12)
 load average when tasks ended: median 13.0, p90 17.0 (14 CPUs)
 
-TASK  WEIGHT  CORES  CHECKS  PASSED  FAILED  KILLED  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
-e2e        2    1.3       5       5       0       0        0      24s      25s      0.2s       10s       10s
-test       4    2.9       5       5       0       0        0      10s      10s      0.1s       10s       10s
+TASK  WEIGHT  CORES MED  CORES P90  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
+e2e        2        1.3        1.3       5       5       0       0          0        0      24s      25s      0.2s       10s       10s
+test       4        2.9        2.9       5       5       0       0          0        0      10s      10s      0.1s       10s       10s
 ```
 
 What to compare between the two periods:
 
 - **FAILED and KILLED**: the false failures and timeouts loadmaster is meant
   to remove (along with real failures, which both periods have). KILLED means
-  ended by a signal, usually a tool timeout, including runs whose `loadmaster`
-  was killed before it could log the result.
+  ended by a signal while running, usually a tool timeout, including runs
+  whose `loadmaster` was killed while the task ran.
+- **LEFT LINE**: checks that stopped before they started: a tool timeout or
+  an interrupt while waiting, or a place given up (exit code 75) and not
+  re-run. This is what waiting cost; it should be near 0 in the measure-only
+  period. NOT RUN counts checks that could not start at all, such as a
+  missing program.
 - **RUN MED / RUN P90** (passed checks): contention makes runs slower; under
   admission they should come close to the time a task takes alone.
 - **WAIT** (from first getting in line to starting, re-runs after exit code 75
   included; for checks that never started, until they ended): what admission
   costs. If it nears your Bash tool timeout, raise the capacity or lower
   weights.
-- **CORES** against **WEIGHT**: the cores a task really kept busy (CPU time
-  divided by run time). If your weights count CPU cores, a weight far above it
-  makes jobs wait for nothing. A weight sized for memory is not comparable.
-  Read it from the admission period; under contention it reads low.
+- **CORES MED** and **CORES P90** against **WEIGHT**: the cores a task really
+  kept busy (CPU time divided by run time), for the median run and the
+  busiest tenth of runs. A weight far above them makes jobs wait for nothing.
+  A `!` after CORES P90 marks a task whose busiest tenth kept more than 1.2
+  times its weight busy: those runs take more than their slot, and the machine
+  runs above its capacity; raise the weight. Read them from the admission
+  period; under contention they read low.
 - **above capacity ... of the time checks ran**: how often the weights of the
   checks running at once (measure-only) or asking to run (admission) added up
   to more than the capacity. It is only as meaningful as the weights are; the

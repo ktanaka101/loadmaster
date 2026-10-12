@@ -326,6 +326,7 @@ impl Queue {
                 load: None,
                 signal: None,
                 exit_code: None,
+                started: Some(job.state == JobState::Running),
             };
             if let Err(e) = history::append(state_dir, &record) {
                 let _ = writeln!(

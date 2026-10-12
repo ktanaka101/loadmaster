@@ -61,6 +61,10 @@ pub struct Record<'a> {
     pub signal: Option<i32>,
     /// What `loadmaster run` exited with.
     pub exit_code: Option<i32>,
+    /// For a `lost` record: whether the task had started, which tells a run
+    /// killed under load from a wait cut short.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started: Option<bool>,
 }
 
 /// A record read back from the log. Fields that older versions did not write
@@ -91,6 +95,8 @@ pub struct Entry {
     #[serde(default, deserialize_with = "present")]
     pub signal: Option<Option<i32>>,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub started: Option<bool>,
 }
 
 /// Tells a field that is present (even as `null`) from one that is missing.
@@ -156,10 +162,25 @@ mod tests {
             load: Some(2.5),
             signal: None,
             exit_code: Some(1),
+            started: None,
         };
         append(dir.path(), &record).unwrap();
+        append(
+            dir.path(),
+            &Record {
+                outcome: Outcome::Lost,
+                started: Some(false),
+                ..record
+            },
+        )
+        .unwrap();
         let path = dir.path().join(HISTORY_FILE);
         let mut text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.matches("\"started\"").count(),
+            1,
+            "only lost records say"
+        );
         // A line from before `capacity` and `load` existed, and a torn line.
         text += r#"{"job":8,"task":"lint","weight":1,"dir":"/r","args":[],"outcome":"gave_up","queued_at":2000,"wait_ms":5,"run_ms":null,"exit_code":75}"#;
         text += "\n{\"job\":9,\"ta\n";
@@ -185,11 +206,14 @@ mod tests {
                 load: Some(2.5),
                 signal: Some(None),
                 exit_code: Some(1),
+                started: None,
             }
         );
-        assert_eq!(entries[1].capacity, None);
-        assert_eq!(entries[1].signal, None);
-        assert!(!entries[1].measure_only);
-        assert_eq!(entries[1].outcome, Outcome::GaveUp);
+        assert_eq!(entries[1].started, Some(false));
+        assert_eq!(entries[2].capacity, None);
+        assert_eq!(entries[2].signal, None);
+        assert_eq!(entries[2].started, None);
+        assert!(!entries[2].measure_only);
+        assert_eq!(entries[2].outcome, Outcome::GaveUp);
     }
 }
