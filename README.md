@@ -258,6 +258,8 @@ run against the main checkout's code: loadmaster says so and fails.
 | --- | --- |
 | `weight` | Integer ≥ 1. Use "roughly how many CPU cores this task keeps busy" as the unit, in every repository, because all repositories on the machine share one capacity. |
 | `cmd` | Array: the program and its arguments. No shell is involved. Arguments after `--` are appended to the end exactly as given. |
+| `uses` | Optional: the resources the task uses, such as `{ e2e-db = 1 }`; see [Resources besides CPU](#resources-besides-cpu). |
+| `ok_exit_codes` | Optional: the exit codes that mean the check passed, for the history log and `loadmaster report`; `[0]` if not set. A check that reports "differences found" with exit code 2 would set `[0, 2]`. loadmaster itself still exits with the task's code. |
 
 The weight does not change with the arguments: `loadmaster run test -- one.test.ts`
 still counts as 4. Extra arguments come after the fixed ones, so leave out of
@@ -437,8 +439,9 @@ defaults.
 
 The queue lives in `~/.local/state/loadmaster/state.db` (`$XDG_STATE_HOME`,
 `LOADMASTER_STATE_DIR`). Next to it, `history.jsonl` gets one line per job
-(task, weight, capacity, wait and run time, CPU time, load average, signal,
-exit code), which `loadmaster report` summarizes. If `loadmaster` is killed
+(task, weight, resources, capacity, wait and run time, CPU time, load average,
+signal, exit code and whether it counts as passed), which `loadmaster report`
+summarizes. If `loadmaster` is killed
 before it can write its line, the process that later reclaims the job writes
 one with outcome `lost`.
 
@@ -517,7 +520,7 @@ happens to exit with 75 by the `loadmaster: gave up waiting` line on stderr.
 loadmaster run [--max-wait SECONDS] <TASK> [-- ARGS...]
 loadmaster status
 loadmaster clean
-loadmaster report [--since DURATION] [--dir TEXT]
+loadmaster report [--since TIME] [--until TIME] [--dir TEXT]
 loadmaster held [--uses RESOURCE]
 ```
 
@@ -526,9 +529,11 @@ loadmaster held [--uses RESOURCE]
   waiting or parked job.
 - `clean`: reclaim places and slots whose processes are gone. Every update
   already does this, so you should rarely need it.
-- `report`: summarize the history log per task. `--since 7d` (or `12h`, `2w`)
-  limits it to a recent period, `--dir myapp` to checks run from directories
-  whose path contains `myapp`. See
+- `report`: summarize the history log per task. `--since` and `--until`
+  limit it to checks that got in line in a period, given as a time ago
+  (`12h`, `7d`, `2w`) or a local time (`2026-10-12T16:44`, `2026-10-12`), for
+  example around a change of settings; `--dir myapp` keeps checks run from
+  directories whose path contains `myapp`. See
   [Checking that it helps](#checking-that-it-helps).
 - `held`: exit with 0 if this process runs inside a loadmaster job started
   from this checkout (and, with `--uses`, using that resource), and with 1
@@ -774,8 +779,12 @@ on your machine:
 3. Run `loadmaster report`.
 
 The report has one section per setting (measure-only or admission, and the
-capacity). Tasks are grouped by name across all repositories; if two projects
-both have a `test` task, look at one at a time with `--dir`. This report comes
+capacity), and one row per task and setting: a task run with another weight
+or other resources, as by an old branch during a switch-over, gets a row of
+its own. Tasks are grouped by name across all repositories; if two projects
+both have a `test` task, look at one at a time with `--dir`. To compare the
+time before and after a change, use `--until` and `--since` with the time of
+the change. This report comes
 from a short demo, five agents each running `test` and then `e2e` at once:
 
 ```text
@@ -786,25 +795,26 @@ history: /Users/you/.local/state/loadmaster/history.jsonl
 weight in use: above capacity 35% of the time checks ran, peak 20
 load average when tasks ended: median 10.7, p90 16.3 (14 CPUs)
 
-TASK  WEIGHT  CORES MED  CORES P90  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
-e2e        2        1.3        1.4       5       5       0       0          0        0      24s      25s      0.0s      0.0s      0.0s
-test       4        2.2        2.2       5       5       0       0          0        0      13s      13s      0.1s      0.2s      0.2s
+TASK  WEIGHT  USES  CORES MED  CORES P90  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
+e2e        2     -        1.3        1.4       5       5       0       0          0        0      24s      25s      0.0s      0.0s      0.0s
+test       4     -        2.2        2.2       5       5       0       0          0        0      13s      13s      0.1s      0.2s      0.2s
 
 == admission (capacity 12): 10 check(s), 2026-10-11 11:41 to 2026-10-11 11:42
 demand: above capacity 23% of the time checks ran, peak 20 (held back by loadmaster; in use peaked at 12)
 load average when tasks ended: median 13.0, p90 17.0 (14 CPUs)
 
-TASK  WEIGHT  CORES MED  CORES P90  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
-e2e        2        1.3        1.3       5       5       0       0          0        0      24s      25s      0.2s       10s       10s
-test       4        2.9        2.9       5       5       0       0          0        0      10s      10s      0.1s       10s       10s
+TASK  WEIGHT  USES  CORES MED  CORES P90  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
+e2e        2     -        1.3        1.3       5       5       0       0          0        0      24s      25s      0.2s       10s       10s
+test       4     -        2.9        2.9       5       5       0       0          0        0      10s      10s      0.1s       10s       10s
 ```
 
 What to compare between the two periods:
 
 - **FAILED and KILLED**: the false failures and timeouts loadmaster is meant
-  to remove (along with real failures, which both periods have). KILLED means
-  ended by a signal while running, usually a tool timeout, including runs
-  whose `loadmaster` was killed while the task ran.
+  to remove (along with real failures, which both periods have). FAILED
+  counts exit codes not in the task's `ok_exit_codes`. KILLED means ended by a
+  signal while running, usually a tool timeout, including runs whose
+  `loadmaster` was killed while the task ran.
 - **LEFT LINE**: checks that stopped before they started: a tool timeout or
   an interrupt while waiting, or a place given up (exit code 75) and not
   re-run. This is what waiting cost; it should be near 0 in the measure-only

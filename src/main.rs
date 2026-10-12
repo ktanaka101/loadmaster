@@ -81,9 +81,14 @@ struct HeldArgs {
 
 #[derive(Args)]
 struct ReportArgs {
-    /// Only checks from this recent period, e.g. 12h, 7d, 2w
-    #[arg(long, value_name = "DURATION", value_parser = report::parse_since)]
-    since: Option<Duration>,
+    /// Only checks that got in line from this time on: a period ago (12h,
+    /// 7d, 2w) or a local time (2026-10-12T16:44, 2026-10-12)
+    #[arg(long, value_name = "TIME", value_parser = report::parse_time)]
+    since: Option<report::Time>,
+
+    /// Only checks that got in line before this time, given like --since
+    #[arg(long, value_name = "TIME", value_parser = report::parse_time)]
+    until: Option<report::Time>,
 
     /// Only checks run from a directory whose path contains TEXT, e.g. a
     /// project name shared by its worktrees
@@ -202,6 +207,8 @@ fn run(args: RunArgs) -> Result<i32> {
         signal: None,
         exit_code: None,
         started: None,
+        ok: None,
+        uses: task.uses.clone(),
     };
     let result = (|| {
         let max_wait = max_wait.map(Duration::from_secs);
@@ -252,7 +259,12 @@ fn run(args: RunArgs) -> Result<i32> {
     })();
     // Every run that got in line leaves exactly one history line.
     match &result {
-        Ok(code) => record.exit_code = Some(*code),
+        Ok(code) => {
+            record.exit_code = Some(*code);
+            if record.outcome == Outcome::Exited && record.signal.is_none() {
+                record.ok = Some(task.ok_exit_codes.contains(code));
+            }
+        }
         Err(_) => {
             record.outcome = Outcome::Error;
             record.exit_code = Some(EXIT_ERROR);
@@ -753,9 +765,17 @@ fn report(args: ReportArgs) -> Result<i32> {
         Err(e) => return Err(Error::io(format!("cannot read {}", path.display()), e)),
     };
     let now = history::unix_ms(SystemTime::now());
+    let since = args.since.map(|time| time.at(now));
+    let until = args.until.map(|time| time.at(now));
+    if let (Some(since), Some(until)) = (since, until)
+        && until <= since
+    {
+        return Err(Error::Usage("--until must be after --since".to_owned()));
+    }
     let options = report::Options {
         source: &path,
-        since: args.since.map(|d| now.saturating_sub(millis(d))),
+        since,
+        until,
         dir: args.dir.as_deref(),
         unreadable,
         cpus: thread::available_parallelism().ok().map(|n| n.get()),

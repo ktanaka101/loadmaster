@@ -401,12 +401,16 @@ transaction would remove this cost; it is left out until it matters.
 ## History log
 
 `history.jsonl` in the state directory gets one JSON object per queued run:
-job ID, task, weight, capacity, whether the machine was in measure-only mode,
+job ID, task, weight, resources used, capacity, whether the machine was in
+measure-only mode,
 caller directory, arguments, outcome (`exited`, `gave_up`, `interrupted`,
 `spawn_failed`, `error`, `lost`), queue time, wait and run durations, CPU
 time, the 1-minute load average when the task ended, the signal that killed
-the task, if any, the exit code `loadmaster run` returned, and for a `lost`
-run whether its task had started. Every run that
+the task, if any, the exit code `loadmaster run` returned, whether that code
+is one of the task's `ok_exit_codes`, and for a `lost` run whether its task
+had started. The repository's config is not at hand when the log is read (one
+log covers every repository), so what it says is recorded when the run ends.
+Every run that
 got in line writes exactly one line, whatever happened afterwards: a
 `loadmaster` killed with SIGKILL cannot write its own, so the process that
 reaps its job writes a `lost` line for it, after the reaping is committed.
@@ -454,8 +458,11 @@ so users need a way to find out from their own use.
   up (120 seconds, plus two minutes for a busy database and clocks). A `lost`
   record carries the time the job first got in line, so it may start earlier
   than the attempts it joins.
-- **Results**: exit code 0 is passed and any other code failed, so a task
-  that exits with 143 on its own is a failure. A task killed by a signal
+- **Results**: an exit code in the task's `ok_exit_codes` (`[0]` unless set)
+  is passed and any other code failed, so a task that exits with 143 on its
+  own is a failure. A check that reports "differences found" with a non-zero
+  code would otherwise bury load-induced failures among its findings; records
+  from before `ok` was logged pass only with 0. A task killed by a signal
   (recorded from its exit status), or a `lost` run whose task had started, is
   killed: the harm admission is meant to remove. A signal while waiting, a
   `lost` run that was still waiting, and a place given up and never resumed
@@ -483,9 +490,15 @@ so users need a way to find out from their own use.
   are taken as soon as the task exits, before its slot is released, since
   releasing it may wait for the database.
 - **Grouping**: tasks are grouped by name, across repositories, since
-  worktrees of one project have unrelated paths. `--dir TEXT` keeps only
-  checks run from directories whose path contains TEXT, which usually picks
-  out one project with all its worktrees.
+  worktrees of one project have unrelated paths, and within a name by weight
+  and resources used: during a switch-over, old branches run the same task
+  with other settings, and one row with a range of weights hid which was
+  which. `--dir TEXT` keeps only checks run from directories whose path
+  contains TEXT, which usually picks out one project with all its worktrees.
+- **Periods**: `--since` and `--until` take a time ago or a local time, and
+  keep the checks that got in line in between, so the time around a change of
+  settings can be compared directly. A day that does not exist (February 30)
+  is an error rather than whatever `mktime` turns it into.
 - **CPU time** is the task's `RUSAGE_CHILDREN` delta, which covers the task and
   every descendant that was waited for. loadmaster has one child, so nothing
   else is mixed in. Processes a task leaves behind are not counted.

@@ -66,7 +66,9 @@ fn report_summarizes_results_per_task() {
         sandbox.run(&["run", task]);
     }
 
-    let report = sandbox.run(&["report", "--since", "1h"]);
+    let none = stdout(&sandbox.run(&["report", "--until", "2000-01-01"]));
+    assert!(none.contains("no checks in this period"), "{none}");
+    let report = sandbox.run(&["report", "--since", "1h", "--until", "2999-01-01T00:00"]);
     assert_eq!(report.status.code(), Some(0), "{}", stderr(&report));
     let text = stdout(&report);
     assert!(
@@ -80,7 +82,7 @@ fn report_summarizes_results_per_task() {
             .unwrap_or_else(|| panic!("no row for {task}: {text}"));
         // Everything but CORES, which depends on the machine.
         let cells: Vec<&str> = line.split_whitespace().collect();
-        [0, 1, 4, 5, 6, 7, 8, 9]
+        [0, 1, 5, 6, 7, 8, 9, 10]
             .map(|i| cells[i].to_owned())
             .to_vec()
     };
@@ -104,6 +106,13 @@ fn report_without_history_or_with_bad_arguments() {
     let bad = sandbox.run(&["report", "--since", "7"]);
     assert_eq!(bad.status.code(), Some(125));
     assert!(stderr(&bad).contains("like 7d"), "{}", stderr(&bad));
+    let backwards = sandbox.run(&["report", "--since", "2026-10-12", "--until", "2026-10-11"]);
+    assert_eq!(backwards.status.code(), Some(125));
+    assert!(
+        stderr(&backwards).contains("--until must be after --since"),
+        "{}",
+        stderr(&backwards)
+    );
 }
 
 #[test]
@@ -130,8 +139,8 @@ fn a_run_whose_loadmaster_is_killed_is_still_logged() {
     let text = stdout(&sandbox.run(&["report"]));
     let row = text.lines().find(|l| l.starts_with("hold ")).unwrap();
     let cells: Vec<&str> = row.split_whitespace().collect();
-    // TASK WEIGHT CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED
-    assert_eq!(cells[4..8], ["1", "0", "0", "1"], "{text}");
+    // TASK WEIGHT USES CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED
+    assert_eq!(cells[5..9], ["1", "0", "0", "1"], "{text}");
     assert_eq!(records[0]["started"], true);
 }
 
@@ -165,8 +174,8 @@ fn a_run_killed_while_waiting_left_the_line() {
     let text = stdout(&sandbox.run(&["report"]));
     let row = text.lines().find(|l| l.starts_with("waits ")).unwrap();
     let cells: Vec<&str> = row.split_whitespace().collect();
-    // TASK WEIGHT CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED LEFT-LINE
-    assert_eq!(cells[4..9], ["1", "0", "0", "0", "1"], "{text}");
+    // TASK WEIGHT USES CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED LEFT-LINE
+    assert_eq!(cells[5..10], ["1", "0", "0", "0", "1"], "{text}");
 }
 
 #[test]
@@ -183,8 +192,54 @@ fn a_signal_is_told_apart_from_an_exit_code() {
     let text = stdout(&sandbox.run(&["report"]));
     let killed = |task: &str| {
         let row = text.lines().find(|l| l.starts_with(task)).unwrap();
-        row.split_whitespace().nth(7).unwrap().to_owned()
+        row.split_whitespace().nth(8).unwrap().to_owned()
     };
     assert_eq!(killed("killed "), "1", "{text}");
     assert_eq!(killed("exits "), "0", "{text}");
+}
+
+#[test]
+fn a_task_can_count_other_exit_codes_as_passed() {
+    let sandbox = Sandbox::new(4, "");
+    let tasks =
+        sh_task("diff", 1, "exit 2").replacen("cmd = ", "ok_exit_codes = [0, 2]\ncmd = ", 1)
+            + &sh_task("broken", 1, "exit 3").replacen(
+                "cmd = ",
+                "ok_exit_codes = [0, 2]\ncmd = ",
+                1,
+            );
+    std::fs::write(sandbox.repo.join(".loadmaster.toml"), tasks).unwrap();
+    // loadmaster still returns the task's own exit code.
+    assert_eq!(sandbox.run(&["run", "diff"]).status.code(), Some(2));
+    assert_eq!(sandbox.run(&["run", "broken"]).status.code(), Some(3));
+    let records = history(&sandbox);
+    assert_eq!(records[0]["ok"], true);
+    assert_eq!(records[1]["ok"], false);
+    let text = stdout(&sandbox.run(&["report"]));
+    let counts = |task: &str| {
+        let row = text
+            .lines()
+            .find(|l| l.starts_with(&format!("{task} ")))
+            .unwrap();
+        let cells: Vec<&str> = row.split_whitespace().collect();
+        // PASSED FAILED
+        (cells[6].to_owned(), cells[7].to_owned())
+    };
+    assert_eq!(counts("diff"), ("1".to_owned(), "0".to_owned()), "{text}");
+    assert_eq!(counts("broken"), ("0".to_owned(), "1".to_owned()), "{text}");
+}
+
+#[test]
+fn the_resources_a_task_used_are_logged_and_shown() {
+    let sandbox = Sandbox::new(4, "");
+    let tasks = "[resources.db]\ncapacity = 1\n\n".to_owned()
+        + &sh_task("e2e", 1, "true").replacen("cmd = ", "uses = { db = 1 }\ncmd = ", 1);
+    std::fs::write(sandbox.repo.join(".loadmaster.toml"), tasks).unwrap();
+    assert!(sandbox.run(&["run", "e2e"]).status.success());
+    let records = history(&sandbox);
+    assert_eq!(records[0]["uses"], serde_json::json!({ "db": 1 }));
+    let text = stdout(&sandbox.run(&["report"]));
+    let row = text.lines().find(|l| l.starts_with("e2e ")).unwrap();
+    // TASK WEIGHT USES
+    assert_eq!(row.split_whitespace().nth(2), Some("db=1"), "{text}");
 }

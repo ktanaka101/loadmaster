@@ -56,6 +56,9 @@ pub enum Error {
         expected: &'static str,
     },
 
+    #[error("{0}")]
+    Usage(String),
+
     #[error("cannot determine the home directory: HOME is not set")]
     NoHome,
 

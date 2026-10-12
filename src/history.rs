@@ -6,6 +6,7 @@
 //! with outcome `lost`. Nested runs never queue and are not logged.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
@@ -34,7 +35,7 @@ pub enum Outcome {
     Lost,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Record<'a> {
     pub job: i64,
     pub task: &'a str,
@@ -65,6 +66,14 @@ pub struct Record<'a> {
     /// killed under load from a wait cut short.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started: Option<bool>,
+    /// For a task that ran and exited on its own: whether its exit code is
+    /// one of the task's `ok_exit_codes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    /// The resources the task used, by name, so runs of one task with
+    /// different settings can be told apart.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub uses: BTreeMap<String, u32>,
 }
 
 /// A record read back from the log. Fields that older versions did not write
@@ -97,6 +106,10 @@ pub struct Entry {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub started: Option<bool>,
+    #[serde(default)]
+    pub ok: Option<bool>,
+    #[serde(default)]
+    pub uses: BTreeMap<String, u32>,
 }
 
 /// Tells a field that is present (even as `null`) from one that is missing.
@@ -163,6 +176,8 @@ mod tests {
             signal: None,
             exit_code: Some(1),
             started: None,
+            ok: Some(false),
+            uses: BTreeMap::from([("db".to_owned(), 1)]),
         };
         append(dir.path(), &record).unwrap();
         append(
@@ -170,7 +185,8 @@ mod tests {
             &Record {
                 outcome: Outcome::Lost,
                 started: Some(false),
-                ..record
+                ok: None,
+                ..record.clone()
             },
         )
         .unwrap();
@@ -207,8 +223,11 @@ mod tests {
                 signal: Some(None),
                 exit_code: Some(1),
                 started: None,
+                ok: Some(false),
+                uses: BTreeMap::from([("db".to_owned(), 1)]),
             }
         );
+        assert!(entries[2].uses.is_empty());
         assert_eq!(entries[1].started, Some(false));
         assert_eq!(entries[2].capacity, None);
         assert_eq!(entries[2].signal, None);

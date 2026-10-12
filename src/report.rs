@@ -34,6 +34,8 @@ pub struct Check {
     pub run_ms: Option<u64>,
     pub cpu_ms: Option<u64>,
     pub load: Option<f64>,
+    /// The resources it used, by name.
+    pub uses: BTreeMap<String, u32>,
     pub result: CheckResult,
 }
 
@@ -108,7 +110,8 @@ fn join(first: &Entry, last: &Entry) -> Check {
     };
     let result = match last.outcome {
         Outcome::Exited if killed => CheckResult::Killed,
-        Outcome::Exited if last.exit_code == Some(0) => CheckResult::Passed,
+        // Records from before `ok` was logged: only exit code 0 passes.
+        Outcome::Exited if last.ok.unwrap_or(last.exit_code == Some(0)) => CheckResult::Passed,
         Outcome::Exited => CheckResult::Failed,
         // Records from before `started` was logged count as killed.
         Outcome::Lost if last.started == Some(false) => CheckResult::LeftLine,
@@ -127,6 +130,7 @@ fn join(first: &Entry, last: &Entry) -> Check {
         run_ms: last.run_ms,
         cpu_ms: last.cpu_ms,
         load: last.load,
+        uses: last.uses.clone(),
         result,
     }
 }
@@ -205,6 +209,8 @@ pub struct Options<'a> {
     pub source: &'a Path,
     /// Only checks that got in line at or after this time (Unix ms).
     pub since: Option<u64>,
+    /// Only checks that got in line before this time (Unix ms).
+    pub until: Option<u64>,
     /// Only checks run from a directory whose path contains this.
     pub dir: Option<&'a str>,
     /// Lines of the log that could not be read.
@@ -218,9 +224,29 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
     let checks: Vec<Check> = all
         .into_iter()
         .filter(|c| options.since.is_none_or(|since| c.queued_at >= since))
+        .filter(|c| options.until.is_none_or(|until| c.queued_at < until))
         .filter(|c| options.dir.is_none_or(|dir| c.dir.contains(dir)))
         .collect();
     let mut out = format!("history: {}\n", options.source.display());
+    match (options.since, options.until) {
+        (Some(since), Some(until)) => {
+            out += &format!(
+                "only checks that got in line from {} and before {}\n",
+                format_time(since),
+                format_time(until)
+            );
+        }
+        (Some(since), None) => {
+            out += &format!("only checks that got in line from {}\n", format_time(since));
+        }
+        (None, Some(until)) => {
+            out += &format!(
+                "only checks that got in line before {}\n",
+                format_time(until)
+            );
+        }
+        (None, None) => {}
+    }
     if let Some(dir) = options.dir {
         out += &format!("only checks run from directories containing `{dir}`\n");
     }
@@ -228,7 +254,13 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
         out += &format!("skipped {} unreadable line(s)\n", options.unreadable);
     }
     if checks.is_empty() {
-        out += "no checks recorded yet\n";
+        out += if options.since.is_some() || options.until.is_some() {
+            "no checks in this period\n"
+        } else if options.dir.is_some() {
+            "no checks run from such directories\n"
+        } else {
+            "no checks recorded yet\n"
+        };
         return out;
     }
 
@@ -319,16 +351,25 @@ fn section(
     (out, flagged)
 }
 
+/// A task with one weight and one set of resources: a row of the table.
+type Setting<'a> = (&'a str, u32, &'a BTreeMap<String, u32>);
+
 /// The per-task table, and whether it flags a task for using more cores than
 /// its weight.
 fn task_table(checks: &[Check]) -> (String, bool) {
-    let mut by_task: BTreeMap<&str, Vec<&Check>> = BTreeMap::new();
+    // One row per setting of a task: during a switch-over, old branches run
+    // it with another weight or other resources.
+    let mut by_task: BTreeMap<Setting, Vec<&Check>> = BTreeMap::new();
     for check in checks {
-        by_task.entry(&check.task).or_default().push(check);
+        by_task
+            .entry((&check.task, check.weight, &check.uses))
+            .or_default()
+            .push(check);
     }
     let header = [
         "TASK",
         "WEIGHT",
+        "USES",
         "CORES MED",
         "CORES P90",
         "CHECKS",
@@ -345,7 +386,7 @@ fn task_table(checks: &[Check]) -> (String, bool) {
     ];
     let mut rows = vec![header.map(String::from).to_vec()];
     let mut flagged = false;
-    for (task, checks) in by_task {
+    for ((task, weight, uses), checks) in by_task {
         let count = |result| {
             checks
                 .iter()
@@ -359,12 +400,8 @@ fn task_table(checks: &[Check]) -> (String, bool) {
             .filter_map(|c| Some((c.cpu_ms?, c.run_ms.filter(|&run| run > 0)?)))
             .map(|(cpu, run)| cpu as f64 / run as f64)
             .collect();
-        let weights = checks.iter().map(|c| c.weight);
-        let (low, high) = (weights.clone().min(), weights.max());
         let cores_p90 = percentile(&cores, 0.9);
-        let over = cores_p90
-            .zip(high)
-            .is_some_and(|(cores, weight)| cores > OVER_WEIGHT * f64::from(weight));
+        let over = cores_p90.is_some_and(|cores| cores > OVER_WEIGHT * f64::from(weight));
         flagged |= over;
         let waits: Vec<u64> = checks.iter().map(|c| c.wait_ms).collect();
         let ms = |v: Option<u64>| {
@@ -374,9 +411,14 @@ fn task_table(checks: &[Check]) -> (String, bool) {
         };
         rows.push(vec![
             task.to_owned(),
-            match (low, high) {
-                (Some(low), Some(high)) if low < high => format!("{low}-{high}"),
-                (_, high) => high.map_or("-".to_owned(), |w| w.to_string()),
+            weight.to_string(),
+            if uses.is_empty() {
+                "-".to_owned()
+            } else {
+                uses.iter()
+                    .map(|(name, amount)| format!("{name}={amount}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
             },
             percentile(&cores, 0.5).map_or("-".to_owned(), |c| format!("{c:.1}")),
             cores_p90.map_or("-".to_owned(), |c| {
@@ -423,8 +465,91 @@ fn task_table(checks: &[Check]) -> (String, bool) {
     (out, flagged)
 }
 
-/// Parses `--since`: a number followed by `m`, `h`, `d` or `w`.
-pub fn parse_since(text: &str) -> Result<Duration, String> {
+/// A point in time for `--since` and `--until`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Time {
+    /// That long before now.
+    Ago(Duration),
+    /// Unix milliseconds.
+    At(u64),
+}
+
+impl Time {
+    /// In Unix milliseconds, `now_ms` being the current time.
+    pub fn at(self, now_ms: u64) -> u64 {
+        match self {
+            Time::Ago(period) => {
+                now_ms.saturating_sub(u64::try_from(period.as_millis()).unwrap_or(u64::MAX))
+            }
+            Time::At(ms) => ms,
+        }
+    }
+}
+
+/// Parses `--since` and `--until`: a period ago (a number followed by `m`,
+/// `h`, `d` or `w`) or a local time (`2026-10-12T16:44`, `2026-10-12 16:44`
+/// or `2026-10-12`), so a report can cover the time around a change.
+pub fn parse_time(text: &str) -> Result<Time, String> {
+    parse_period(text)
+        .map(Time::Ago)
+        .or_else(|_| local_time(text).map(Time::At).ok_or(()))
+        .map_err(|()| {
+            format!(
+                "expected a period like 7d or 12h, or a local time like 2026-10-12T16:44 or \
+                 2026-10-12; got `{text}`"
+            )
+        })
+}
+
+/// A local date and time as Unix milliseconds, if it exists.
+fn local_time(text: &str) -> Option<u64> {
+    let (date, time) = match text.split_once(['T', ' ']) {
+        Some((date, time)) => (date, Some(time)),
+        None => (text, None),
+    };
+    let number = |s: &str, digits: usize| -> Option<i32> {
+        (s.len() == digits && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    let mut parts = date.split('-');
+    let year = number(parts.next()?, 4)?;
+    let month = number(parts.next()?, 2)?;
+    let day = number(parts.next()?, 2)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (hour, minute) = match time {
+        None => (0, 0),
+        Some(time) => {
+            let (hour, minute) = time.split_once(':')?;
+            (number(hour, 2)?, number(minute, 2)?)
+        }
+    };
+    if !(1..=12).contains(&month) || !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+        return None;
+    }
+    // SAFETY: an all-zero `tm` is a valid value to fill in.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    // Let the C library decide whether daylight saving time applies.
+    tm.tm_isdst = -1;
+    // SAFETY: `tm` is valid for the duration of the call.
+    let secs = unsafe { libc::mktime(&mut tm) };
+    // mktime moves a day that does not exist (February 30) into the next
+    // month; such a date is not accepted.
+    if secs == -1 || tm.tm_mon != month - 1 || tm.tm_mday != day {
+        return None;
+    }
+    u64::try_from(secs).ok()?.checked_mul(1000)
+}
+
+/// A number followed by `m`, `h`, `d` or `w`.
+fn parse_period(text: &str) -> Result<Duration, String> {
     let split = text
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(text.len());
@@ -501,6 +626,8 @@ mod tests {
             signal: Some(None),
             exit_code: None,
             started: None,
+            ok: None,
+            uses: BTreeMap::new(),
         }
     }
 
@@ -516,6 +643,7 @@ mod tests {
         Options {
             source: Path::new("/state/history.jsonl"),
             since: None,
+            until: None,
             dir: None,
             unreadable: 0,
             cpus: None,
@@ -641,6 +769,69 @@ mod tests {
     }
 
     #[test]
+    fn a_task_can_count_other_exit_codes_as_passed() {
+        // A check that reports "differences found" with exit code 2.
+        let with_ok = |job, code, ok| Entry {
+            ok,
+            ..exited(job, 0, 0, 10, code)
+        };
+        let results: Vec<CheckResult> = checks(&[
+            with_ok(1, 2, Some(true)),
+            with_ok(2, 2, Some(false)),
+            with_ok(3, 0, Some(false)),
+            // Records from before `ok` was logged: only 0 passes.
+            with_ok(4, 2, None),
+            with_ok(5, 0, None),
+        ])
+        .iter()
+        .map(|c| c.result)
+        .collect();
+        use CheckResult::*;
+        assert_eq!(results, [Passed, Failed, Failed, Failed, Passed]);
+    }
+
+    #[test]
+    fn rows_are_split_by_weight_and_resources() {
+        // During a switch-over, old branches run the same task with another
+        // weight or without the resource; each setting gets its own row.
+        let with = |job, weight, uses: &[(&str, u32)]| Entry {
+            weight,
+            uses: uses.iter().map(|&(n, a)| (n.to_owned(), a)).collect(),
+            ..exited(job, 0, 0, 10, 0)
+        };
+        let text = render(
+            &[
+                with(1, 8, &[("db", 1)]),
+                with(2, 8, &[]),
+                with(3, 8, &[("db", 1)]),
+                with(4, 12, &[]),
+            ],
+            &options(),
+        );
+        let rows: Vec<Vec<&str>> = text
+            .lines()
+            .filter(|l| l.starts_with("test "))
+            .map(|l| l.split_whitespace().take(5).collect())
+            .collect();
+        // TASK WEIGHT USES CORES-MED CORES-P90 ... CHECKS is the 6th cell.
+        assert_eq!(
+            rows.iter().map(|r| r[..3].to_vec()).collect::<Vec<_>>(),
+            [
+                vec!["test", "8", "-"],
+                vec!["test", "8", "db=1"],
+                vec!["test", "12", "-"]
+            ],
+            "{text}"
+        );
+        let checks: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("test "))
+            .map(|l| l.split_whitespace().nth(5).unwrap())
+            .collect();
+        assert_eq!(checks, ["1", "2", "1"], "{text}");
+    }
+
+    #[test]
     fn overlap_compares_demand_with_what_ran() {
         // Three weight-4 checks asked at once with capacity 8: one waited.
         let checks = checks(&[
@@ -731,12 +922,12 @@ mod tests {
             .nth(1)
             .unwrap();
         let cells: Vec<&str> = row.split_whitespace().collect();
-        // TASK WEIGHT CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED
+        // TASK WEIGHT USES CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED
         // LEFT-LINE NOT-RUN RUN-MED RUN-P90 WAIT-MED WAIT-P90 WAIT-MAX
         assert_eq!(
             cells,
             [
-                "test", "4", "3.8", "3.8", "1", "1", "0", "0", "0", "0", "10s", "10s", "5.0s",
+                "test", "4", "-", "3.8", "3.8", "1", "1", "0", "0", "0", "0", "10s", "10s", "5.0s",
                 "5.0s", "5.0s"
             ]
         );
@@ -756,10 +947,10 @@ mod tests {
         // Weight 4; most runs keep about 4 cores busy, one in ten keeps 6.
         let mut entries: Vec<Entry> = (1..=9).map(|job| run(job, 40_000)).collect();
         entries.push(run(10, 60_000));
-        assert_eq!(cells(&entries)[2..4], ["4.0", "4.0"]);
+        assert_eq!(cells(&entries)[3..5], ["4.0", "4.0"]);
         entries.push(run(11, 60_000));
         let flagged = cells(&entries);
-        assert_eq!(flagged[2..4], ["4.0", "6.0!"]);
+        assert_eq!(flagged[3..5], ["4.0", "6.0!"]);
         let text = render(&entries, &options());
         assert!(
             text.contains(
@@ -769,7 +960,7 @@ mod tests {
         );
         // Within a fifth of the weight: no flag.
         let close: Vec<Entry> = (1..=10).map(|job| run(job, 46_000)).collect();
-        assert_eq!(cells(&close)[3], "4.6");
+        assert_eq!(cells(&close)[4], "4.6");
         assert!(!render(&close, &options()).contains("!:"));
     }
 
@@ -798,7 +989,18 @@ mod tests {
             ..options()
         };
         assert!(render(&entries, &since(5_000)).contains("1 check(s)"));
-        assert!(render(&entries, &since(10_000)).contains("no checks recorded yet"));
+        assert!(render(&entries, &since(10_000)).contains("no checks in this period"));
+        let until = Options {
+            until: Some(5_000),
+            ..options()
+        };
+        let text = render(&entries, &until);
+        assert!(text.contains("1 check(s)"), "{text}");
+        assert!(
+            text.contains("only checks that got in line before "),
+            "{text}"
+        );
+        assert!(render(&[], &options()).contains("no checks recorded yet"));
         let text = render(
             &entries,
             &Options {
@@ -811,12 +1013,40 @@ mod tests {
     }
 
     #[test]
-    fn since_accepts_minutes_to_weeks() {
-        assert_eq!(parse_since("90m"), Ok(Duration::from_secs(5_400)));
-        assert_eq!(parse_since("7d"), Ok(Duration::from_secs(604_800)));
-        assert_eq!(parse_since("2w"), Ok(Duration::from_secs(1_209_600)));
-        for bad in ["", "7", "d", "7s", "-1d", "1.5h"] {
-            assert!(parse_since(bad).is_err(), "{bad}");
+    fn a_point_in_time_is_a_period_ago_or_a_local_time() {
+        assert_eq!(parse_time("90m"), Ok(Time::Ago(Duration::from_secs(5_400))));
+        assert_eq!(
+            parse_time("7d"),
+            Ok(Time::Ago(Duration::from_secs(604_800)))
+        );
+        assert_eq!(
+            parse_time("2w"),
+            Ok(Time::Ago(Duration::from_secs(1_209_600)))
+        );
+        let at = |text| match parse_time(text) {
+            Ok(Time::At(ms)) => format_time(ms),
+            other => panic!("{text}: {other:?}"),
+        };
+        assert_eq!(at("2026-10-12T16:44"), "2026-10-12 16:44");
+        assert_eq!(at("2026-10-12 16:44"), "2026-10-12 16:44");
+        assert_eq!(at("2026-10-12"), "2026-10-12 00:00");
+        for bad in [
+            "",
+            "7",
+            "d",
+            "7s",
+            "-1d",
+            "1.5h",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-10-12T24:00",
+            "2026-10-12T16:60",
+            "2026-10-12T16",
+            "yesterday",
+        ] {
+            assert!(parse_time(bad).is_err(), "{bad}");
         }
+        assert_eq!(Time::Ago(Duration::from_secs(60)).at(100_000), 40_000);
+        assert_eq!(Time::At(7).at(100_000), 7);
     }
 }

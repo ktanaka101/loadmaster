@@ -327,6 +327,12 @@ impl Queue {
                 signal: None,
                 exit_code: None,
                 started: Some(job.state == JobState::Running),
+                ok: None,
+                uses: job
+                    .uses
+                    .iter()
+                    .map(|u| (u.name.clone(), u.amount))
+                    .collect(),
             };
             if let Err(e) = history::append(state_dir, &record) {
                 let _ = writeln!(

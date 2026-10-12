@@ -34,6 +34,9 @@ pub struct Task {
     pub weight: u32,
     /// Resources the task uses, by name, all declared in the same file.
     pub uses: BTreeMap<String, u32>,
+    /// Exit codes that mean the check passed (`[0]` unless set), for the
+    /// history log and `loadmaster report`.
+    pub ok_exit_codes: Vec<i32>,
     /// Program and arguments. Never empty.
     pub cmd: Vec<String>,
 }
@@ -71,6 +74,7 @@ struct TaskFile {
     weight: u32,
     #[serde(default)]
     uses: BTreeMap<String, u32>,
+    ok_exit_codes: Option<Vec<i64>>,
     cmd: toml::Value,
 }
 
@@ -230,6 +234,23 @@ impl Task {
         if def.uses.values().any(|&amount| amount == 0) {
             return Err(format!("task `{name}`: `uses` amounts must be at least 1"));
         }
+        let ok_exit_codes = match def.ok_exit_codes {
+            None => vec![0],
+            Some(codes) if codes.is_empty() => {
+                return Err(format!(
+                    "task `{name}`: `ok_exit_codes` must list at least one exit code"
+                ));
+            }
+            Some(codes) => codes
+                .into_iter()
+                .map(|code| match i32::try_from(code) {
+                    Ok(code @ 0..=255) => Ok(code),
+                    _ => Err(format!(
+                        "task `{name}`: exit codes are 0 to 255, found {code}"
+                    )),
+                })
+                .collect::<std::result::Result<_, _>>()?,
+        };
         let cmd_hint = "e.g. cmd = [\"npx\", \"vitest\", \"run\"]; \
                         use [\"sh\", \"-c\", \"...\"] if you need shell syntax";
         let cmd = match def.cmd {
@@ -264,6 +285,7 @@ impl Task {
             name,
             weight: def.weight,
             uses: def.uses,
+            ok_exit_codes,
             cmd,
         })
     }
@@ -447,6 +469,7 @@ mod tests {
                 name: "test".into(),
                 weight: 4,
                 uses: BTreeMap::new(),
+                ok_exit_codes: vec![0],
                 cmd: vec!["npx".into(), "vitest".into(), "run".into()],
             }
         );
@@ -699,6 +722,29 @@ mod tests {
         ] {
             let msg = message(parse(&text).unwrap_err());
             assert!(msg.contains(expected), "{text:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn ok_exit_codes_default_to_zero() {
+        let config = parse(
+            "[tasks.lint]\nweight = 1\ncmd = [\"x\"]\n\
+             [tasks.ui]\nweight = 1\nok_exit_codes = [0, 2]\ncmd = [\"x\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.task("lint").unwrap().ok_exit_codes, [0]);
+        assert_eq!(config.task("ui").unwrap().ok_exit_codes, [0, 2]);
+        for (codes, expected) in [
+            (
+                "[]",
+                "task `t`: `ok_exit_codes` must list at least one exit code",
+            ),
+            ("[256]", "task `t`: exit codes are 0 to 255, found 256"),
+            ("[-1]", "task `t`: exit codes are 0 to 255, found -1"),
+        ] {
+            let text = format!("[tasks.t]\nweight = 1\nok_exit_codes = {codes}\ncmd = [\"x\"]\n");
+            let msg = message(parse(&text).unwrap_err());
+            assert!(msg.contains(expected), "{codes}: {msg}");
         }
     }
 
