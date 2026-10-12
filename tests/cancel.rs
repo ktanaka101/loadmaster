@@ -313,15 +313,61 @@ fn a_signal_the_task_survives_does_not_swallow_a_cancel() {
         probe.hold_script("hold"),
         log = q(&probe.path("signals"))
     );
-    std::fs::write(probe.repo.join(".loadmaster.toml"), sh_task("hold", 1, &script)).unwrap();
+    std::fs::write(
+        probe.repo.join(".loadmaster.toml"),
+        sh_task("hold", 1, &script),
+    )
+    .unwrap();
     let sandbox = probe;
     let mut holder = sandbox.spawn(&["run", "hold"]);
     wait_until("the task to start", || sandbox.started("hold"));
     signal(holder.id(), libc::SIGHUP);
-    wait_until("the task to get SIGHUP", || sandbox.read("signals").contains("hup"));
+    wait_until("the task to get SIGHUP", || {
+        sandbox.read("signals").contains("hup")
+    });
 
     let output = sandbox.run(&["cancel", "1"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(wait(&mut holder).code(), Some(3));
     assert_eq!(sandbox.read("signals"), "hup\nterm\n");
+}
+
+#[test]
+fn a_second_cancel_does_not_signal_a_job_already_stopping() {
+    // A member of the task's group logs every SIGTERM it gets; the task's
+    // clean-up takes 4 seconds, longer than a cancel waits for its request
+    // to be taken.
+    let probe = Sandbox::new(4, "");
+    let (log, done) = (q(&probe.path("signals")), q(&probe.path("done")));
+    let script = format!(
+        "sh -c 'trap \"echo term >> {log}\" TERM; while [ ! -e {done} ]; do sleep 0.05; done' & \
+         c=$!; \
+         trap 'i=0; while [ $i -lt 80 ]; do sleep 0.05; i=$((i+1)); done; touch {done}; wait $c; exit 3' TERM; \
+         {}",
+        probe.hold_script("hold")
+    );
+    std::fs::write(
+        probe.repo.join(".loadmaster.toml"),
+        sh_task("hold", 1, &script),
+    )
+    .unwrap();
+    let sandbox = probe;
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let mut first = sandbox.spawn(&["cancel", "1"]);
+    wait_until("the clean-up to start", || {
+        sandbox.read("signals").contains("term")
+    });
+
+    // A stopped loadmaster takes no request: a second cancel must not fall
+    // back to signalling it, since the job is stopping already.
+    signal(holder.id(), libc::SIGSTOP);
+    let mut second = sandbox.spawn(&["cancel", "1"]);
+    std::thread::sleep(std::time::Duration::from_millis(2_500));
+    signal(holder.id(), libc::SIGCONT);
+
+    assert!(wait(&mut first).success());
+    assert!(wait(&mut second).success());
+    assert_eq!(wait(&mut holder).code(), Some(3));
+    assert_eq!(sandbox.read("signals"), "term\n", "one SIGTERM");
 }

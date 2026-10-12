@@ -86,12 +86,15 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64 + 1;
 
 /// Requests from `loadmaster cancel`, for the job's own loadmaster to act on:
 /// in an agent's sandbox, a process may not signal one started by another
-/// command. Older versions never read this table and work without it, so it
-/// is added without a new schema version, which they would refuse.
+/// command. One row per job, kept once taken, so that a later cancel that
+/// asks for no more than was done does nothing. Older versions never read
+/// this table and work without it, so it is added without a new schema
+/// version, which they would refuse.
 const CANCEL_REQUESTS: &str = "
 CREATE TABLE IF NOT EXISTS cancel_requests (
-    job  INTEGER PRIMARY KEY,
-    kill INTEGER NOT NULL
+    job   INTEGER PRIMARY KEY,
+    kill  INTEGER NOT NULL,
+    taken INTEGER NOT NULL DEFAULT 0
 );
 ";
 
@@ -569,10 +572,14 @@ impl Queue {
                     return Ok(Some(Canceled::DroppedPlace(job)));
                 }
                 if job.owner_alive() {
-                    // A SIGKILL request is not turned back into a SIGTERM one.
+                    // A SIGKILL request is not turned back into a SIGTERM
+                    // one, and one taken already stays taken unless this one
+                    // asks for more. (SET reads the row as it was.)
                     tx.execute(
                         "INSERT INTO cancel_requests (job, kill) VALUES (?1, ?2)
-                         ON CONFLICT (job) DO UPDATE SET kill = max(kill, excluded.kill)",
+                         ON CONFLICT (job) DO UPDATE
+                         SET taken = taken AND excluded.kill <= kill,
+                             kill = max(kill, excluded.kill)",
                         params![job.id, kill],
                     )?;
                     return Ok(Some(Canceled::Requested(job)));
@@ -595,7 +602,7 @@ impl Queue {
     /// Whether a request for job `id` is still waiting for its loadmaster.
     pub fn cancel_pending(&self, id: JobId) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM cancel_requests WHERE job = ?1)",
+            "SELECT EXISTS (SELECT 1 FROM cancel_requests WHERE job = ?1 AND NOT taken)",
             [id],
             |r| r.get(0),
         )?)
@@ -611,7 +618,7 @@ impl Queue {
         let tx = self.begin()?;
         let kill = tx
             .query_row(
-                "DELETE FROM cancel_requests WHERE job = ?1 RETURNING kill",
+                "DELETE FROM cancel_requests WHERE job = ?1 AND NOT taken RETURNING kill",
                 [id],
                 |r| r.get(0),
             )
@@ -912,12 +919,12 @@ impl Ticket<'_> {
         let tx = self.queue.begin()?;
         let kill: Option<bool> = tx
             .query_row(
-                "SELECT kill FROM cancel_requests WHERE job = ?1",
+                "UPDATE cancel_requests SET taken = 1 WHERE job = ?1 AND NOT taken
+                 RETURNING kill",
                 [self.id],
                 |r| r.get(0),
             )
             .optional()?;
-        tx.execute("DELETE FROM cancel_requests WHERE job = ?1", [self.id])?;
         tx.commit()?;
         Ok(kill)
     }

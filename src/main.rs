@@ -1073,17 +1073,19 @@ fn open_queue() -> Result<(PathBuf, Queue)> {
     // Made sure of first: SQLite's errors don't say whether the directory is
     // to blame (its database could be a directory, say), and it opens a
     // database it may not write for reading without saying so.
-    let probe = dir.join(format!(".write-test-{}", std::process::id()));
-    match fs::OpenOptions::new()
+    // A new file each time (an existing one, a link say, is never opened),
+    // which must also be removable.
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let probe = dir.join(format!(".write-test-{}-{nanos}", std::process::id()));
+    let made = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(&probe)
-    {
-        Ok(_) => {
-            let _ = fs::remove_file(&probe);
-        }
-        Err(e) => return Err(not_writable(e.to_string())),
+        .and_then(|_| fs::remove_file(&probe));
+    if let Err(e) = made {
+        return Err(not_writable(e.to_string()));
     }
     let path = dir.join(STATE_DB_FILE);
     let queue = Queue::open(&path)?;

@@ -551,26 +551,39 @@ fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
         f.queue.stop(ticket.id(), false).unwrap(),
         Canceled::Requested(_)
     ));
-    // A SIGKILL request is not turned back into a SIGTERM one.
-    f.queue.stop(ticket.id(), true).unwrap();
-    f.queue.stop(ticket.id(), false).unwrap();
-    assert_eq!(ticket.cancel_requested().unwrap(), Some(true));
+    assert_eq!(ticket.cancel_requested().unwrap(), Some(false));
     assert_eq!(ticket.cancel_requested().unwrap(), None, "taken once");
 
+    // Asking again for no more than was done does nothing: no second SIGTERM.
     f.queue.stop(ticket.id(), false).unwrap();
-    f.queue.stop(ticket.id(), true).unwrap();
-    assert_eq!(
-        f.queue.take_back_cancel(ticket.id()).unwrap(),
-        Some(true),
-        "taken back as the strongest request"
-    );
-    assert_eq!(ticket.cancel_requested().unwrap(), None, "taken back");
+    assert!(!f.queue.cancel_pending(ticket.id()).unwrap());
     assert_eq!(f.queue.take_back_cancel(ticket.id()).unwrap(), None);
-
+    assert_eq!(ticket.cancel_requested().unwrap(), None);
+    // Asking for SIGKILL is new.
+    f.queue.stop(ticket.id(), true).unwrap();
+    assert_eq!(ticket.cancel_requested().unwrap(), Some(true));
     f.queue.stop(ticket.id(), false).unwrap();
+    assert_eq!(
+        ticket.cancel_requested().unwrap(),
+        None,
+        "nothing above SIGKILL"
+    );
+
     let id = ticket.id();
     drop(ticket);
     assert!(!f.queue.cancel_pending(id).unwrap(), "gone with its job");
+}
+
+#[test]
+fn a_request_taken_back_is_the_strongest_one() {
+    let f = fixture();
+    let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
+    // From two cancels, neither taken by the job's loadmaster.
+    f.queue.stop(ticket.id(), true).unwrap();
+    f.queue.stop(ticket.id(), false).unwrap();
+    assert_eq!(f.queue.take_back_cancel(ticket.id()).unwrap(), Some(true));
+    assert_eq!(f.queue.take_back_cancel(ticket.id()).unwrap(), None);
+    assert_eq!(ticket.cancel_requested().unwrap(), None, "taken back");
 }
 
 #[test]

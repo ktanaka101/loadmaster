@@ -339,10 +339,14 @@ that one agent works in.
   allowed (checked by PID and start time), by the job's state as read right
   before: if a waiting job's `loadmaster` was killed after its task had
   started, `--kill` kills the task too once `cancel` sees it running on its
-  own. Taking a request and taking it back are each one delete in a write
-  transaction, so exactly one of them wins, and the job is never told
-  twice. Requests from several `cancel`s are one row, and whoever takes it
-  acts on the strongest of them. The same fallback reaches a
+  own. A job has one request row, which its `loadmaster` marks as taken
+  and `cancel` takes back only while it is not, each in one write
+  transaction, so exactly one of them acts on it. Requests from several
+  `cancel`s are that one row, and whoever acts on it acts on the strongest.
+  A taken row stays until the job is gone, so a later `cancel` that asks
+  for no more than was done (another SIGTERM, while the task cleans up)
+  does nothing at all, even if the job's `loadmaster` is stopped by then;
+  one that asks for SIGKILL makes the row untaken again. The same fallback reaches a
   `loadmaster` stopped with Ctrl-Z, which acts on nothing, not even on its
   task exiting, so it is also sent SIGCONT. Where the fallback is not allowed
   either, `cancel` says why and how to stop the job instead. A task whose
