@@ -201,21 +201,31 @@ fn set_aside_while_waiting(repo: &RepoConfig, machine: &MachineConfig) -> Vec<St
                     // (the waiting run, short of it, holds it back from
                     // everyone behind), nor ones that some other resource
                     // keeps out anyway.
+                    let fits_beside = |task: &Task, limit: &dyn Fn(&str) -> Option<u64>| {
+                        task.uses.keys().all(|other| {
+                            limit(other).is_none_or(|l| {
+                                amount(holder, other).min(l)
+                                    + amount(waiter, other).min(l)
+                                    + amount(task, other).min(l)
+                                    <= l
+                            })
+                        })
+                    };
                     let crowded: Vec<String> = repo
                         .tasks()
                         .filter(|task| !task.uses.contains_key(name))
-                        .filter(|task| {
-                            task.uses.keys().all(|other| {
-                                tightest(other).is_none_or(|l| {
-                                    amount(holder, other).min(l)
-                                        + amount(waiter, other).min(l)
-                                        + amount(task, other).min(l)
-                                        <= l
-                                })
-                            })
-                        })
                         .filter(|task| (free + 1..=capacity - h).contains(&weight(task)))
-                        .map(|task| format!("`{}` ({})", task.name, task.weight))
+                        .filter(|task| fits_beside(task, &limit_of))
+                        .map(|task| {
+                            // From the holder's checkout, a per-checkout
+                            // limit may keep it out anyway.
+                            let elsewhere = if fits_beside(task, &tightest) {
+                                ""
+                            } else {
+                                ", from other checkouts"
+                            };
+                            format!("`{}` ({}{elsewhere})", task.name, task.weight)
+                        })
                         .collect();
                     if crowded.is_empty() {
                         continue;
@@ -388,12 +398,21 @@ mod tests {
     }
 
     #[test]
-    fn a_task_kept_out_by_another_per_checkout_limit_is_not_counted() {
-        let text = "[resources.db]\nper_checkout = 1\n\n[resources.gpu]\nper_checkout = 1\n\n"
+    fn a_task_kept_out_in_the_holders_checkout_counts_from_others() {
+        // `report` needs the gpu, which `e2e` holds within its checkout:
+        // only runs from other checkouts are kept out by cores alone.
+        let text = "[resources.db]\ncapacity = 1\n\n[resources.gpu]\nper_checkout = 1\n\n"
             .to_owned()
             + &task("e2e", 4, "db = 1, gpu = 1")
             + &task("report", 1, "gpu = 1");
-        assert!(warnings_of(&text, 8).is_empty());
+        assert_eq!(
+            warnings_of(&text, 8),
+            [
+                "a `e2e` run (weight 4) waiting for `db` keeps other tasks out: while another \
+              `e2e` run holds it, its 4 cores are set aside, leaving 0 of 8, so `report` (1, \
+              from other checkouts) waits too. A lower weight for `e2e` leaves them room"
+            ]
+        );
     }
 
     #[test]

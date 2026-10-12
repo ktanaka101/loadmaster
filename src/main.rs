@@ -911,14 +911,18 @@ fn cancel(args: CancelArgs) -> Result<i32> {
             let Some((_, last)) = seen.iter_mut().find(|(id, _)| *id == job.id) else {
                 continue;
             };
-            let now = state(job);
+            let (before, now) = (*last, state(job));
             // A re-run that resumed the place after it parked has a new
             // loadmaster, which got no signal yet.
-            let new_owner = now.3.is_some() && now.3 != last.3;
-            if *last != now && (args.kill || new_owner || job.state == JobState::Parked) {
-                queue.stop(job.id, args.kill)?;
-            }
+            let new_owner = now.3.is_some() && now.3 != before.3;
             *last = now;
+            if now != before && (args.kill || new_owner || job.state == JobState::Parked) {
+                // As signalled: the job may have changed again in between
+                // (a parked place resumed), and that owner has the signal.
+                if let Canceled::Signaled(signalled) = queue.stop(job.id, args.kill)? {
+                    *last = state(&signalled);
+                }
+            }
         }
         if !hinted && started.elapsed() >= CANCEL_HINT_AFTER {
             hinted = true;
