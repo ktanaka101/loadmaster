@@ -809,14 +809,20 @@ fn act_directly(tx: &Transaction, job: Job) -> Result<Canceled> {
         return Ok(Canceled::Requested(job));
     }
     let sent = signal_directly(&job, kill).map_err(|source| cannot_signal(&job, source))?;
-    if !sent {
+    let Some(sent) = sent else {
         // Gone in the meantime; the next look reaps it.
         return Ok(Canceled::Requested(job));
-    }
+    };
+    // As it was sent: its loadmaster may have died since it was looked at,
+    // and the signal then went to the task.
+    let to = match sent {
+        Sent::Task => None,
+        Sent::Loadmaster(owner) => Some(owner.start_time as i64),
+    };
     tx.execute(
         "UPDATE cancel_requests SET signal_done = max(signal_done, kill), signal_owner = ?2
          WHERE job = ?1",
-        params![job.id, owner.map(|owner| owner.start_time as i64)],
+        params![job.id, to],
     )?;
     Ok(Canceled::Signaled(job))
 }
@@ -851,7 +857,7 @@ fn delete_job(tx: &Transaction, id: JobId) -> Result<()> {
 /// its loadmaster with SIGTERM (or SIGKILL), or with `kill` or without a
 /// live loadmaster its task, which needs the permission to signal them.
 /// `Ok(false)` if it is gone.
-pub fn signal_directly(job: &Job, kill: bool) -> std::io::Result<bool> {
+fn signal_directly(job: &Job, kill: bool) -> std::io::Result<Option<Sent>> {
     let signal = if kill { libc::SIGKILL } else { libc::SIGTERM };
     let owner = job.owner.filter(|owner| owner.is_alive());
     let sent = match job.child {
@@ -859,25 +865,25 @@ pub fn signal_directly(job: &Job, kill: bool) -> std::io::Result<bool> {
             if !child.is_alive() {
                 // The task is done; its loadmaster, if any, only has to free
                 // the slot, which the SIGCONT below lets a stopped one do.
-                if owner.is_none() {
-                    return Ok(false);
-                }
-                owner.map(|owner| owner.signal(libc::SIGCONT)).transpose()?;
-                return Ok(true);
+                let Some(owner) = owner else {
+                    return Ok(None);
+                };
+                owner.signal(libc::SIGCONT)?;
+                return Ok(Some(Sent::Loadmaster(owner)));
             }
             match child.signal(signal) {
                 Ok(()) => {
                     // Lets a stopped task act on it.
                     let _ = child.signal(libc::SIGCONT);
-                    true
+                    Sent::Task
                 }
-                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
                 Err(e) => return Err(e),
             }
         }
         _ => match owner {
-            Some(owner) => owner.signal(signal)?,
-            None => return Ok(false),
+            Some(owner) if owner.signal(signal)? => Sent::Loadmaster(owner),
+            _ => return Ok(None),
         },
     };
     // A stopped loadmaster (Ctrl-Z) acts on nothing, not even on its task
@@ -885,7 +891,15 @@ pub fn signal_directly(job: &Job, kill: bool) -> std::io::Result<bool> {
     if let Some(owner) = owner {
         owner.signal(libc::SIGCONT)?;
     }
-    Ok(sent)
+    Ok(Some(sent))
+}
+
+/// Whom [`signal_directly`] signalled, as it decided at that moment.
+enum Sent {
+    /// The task's process group.
+    Task,
+    /// The job's loadmaster, which passes it on to its task.
+    Loadmaster(ProcessId),
 }
 
 /// A history record for a job that its loadmaster process did not log
