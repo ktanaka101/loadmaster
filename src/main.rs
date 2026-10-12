@@ -489,6 +489,14 @@ fn run_admitted(
             task.name,
             child.group.pgid
         );
+        // Whether they had a SIGTERM must outlive this process: a cancel of
+        // the job then sends them no second one.
+        forwarder.forward_pending(&child.group, signals);
+        if forwarder.term_sent()
+            && let Err(e) = ticket.record_term_sent()
+        {
+            say!("loadmaster: warning: could not record the SIGTERM sent to job #{id}: {e}");
+        }
         ticket.detach()
     } else {
         drop(ticket);
@@ -952,10 +960,8 @@ fn cancel(args: CancelArgs) -> Result<i32> {
         for job in &left {
             if job.state == JobState::Parked || job.is_orphaned() {
                 queue.stop(job.id, args.kill)?;
-            } else if started.elapsed() >= CANCEL_ANSWER_WITHIN
-                && let Some(kill) = queue.claim_fallback(job.id)?
-            {
-                queue.signal_now(job.id, kill)?;
+            } else if started.elapsed() >= CANCEL_ANSWER_WITHIN {
+                queue.fallback(job.id)?;
             }
         }
         if !hinted && started.elapsed() >= CANCEL_HINT_AFTER {

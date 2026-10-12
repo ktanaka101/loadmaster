@@ -560,6 +560,12 @@ fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
     assert!(!f.queue.cancel_pending(ticket.id()).unwrap());
     assert_eq!(f.queue.claim_fallback(ticket.id()).unwrap(), None);
     assert_eq!(ticket.cancel_requested().unwrap(), None);
+    // A SIGTERM its loadmaster forwarded from outside counts too.
+    let other = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
+    other.record_term_sent().unwrap();
+    f.queue.stop(other.id(), false).unwrap();
+    assert!(!f.queue.cancel_pending(other.id()).unwrap());
+    assert_eq!(other.cancel_requested().unwrap(), None);
     // Asking for SIGKILL is new; nothing goes above it.
     f.queue.stop(ticket.id(), true).unwrap();
     assert_eq!(ticket.cancel_requested().unwrap(), Some(true));
@@ -578,7 +584,10 @@ fn a_fallback_signal_is_claimed_once_and_leaves_the_request() {
     // From two cancels, neither acted on by the job's loadmaster.
     f.queue.stop(ticket.id(), true).unwrap();
     f.queue.stop(ticket.id(), false).unwrap();
-    assert_eq!(f.queue.claim_fallback(ticket.id()).unwrap(), Some(true));
+    assert_eq!(
+        f.queue.claim_fallback(ticket.id()).unwrap(),
+        Some((true, -1))
+    );
     assert_eq!(
         f.queue.claim_fallback(ticket.id()).unwrap(),
         None,

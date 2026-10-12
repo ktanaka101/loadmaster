@@ -263,12 +263,18 @@ fn sigterm_reaches_the_task_once() {
         q(&probe.path("signals")),
         probe.hold_script("hold")
     );
-    std::fs::write(probe.repo.join(".loadmaster.toml"), sh_task("hold", 1, &script)).unwrap();
+    std::fs::write(
+        probe.repo.join(".loadmaster.toml"),
+        sh_task("hold", 1, &script),
+    )
+    .unwrap();
     let sandbox = probe;
     let mut runner = sandbox.spawn(&["run", "hold"]);
     wait_until("the task to start", || sandbox.started("hold"));
     signal(runner.id(), libc::SIGTERM);
-    wait_until("the first SIGTERM", || sandbox.read("signals").contains("term"));
+    wait_until("the first SIGTERM", || {
+        sandbox.read("signals").contains("term")
+    });
     signal(runner.id(), libc::SIGTERM);
     std::thread::sleep(std::time::Duration::from_millis(300));
     sandbox.release("hold");

@@ -340,9 +340,11 @@ that one agent works in.
   outside alike: a second one would cut short the clean-up the first
   started (as in a handler registered with `process.once`), and with several
   sources (a cancel, its fallback, a tool's timeout) it would otherwise come
-  up. Its `loadmaster` sends it, so that one rule covers every path but
-  those that bypass it. SIGKILL is there to force a task: `--kill`, as often
-  as it takes.
+  up. Its `loadmaster` sends it, so that one rule covers every path through
+  it, and before it hands the slot over to the processes its task left
+  behind, it records in the queue that it has sent one, so a `cancel`, which
+  signals those processes itself, sends them none either. SIGKILL is there
+  to force a task: `--kill`, as often as it takes.
 - A job has one request row, kept until the job is gone, with the strongest
   stop asked for (several `cancel`s are that one row) and the strongest one
   done, by its `loadmaster` and by a `cancel` signalling the job itself. Its
@@ -356,18 +358,24 @@ that one agent works in.
   of an older `loadmaster` does not act on its request, nor does one stopped
   with Ctrl-Z, so after 2 seconds `cancel` claims the stop and signals the
   job itself, where that is allowed (checked by PID and start time), by the
-  job's state as read right before, and sends SIGCONT along. The request
-  stays, so a `loadmaster` that comes back, or that ignored the signal (one
-  started with SIGTERM ignored), still acts on it. Where the signal is not
-  allowed either, `cancel` says why and how to stop the job instead.
+  job's state as read right before, and sends SIGCONT along. Right before,
+  it also checks that the job's `loadmaster` has not acted on the request
+  since the claim. The request stays, so a `loadmaster` that comes back, or
+  that ignored the signal (one started with SIGTERM ignored), still acts on
+  it. Where the signal is not allowed either, `cancel` gives the claim back
+  (nothing was sent, so a `cancel` run outside the sandbox can still send
+  it) and says why and how to stop the job instead.
 - A task whose `loadmaster` is gone is signalled from `cancel`: SIGTERM if
   nobody has sent it one (its `loadmaster` may have, before it handed the
   slot over to the processes the task left behind), SIGKILL whenever asked.
   So a waiting job whose `loadmaster` was killed after its task had started
-  has that task killed too. One gap is left: a `loadmaster` killed between
-  taking a SIGTERM request and passing it on leaves its task unsignalled,
-  and `cancel` waits; its note after 10 seconds points to `--kill`. Sending
-  SIGTERM again in that case would risk the second SIGTERM everywhere else.
+  has that task killed too. Two gaps are left, both needing a `loadmaster`
+  killed with SIGKILL at a particular moment. Killed between taking a
+  SIGTERM request and passing it on, it leaves its task unsignalled, and
+  `cancel` waits; its note after 10 seconds points to `--kill`. Killed after
+  passing a SIGTERM on but before handing its slot over, it leaves no record
+  of it, and a later `cancel` sends one more. Closing the first would open
+  the second wider, and the other way round.
 - It waits until the jobs have left the queue, so the caller knows the slot
   is free, and says after 10 seconds which ones are still stopping. It never
   escalates to SIGKILL by itself: a task that takes long to stop is usually

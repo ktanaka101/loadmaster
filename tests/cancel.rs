@@ -434,3 +434,54 @@ fn processes_left_behind_get_no_second_sigterm() {
     assert!(wait(&mut second).success());
     assert_eq!(sandbox.read("signals"), "term\n", "one SIGTERM");
 }
+
+#[test]
+fn processes_left_behind_after_a_sigterm_from_outside_get_no_second_one() {
+    // As above, but the first SIGTERM comes from outside, as from a tool's
+    // timeout: that it was sent must outlive the job's loadmaster.
+    let probe = Sandbox::new(4, "");
+    let (log, done) = (q(&probe.path("signals")), q(&probe.path("done")));
+    let script = format!(
+        "sh -c 'trap \"echo term >> {log}\" TERM; while [ ! -e {done} ]; do sleep 0.05; done' & \
+         trap 'exit 3' TERM; {}",
+        probe.hold_script("hold")
+    );
+    std::fs::write(
+        probe.repo.join(".loadmaster.toml"),
+        sh_task("hold", 1, &script),
+    )
+    .unwrap();
+    let sandbox = probe;
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    signal(holder.id(), libc::SIGTERM);
+    assert_eq!(wait(&mut holder).code(), Some(3));
+    wait_until("the slot to be handed over", || {
+        sandbox.job("hold").is_some_and(|j| j.is_orphaned())
+    });
+
+    let mut cancel = sandbox.spawn(&["cancel", "1"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::fs::write(sandbox.path("done"), "").unwrap();
+    assert!(wait(&mut cancel).success());
+    assert_eq!(sandbox.read("signals"), "term\n", "one SIGTERM");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_cancel_refused_in_a_sandbox_does_not_stop_one_from_outside() {
+    // A stopped loadmaster takes no request; inside the sandbox the signal
+    // standing in for it is refused, outside it is not.
+    let sandbox = sandbox();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the child group to be recorded", || {
+        sandbox.job("hold").is_some_and(|j| j.child.is_some())
+    });
+    signal(holder.id(), libc::SIGSTOP);
+    assert_eq!(cancel_in_sandbox(&sandbox, &["1"]).status.code(), Some(125));
+
+    let output = sandbox.run(&["cancel", "1"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(wait(&mut holder).code(), Some(3));
+    assert_eq!(sandbox.read("term"), "term\n");
+}

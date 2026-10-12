@@ -459,8 +459,17 @@ impl Queue {
         )?;
         if !current {
             let tx = self.begin()?;
-            tx.execute_batch("DROP TABLE IF EXISTS cancel_requests")?;
-            tx.execute_batch(CANCEL_REQUESTS)?;
+            // Again under the lock: another process may have made it since.
+            let current: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('cancel_requests')
+                                WHERE name = 'signal_done')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !current {
+                tx.execute_batch("DROP TABLE IF EXISTS cancel_requests")?;
+                tx.execute_batch(CANCEL_REQUESTS)?;
+            }
             tx.commit()?;
         }
         Ok(())
@@ -597,18 +606,30 @@ impl Queue {
                 if !kill && done >= 0 {
                     return Ok(Some((Canceled::Requested(job), None)));
                 }
+                let previous: i64 = tx.query_row(
+                    "SELECT signal_done FROM cancel_requests WHERE job = ?1",
+                    [job.id],
+                    |r| r.get(0),
+                )?;
                 tx.execute(
                     "UPDATE cancel_requests SET signal_done = max(signal_done, kill)
                      WHERE job = ?1",
                     [job.id],
                 )?;
-                Ok(Some((Canceled::Signaled(job), Some(kill))))
+                Ok(Some((Canceled::Signaled(job), Some((kill, previous)))))
             })?;
             match found {
                 None => return Ok(Canceled::NotFound),
-                Some((Canceled::Signaled(job), Some(kill))) => {
-                    if signal_directly(&job, kill).map_err(|source| cannot_signal(&job, source))? {
-                        return Ok(Canceled::Signaled(job));
+                Some((Canceled::Signaled(job), Some((kill, previous)))) => {
+                    match signal_directly(&job, kill) {
+                        Ok(true) => return Ok(Canceled::Signaled(job)),
+                        Ok(false) => {}
+                        Err(source) => {
+                            // Not sent, so not done: another cancel, from
+                            // where it may signal, can still send it.
+                            self.unclaim(job.id, kill, previous)?;
+                            return Err(cannot_signal(&job, source));
+                        }
                     }
                 }
                 Some((other, _)) => return Ok(other),
@@ -627,50 +648,98 @@ impl Queue {
         )?)
     }
 
-    /// Claims the signal that stands in for job `id`'s request when its
-    /// loadmaster has not acted on it (one from a version that does not read
-    /// requests, or one that is stopped): whether it is SIGKILL, or `None`
-    /// if that much has been done already, by its loadmaster or by another
+    /// Signals job `id` in place of its request when its loadmaster has
+    /// not acted on it (one from a version that does not read requests, or
+    /// one that is stopped), by the job's state as read right before, unless
+    /// that much has been done already, by its loadmaster or by another
     /// `cancel`. The request stays, so the loadmaster acts on it once it
-    /// can; it sends its task no second SIGTERM.
-    pub fn claim_fallback(&self, id: JobId) -> Result<Option<bool>> {
-        let tx = self.begin()?;
-        let kill = tx
-            .query_row(
-                "UPDATE cancel_requests SET signal_done = kill
-                 WHERE job = ?1 AND kill > owner_done AND kill > signal_done
-                 RETURNING kill",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        tx.commit()?;
-        Ok(kill)
-    }
-
-    /// Signals job `id` without a request, by its state as read right
-    /// before: for a job whose loadmaster does not take requests, or is gone.
-    /// A parked job loses its place instead.
-    pub fn signal_now(&self, id: JobId, kill: bool) -> Result<Canceled> {
+    /// can; it sends its task no second SIGTERM. `None` if there was nothing
+    /// to do.
+    pub fn fallback(&self, id: JobId) -> Result<Option<Canceled>> {
+        // Claimed first, so two cancels don't both send it.
+        let Some((kill, previous)) = self.claim_fallback(id)? else {
+            return Ok(None);
+        };
         for _ in 0..10 {
             let (job, _) = self.write(|tx| {
-                let job = load_jobs(tx)?.into_iter().find(|job| job.id == id);
-                if let Some(job) = job.as_ref().filter(|job| job.state == JobState::Parked) {
+                let Some(job) = load_jobs(tx)?.into_iter().find(|job| job.id == id) else {
+                    return Ok(None);
+                };
+                if job.state == JobState::Parked {
                     delete_job(tx, job.id)?;
+                    return Ok(Some((job, false)));
                 }
-                Ok(job)
+                // Its loadmaster may have acted since the claim, and even
+                // handed the slot over to what its task left behind.
+                let acted: bool = tx
+                    .query_row(
+                        "SELECT owner_done >= ?2 FROM cancel_requests WHERE job = ?1",
+                        params![job.id, kill],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(true);
+                Ok(Some((job, !acted)))
             })?;
-            let Some(job) = job else {
-                return Ok(Canceled::NotFound);
+            let Some((job, send)) = job else {
+                return Ok(Some(Canceled::NotFound));
             };
             if job.state == JobState::Parked {
-                return Ok(Canceled::DroppedPlace(job));
+                return Ok(Some(Canceled::DroppedPlace(job)));
             }
-            if signal_directly(&job, kill).map_err(|source| cannot_signal(&job, source))? {
-                return Ok(Canceled::Signaled(job));
+            if !send {
+                return Ok(Some(Canceled::Requested(job)));
+            }
+            match signal_directly(&job, kill) {
+                Ok(true) => return Ok(Some(Canceled::Signaled(job))),
+                Ok(false) => {}
+                Err(source) => {
+                    self.unclaim(job.id, kill, previous)?;
+                    return Err(cannot_signal(&job, source));
+                }
             }
         }
-        Ok(Canceled::NotFound)
+        Ok(Some(Canceled::NotFound))
+    }
+
+    /// Claims the signal that stands in for job `id`'s request: whether it
+    /// is SIGKILL, and what had been sent before, or `None` if that much has
+    /// been done already.
+    fn claim_fallback(&self, id: JobId) -> Result<Option<(bool, i64)>> {
+        let tx = self.begin()?;
+        let row: Option<(bool, i64, i64)> = tx
+            .query_row(
+                "SELECT kill, owner_done, signal_done FROM cancel_requests WHERE job = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((kill, owner_done, previous)) = row else {
+            return Ok(None);
+        };
+        if i64::from(kill) <= owner_done.max(previous) {
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE cancel_requests SET signal_done = kill WHERE job = ?1",
+            [id],
+        )?;
+        tx.commit()?;
+        Ok(Some((kill, previous)))
+    }
+
+    /// Takes back a claim to have signalled job `id` (at `kill`) that could
+    /// not be sent, back to `previous`, unless something else has been
+    /// claimed since.
+    fn unclaim(&self, id: JobId, kill: bool, previous: i64) -> Result<()> {
+        let tx = self.begin()?;
+        tx.execute(
+            "UPDATE cancel_requests SET signal_done = ?3
+             WHERE job = ?1 AND signal_done = ?2",
+            params![id, kill, previous],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Gets in line, or takes over a parked job with the same
@@ -956,6 +1025,20 @@ impl Ticket<'_> {
             .optional()?;
         tx.commit()?;
         Ok(kill)
+    }
+
+    /// Records that its loadmaster has sent its task SIGTERM, from outside
+    /// or from a cancel, before it hands the slot over to the processes the
+    /// task leaves behind: a cancel then sends them no second one.
+    pub fn record_term_sent(&self) -> Result<()> {
+        let tx = self.queue.begin()?;
+        tx.execute(
+            "INSERT INTO cancel_requests (job, kill, owner_done) VALUES (?1, 0, 0)
+             ON CONFLICT (job) DO UPDATE SET owner_done = max(owner_done, 0)",
+            [self.id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Starts the job if it is at the head of the line and fits.
