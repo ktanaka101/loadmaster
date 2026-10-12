@@ -327,13 +327,15 @@ that one agent works in.
   next run a mess. `--kill` sends SIGKILL to the running task when asked.
 - A job can change while it is canceled. One that gave up waiting at that
   moment parks: its place is dropped, also when its `loadmaster` has already
-  exited and the signal finds nobody. With `--kill`, a waiting job's
+  exited and the signal finds nobody. If a re-run resumes the place first,
+  its new `loadmaster` gets the signal, which it has not had yet. With `--kill`, a waiting job's
   `loadmaster` is killed; if the job was admitted in between, its task runs
   on without it, so `cancel` kills the task too once it sees the change. A
   SIGTERM is not sent twice, since the first is normally forwarded already
   and the task would get it twice; the 10-second note covers the rest.
 - A `loadmaster` stopped with Ctrl-Z acts on nothing, not even on its task
-  exiting, so it is sent SIGCONT after the signal.
+  exiting, so it is sent SIGCONT after the signal, and also when its task
+  has already ended and only the slot is left to free.
 - A PID is checked by its start time right before the signal, as when a
   signal is forwarded to a task's group: a PID the OS hands out again within
   that instant would get it. macOS has no pidfd to close that gap, and the

@@ -157,6 +157,18 @@ fn set_aside_while_waiting(repo: &RepoConfig, machine: &MachineConfig) -> Vec<St
             .or(repo.resource(name)?.capacity)
             .map(u64::from)
     };
+    // The tightest limit on a resource that a task beside the holder could
+    // meet: in the holder's checkout, its per-checkout one.
+    let tightest = |name: &str| {
+        let per_checkout = repo
+            .resource(name)
+            .and_then(|r| r.per_checkout)
+            .map(u64::from);
+        match (limit_of(name), per_checkout) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    };
     let amount = |task: &Task, name: &str| task.uses.get(name).map_or(0, |&a| u64::from(a));
     let mut warned: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
     let mut warnings = Vec::new();
@@ -194,7 +206,7 @@ fn set_aside_while_waiting(repo: &RepoConfig, machine: &MachineConfig) -> Vec<St
                         .filter(|task| !task.uses.contains_key(name))
                         .filter(|task| {
                             task.uses.keys().all(|other| {
-                                limit_of(other).is_none_or(|l| {
+                                tightest(other).is_none_or(|l| {
                                     amount(holder, other).min(l)
                                         + amount(waiter, other).min(l)
                                         + amount(task, other).min(l)
@@ -370,6 +382,15 @@ mod tests {
         // `report` needs the gpu that `e2e` holds: it waits for that, not for
         // the cores the waiting `e2e` run sets aside.
         let text = "[resources.db]\ncapacity = 1\n\n[resources.gpu]\ncapacity = 1\n\n".to_owned()
+            + &task("e2e", 4, "db = 1, gpu = 1")
+            + &task("report", 1, "gpu = 1");
+        assert!(warnings_of(&text, 8).is_empty());
+    }
+
+    #[test]
+    fn a_task_kept_out_by_another_per_checkout_limit_is_not_counted() {
+        let text = "[resources.db]\nper_checkout = 1\n\n[resources.gpu]\nper_checkout = 1\n\n"
+            .to_owned()
             + &task("e2e", 4, "db = 1, gpu = 1")
             + &task("report", 1, "gpu = 1");
         assert!(warnings_of(&text, 8).is_empty());

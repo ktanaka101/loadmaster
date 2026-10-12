@@ -181,3 +181,27 @@ fn drops_a_kept_place_and_names_unknown_jobs() {
     sandbox.release("hold");
     assert!(wait(&mut holder).success());
 }
+
+#[test]
+fn continues_a_stopped_loadmaster_whose_task_has_ended() {
+    let sandbox = sandbox();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the child group to be recorded", || {
+        sandbox.job("hold").is_some_and(|j| j.child.is_some())
+    });
+    let group = sandbox.job("hold").unwrap().child.unwrap();
+    // Ctrl-Z on loadmaster; the task then ends, but nobody frees its slot.
+    signal(holder.id(), libc::SIGSTOP);
+    sandbox.release("hold");
+    wait_until("the task to end", || !group.is_alive());
+
+    let output = sandbox.run(&["cancel", "--kill", "1"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).starts_with("canceled #1 `hold`"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(wait(&mut holder).success(), "the task had passed");
+    assert!(sandbox.snapshot().jobs.is_empty());
+}

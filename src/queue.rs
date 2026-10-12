@@ -686,7 +686,13 @@ fn signal_job(job: &Job, kill: bool) -> std::io::Result<bool> {
     let sent = match job.child {
         Some(child) if job.state == JobState::Running && (kill || owner.is_none()) => {
             if !child.is_alive() {
-                return Ok(false);
+                // The task is done; its loadmaster, if any, only has to free
+                // the slot, which the SIGCONT below lets a stopped one do.
+                if owner.is_none() {
+                    return Ok(false);
+                }
+                owner.map(|owner| owner.signal(libc::SIGCONT)).transpose()?;
+                return Ok(true);
             }
             match child.signal(signal) {
                 Ok(()) => {

@@ -883,15 +883,18 @@ fn cancel(args: CancelArgs) -> Result<i32> {
     // Gone once its loadmaster has left the line, or its task has exited and
     // freed the slot. A job can change as it is signalled: one that gave up
     // waiting (exit code 75) at that moment keeps its place, which is
-    // dropped rather than left to expire. With --kill, a waiting job's
+    // dropped rather than left to expire, or is resumed by a re-run, whose
+    // loadmaster is then signalled too. With --kill, a waiting job's
     // loadmaster was killed, so if the job had been admitted meanwhile its
     // task runs on: it is killed too. (A second SIGTERM is not sent: the
     // first one has normally been forwarded already, and the task would get
     // it twice.)
     let started = Instant::now();
     let mut hinted = false;
-    let state = |job: &Job| (job.state, job.is_orphaned(), job.child.is_some());
-    let mut seen: Vec<(JobId, (JobState, bool, bool))> = stopping
+    type Seen = (JobState, bool, bool, Option<ProcessId>);
+    let state =
+        |job: &Job| -> Seen { (job.state, job.is_orphaned(), job.child.is_some(), job.owner) };
+    let mut seen: Vec<(JobId, Seen)> = stopping
         .iter()
         .map(|(job, _)| (job.id, state(job)))
         .collect();
@@ -908,10 +911,14 @@ fn cancel(args: CancelArgs) -> Result<i32> {
             let Some((_, last)) = seen.iter_mut().find(|(id, _)| *id == job.id) else {
                 continue;
             };
-            if *last != state(job) && (args.kill || job.state == JobState::Parked) {
+            let now = state(job);
+            // A re-run that resumed the place after it parked has a new
+            // loadmaster, which got no signal yet.
+            let new_owner = now.3.is_some() && now.3 != last.3;
+            if *last != now && (args.kill || new_owner || job.state == JobState::Parked) {
                 queue.stop(job.id, args.kill)?;
             }
-            *last = state(job);
+            *last = now;
         }
         if !hinted && started.elapsed() >= CANCEL_HINT_AFTER {
             hinted = true;
