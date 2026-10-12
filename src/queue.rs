@@ -84,6 +84,17 @@ const MIGRATIONS: [&str; 2] = [
 
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64 + 1;
 
+/// Requests from `loadmaster cancel`, for the job's own loadmaster to act on:
+/// in an agent's sandbox, a process may not signal one started by another
+/// command. Older versions never read this table and work without it, so it
+/// is added without a new schema version, which they would refuse.
+const CANCEL_REQUESTS: &str = "
+CREATE TABLE IF NOT EXISTS cancel_requests (
+    job  INTEGER PRIMARY KEY,
+    kill INTEGER NOT NULL
+);
+";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     Waiting,
@@ -420,7 +431,24 @@ impl Queue {
             path: path.to_owned(),
         };
         queue.migrate()?;
+        queue.ensure_cancel_requests()?;
         Ok(queue)
+    }
+
+    fn ensure_cancel_requests(&self) -> Result<()> {
+        // Usually it exists; don't take the write lock then.
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                            WHERE type = 'table' AND name = 'cancel_requests')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            let tx = self.begin()?;
+            tx.execute_batch(CANCEL_REQUESTS)?;
+            tx.commit()?;
+        }
+        Ok(())
     }
 
     fn migrate(&self) -> Result<()> {
@@ -499,7 +527,9 @@ impl Queue {
     /// a `canceled` record, so the report can leave the check out.
     pub fn cancel(&self, id: JobId, kill: bool) -> Result<Canceled> {
         let canceled = self.stop(id, kill)?;
-        if let Canceled::DroppedPlace(job) | Canceled::Signaled(job) = &canceled {
+        if let Canceled::DroppedPlace(job) | Canceled::Requested(job) | Canceled::Signaled(job) =
+            &canceled
+        {
             let now = SystemTime::now();
             self.log(&Record {
                 run_ms: job
@@ -511,38 +541,78 @@ impl Queue {
         Ok(canceled)
     }
 
-    /// Stops job `id`, without logging: a waiting job leaves the line and a
-    /// running one's task ends, both through the job's loadmaster process,
-    /// which handles the SIGTERM as any other; a parked job loses its place.
-    /// With `kill`, SIGKILL instead, sent to a running job's task (its
-    /// loadmaster must stay to free the slot and log the result) or to a
-    /// waiting job's loadmaster. A task whose loadmaster is gone is signalled
-    /// directly. Also for a canceled job whose state has changed since.
+    /// Stops job `id`, without logging. A job with a live loadmaster gets a
+    /// request, which that loadmaster acts on (see
+    /// [`Ticket::cancel_requested`]): a waiting job leaves the line and a
+    /// running one's task gets SIGTERM, or SIGKILL with `kill`. That needs
+    /// no permission to signal it, which an agent's sandbox may not give. A
+    /// parked job loses its place. A task whose loadmaster is gone is
+    /// signalled directly. Also for a canceled job whose state has changed
+    /// since.
     pub fn stop(&self, id: JobId, kill: bool) -> Result<Canceled> {
         // The job can change between reading and signalling it: a signal
-        // that finds nobody (it parked, say, and its loadmaster exited) reads
-        // it again, and the write reaps it if nothing holds it any more.
+        // that finds nobody reads it again, and the write reaps it if nothing
+        // holds it any more.
         for _ in 0..10 {
-            let (job, _) = self.write(|tx| {
-                let job = load_jobs(tx)?.into_iter().find(|job| job.id == id);
-                if let Some(job) = job.as_ref().filter(|job| job.state == JobState::Parked) {
-                    tx.execute("DELETE FROM jobs WHERE id = ?1", [job.id])?;
+            let (found, _) = self.write(|tx| {
+                let Some(job) = load_jobs(tx)?.into_iter().find(|job| job.id == id) else {
+                    return Ok(None);
+                };
+                if job.state == JobState::Parked {
+                    delete_job(tx, job.id)?;
+                    return Ok(Some(Canceled::DroppedPlace(job)));
                 }
-                Ok(job)
+                if job.owner_alive() {
+                    // A SIGKILL request is not turned back into a SIGTERM one.
+                    tx.execute(
+                        "INSERT INTO cancel_requests (job, kill) VALUES (?1, ?2)
+                         ON CONFLICT (job) DO UPDATE SET kill = max(kill, excluded.kill)",
+                        params![job.id, kill],
+                    )?;
+                    return Ok(Some(Canceled::Requested(job)));
+                }
+                Ok(Some(Canceled::Signaled(job)))
             })?;
-            let Some(job) = job else {
-                return Ok(Canceled::NotFound);
-            };
-            if job.state == JobState::Parked {
-                return Ok(Canceled::DroppedPlace(job));
-            }
-            if signal_job(&job, kill)
-                .map_err(|e| Error::io(format!("cannot signal job #{id}"), e))?
-            {
-                return Ok(Canceled::Signaled(job));
+            match found {
+                None => return Ok(Canceled::NotFound),
+                Some(Canceled::Signaled(job)) => {
+                    let sent =
+                        signal_directly(&job, kill).map_err(|source| Error::CannotSignal {
+                            id,
+                            why: format!(
+                                "its loadmaster is gone, and its task's process group {} could not \
+                             be signalled",
+                                job.child.map_or(0, |c| c.pgid)
+                            ),
+                            source,
+                        })?;
+                    if sent {
+                        return Ok(Canceled::Signaled(job));
+                    }
+                }
+                Some(other) => return Ok(other),
             }
         }
         Ok(Canceled::NotFound)
+    }
+
+    /// Whether a request for job `id` is still waiting for its loadmaster.
+    pub fn cancel_pending(&self, id: JobId) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM cancel_requests WHERE job = ?1)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Takes back a request that job `id`'s loadmaster has not acted on
+    /// (one from a version that does not read them, or one that is stopped),
+    /// so the caller can signal it instead; false if it has acted on it.
+    pub fn take_back_cancel(&self, id: JobId) -> Result<bool> {
+        let tx = self.begin()?;
+        let taken = tx.execute("DELETE FROM cancel_requests WHERE job = ?1", [id])?;
+        tx.commit()?;
+        Ok(taken == 1)
     }
 
     /// Gets in line, or takes over a parked job with the same
@@ -663,7 +733,7 @@ impl Queue {
     }
 
     fn remove(&self, id: JobId) -> Result<()> {
-        self.write(|tx| Ok(tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?))?;
+        self.write(|tx| delete_job(tx, id))?;
         Ok(())
     }
 }
@@ -675,12 +745,24 @@ pub enum Canceled {
     NotFound,
     /// It was parked: its kept place is gone.
     DroppedPlace(Job),
-    /// It was signalled, and leaves the queue once that takes effect.
+    /// Its loadmaster was asked to stop it, and the job leaves the queue
+    /// once that has taken effect.
+    Requested(Job),
+    /// Its loadmaster is gone, so its task was signalled directly.
     Signaled(Job),
 }
 
-/// Signals a job for [`Queue::cancel`]; `Ok(false)` if it is gone.
-fn signal_job(job: &Job, kill: bool) -> std::io::Result<bool> {
+fn delete_job(tx: &Transaction, id: JobId) -> Result<()> {
+    tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+    tx.execute("DELETE FROM cancel_requests WHERE job = ?1", [id])?;
+    Ok(())
+}
+
+/// Signals a job for `loadmaster cancel` without going through a request:
+/// its loadmaster with SIGTERM (or SIGKILL), or with `kill` or without a
+/// live loadmaster its task, which needs the permission to signal them.
+/// `Ok(false)` if it is gone.
+pub fn signal_directly(job: &Job, kill: bool) -> std::io::Result<bool> {
     let signal = if kill { libc::SIGKILL } else { libc::SIGTERM };
     let owner = job.owner.filter(|owner| owner.is_alive());
     let sent = match job.child {
@@ -768,6 +850,26 @@ impl Ticket<'_> {
     /// the back of the line.
     pub fn resumed(&self) -> bool {
         self.resumed
+    }
+
+    /// A request from `loadmaster cancel`, taken so it is acted on once:
+    /// `Some(true)` to kill the task, `Some(false)` to stop it with SIGTERM.
+    pub fn cancel_requested(&self) -> Result<Option<bool>> {
+        // Almost always there is none; look without the write lock first.
+        if !self.queue.cancel_pending(self.id)? {
+            return Ok(None);
+        }
+        let tx = self.queue.begin()?;
+        let kill: Option<bool> = tx
+            .query_row(
+                "SELECT kill FROM cancel_requests WHERE job = ?1",
+                [self.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.execute("DELETE FROM cancel_requests WHERE job = ?1", [self.id])?;
+        tx.commit()?;
+        Ok(kill)
     }
 
     /// Starts the job if it is at the head of the line and fits.
@@ -1097,8 +1199,13 @@ fn reap(tx: &Transaction) -> Result<Vec<Job>> {
         .filter(|job| !job.is_live(now))
         .collect();
     for job in &dead {
-        tx.execute("DELETE FROM jobs WHERE id = ?1", [job.id])?;
+        delete_job(tx, job.id)?;
     }
+    // Versions that do not know requests delete jobs without theirs.
+    tx.execute(
+        "DELETE FROM cancel_requests WHERE job NOT IN (SELECT id FROM jobs)",
+        [],
+    )?;
     Ok(dead)
 }
 

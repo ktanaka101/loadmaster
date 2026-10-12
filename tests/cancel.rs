@@ -207,3 +207,98 @@ fn continues_a_stopped_loadmaster_whose_task_has_ended() {
     assert!(wait(&mut holder).success(), "the task had passed");
     assert!(sandbox.snapshot().jobs.is_empty());
 }
+
+#[test]
+fn a_waiting_job_leaves_on_request_without_a_signal() {
+    // Its loadmaster ignores SIGTERM, as under `nohup`-like setups, so only
+    // the request can make it leave.
+    let sandbox = sandbox();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let mut cmd = sandbox.cmd(&["run", "test"]);
+    cmd.stdout(Stdio::null())
+        .stderr(std::fs::File::create(sandbox.path("test.err")).unwrap());
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut waiter = cmd.spawn().unwrap();
+    wait_for_state(&sandbox, "test", JobState::Waiting);
+
+    let output = sandbox.run(&["cancel", "2"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(wait(&mut waiter).code(), Some(143));
+    assert!(
+        sandbox
+            .read("test.err")
+            .contains("`test` was canceled with `loadmaster cancel` while it waited"),
+        "{}",
+        sandbox.read("test.err")
+    );
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+}
+
+/// `cancel` run where it may not signal processes it did not start, as in
+/// the macOS sandboxes of agents such as Codex.
+#[cfg(target_os = "macos")]
+fn cancel_in_sandbox(sandbox: &Sandbox, args: &[&str]) -> std::process::Output {
+    let mut cmd = std::process::Command::new("sandbox-exec");
+    cmd.args([
+        "-p",
+        // As Codex's sandbox: signals only to processes in the same sandbox.
+        "(version 1)(allow default)(deny signal)(allow signal (target same-sandbox))",
+        BIN,
+        "cancel",
+    ])
+    .args(args)
+    .current_dir(&sandbox.repo)
+    .env("LOADMASTER_CONFIG", &sandbox.machine_config)
+    .env("LOADMASTER_STATE_DIR", &sandbox.state)
+    .env_remove("LOADMASTER_HELD");
+    output(cmd)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cancels_where_it_may_not_signal() {
+    let sandbox = sandbox();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+
+    let output = cancel_in_sandbox(&sandbox, &["--here"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).starts_with("canceled #1 `hold` (running for "));
+    assert_eq!(wait(&mut holder).code(), Some(3));
+    assert_eq!(sandbox.read("term"), "term\n");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn says_why_when_it_must_signal_but_may_not() {
+    // A stopped loadmaster takes no request; the signal that would replace
+    // it is not allowed.
+    let sandbox = sandbox();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the child group to be recorded", || {
+        sandbox.job("hold").is_some_and(|j| j.child.is_some())
+    });
+    signal(holder.id(), libc::SIGSTOP);
+
+    let output = cancel_in_sandbox(&sandbox, &["1"]);
+    assert_eq!(output.status.code(), Some(125));
+    let err = stderr(&output);
+    assert!(
+        err.contains("cannot stop job #1: its loadmaster (process ")
+            && err.contains("did not take the request, as a version before 0.6 or a stopped one does not")
+            && err.contains("in an agent's sandbox, a command may not signal processes that another command started"),
+        "{err}"
+    );
+
+    signal(holder.id(), libc::SIGCONT);
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+}

@@ -81,8 +81,25 @@ pub enum Error {
         expected: i64,
     },
 
+    #[error(
+        "cannot write to the state directory {} ({detail})\n\
+         loadmaster keeps the queue that every agent on this machine shares there; in an \
+         agent's sandbox, allow writing to it (see \"Let it write the state directory\" in \
+         loadmaster's README). LOADMASTER_STATE_DIR moves it, but every agent must then use \
+         the same one",
+        dir.display()
+    )]
+    StateDirNotWritable { dir: PathBuf, detail: String },
+
     #[error("job #{0} disappeared from the queue")]
     JobVanished(JobId),
+
+    #[error("cannot stop job #{id}: {why}: {source}{}", sandbox_hint(source))]
+    CannotSignal {
+        id: JobId,
+        why: String,
+        source: io::Error,
+    },
 
     #[error("state database error: {0}")]
     Database(#[from] rusqlite::Error),
@@ -124,6 +141,15 @@ fn not_found(start: &Path, repo_root: Option<&Path>, beyond: Option<&Path>) -> S
         );
     }
     message
+}
+
+fn sandbox_hint(source: &io::Error) -> &'static str {
+    if source.kind() == io::ErrorKind::PermissionDenied {
+        "\nin an agent's sandbox, a command may not signal processes that another command \
+         started: run `loadmaster cancel` outside the sandbox, or from where the job was started"
+    } else {
+        ""
+    }
 }
 
 fn format_tasks(tasks: &[(String, u32)]) -> String {

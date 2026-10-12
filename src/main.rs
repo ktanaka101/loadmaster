@@ -193,8 +193,7 @@ fn run(args: RunArgs) -> Result<i32> {
     let checkout = fs::canonicalize(repo.dir()).unwrap_or_else(|_| repo.dir().to_owned());
 
     let signals = Signals::install().map_err(|e| Error::io("cannot install signal handlers", e))?;
-    let state_dir = open_state_dir()?;
-    let queue = Queue::open(&state_dir.join(STATE_DB_FILE))?;
+    let (state_dir, queue) = open_queue()?;
     let owner = ProcessId::current().map_err(|e| Error::io("cannot identify this process", e))?;
     let display = display_command(&task.cmd, &args.args);
     let request = JobRequest {
@@ -361,6 +360,13 @@ fn wait_turn(
         if let Some(&signal) = signals.take().first() {
             return Ok(Turn::Interrupted(signal));
         }
+        if let Some(kill) = ticket.cancel_requested()? {
+            say!(
+                "loadmaster: `{}` was canceled with `loadmaster cancel` while it waited",
+                task.name
+            );
+            return Ok(Turn::Interrupted(cancel_signal(kill)));
+        }
         match ticket.try_admit(capacity)? {
             Admission::Admitted => {
                 if last_report.is_some() {
@@ -414,6 +420,14 @@ fn run_admitted(
         record.outcome = Outcome::Interrupted;
         return Ok(128 + signal);
     }
+    if let Some(kill) = ticket.cancel_requested()? {
+        say!(
+            "loadmaster: `{}` was canceled with `loadmaster cancel`",
+            task.name
+        );
+        record.outcome = Outcome::Interrupted;
+        return Ok(128 + cancel_signal(kill));
+    }
     command
         .env(HELD_ENV, ticket.id().to_string())
         .env(WEIGHT_ENV, task.weight.to_string())
@@ -442,8 +456,25 @@ fn run_admitted(
     // wait ends and the run begins here.
     let started = Instant::now();
     record.wait_ms = millis(started.duration_since(wait_started));
-    let status =
-        runner::wait(&mut child, signals).map_err(|e| Error::io("cannot wait for the task", e))?;
+    // SIGTERM once, as for clean-up that a second one would cut short; a
+    // request to kill still goes through.
+    let mut term_sent = false;
+    let canceled = || {
+        // A failed look (a busy database) only puts it off to the next one.
+        let kill = ticket.cancel_requested().ok()??;
+        if !kill && term_sent {
+            return None;
+        }
+        term_sent |= !kill;
+        say!(
+            "loadmaster: `{}` was canceled with `loadmaster cancel`; sending it {}",
+            task.name,
+            if kill { "SIGKILL" } else { "SIGTERM" }
+        );
+        Some(cancel_signal(kill))
+    };
+    let status = runner::wait(&mut child, signals, canceled)
+        .map_err(|e| Error::io("cannot wait for the task", e))?;
     // Measured before the slot is released, which may wait for the database.
     record.run_ms = Some(millis(started.elapsed()));
     record.cpu_ms = process::children_cpu_time()
@@ -568,7 +599,7 @@ fn held(args: HeldArgs) -> Result<i32> {
 /// started from the checkout of `config`, this checkout's .loadmaster.toml;
 /// otherwise why not. Both `held` and nested runs check this.
 fn holder_here(value: &str, config: &Path) -> Result<std::result::Result<Job, String>> {
-    let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
+    let (_, queue) = open_queue()?;
     let job = match value.trim().parse::<JobId>() {
         Ok(id) => queue.holder(id)?,
         Err(_) => None,
@@ -624,7 +655,7 @@ fn spawn_failure_code(err: &io::Error) -> i32 {
 
 fn status() -> Result<i32> {
     let machine = MachineConfig::load()?;
-    let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
+    let (_, queue) = open_queue()?;
     let snapshot = queue.snapshot()?;
     let mut out = format!(
         "{}/{} in use (capacity {})\n",
@@ -805,7 +836,7 @@ fn jobs_table(jobs: &[Job]) -> String {
 }
 
 fn clean() -> Result<i32> {
-    let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
+    let (_, queue) = open_queue()?;
     let reaped = queue.reap()?;
     let mut out = String::new();
     if reaped.is_empty() {
@@ -828,9 +859,18 @@ fn clean() -> Result<i32> {
 
 /// After this long, `cancel` says which jobs are still stopping.
 const CANCEL_HINT_AFTER: Duration = Duration::from_secs(10);
+/// A job's loadmaster looks for requests every 100 ms while it waits and
+/// every 200 ms while its task runs; one that has not taken it after this
+/// long does not read them, or is stopped.
+const CANCEL_ANSWER_WITHIN: Duration = Duration::from_secs(2);
+
+/// The signal a cancel request stands for.
+fn cancel_signal(kill: bool) -> i32 {
+    if kill { libc::SIGKILL } else { libc::SIGTERM }
+}
 
 fn cancel(args: CancelArgs) -> Result<i32> {
-    let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
+    let (_, queue) = open_queue()?;
     // The job this runs in, if any: canceling it would end this command.
     let own = env::var(HELD_ENV)
         .ok()
@@ -857,53 +897,54 @@ fn cancel(args: CancelArgs) -> Result<i32> {
             .collect()
     };
     let mut out = String::new();
-    // Each job signalled, and what it was doing for how long.
+    // Each job asked to stop, and what it was doing for how long.
     let mut stopping: Vec<(Job, String)> = Vec::new();
+    // Jobs that need no more from this command: their loadmaster took the
+    // request, or they were signalled. Nothing is sent to them again.
+    let mut settled = std::collections::BTreeSet::new();
     for id in ids {
         if Some(id) == own {
             say!("loadmaster: not canceling job #{id}: this command runs in it");
             continue;
         }
-        match queue.cancel(id, args.kill)? {
-            Canceled::NotFound if args.here => {}
-            Canceled::NotFound => say!("loadmaster: job #{id} is not in the queue"),
+        let (job, signalled) = match queue.cancel(id, args.kill)? {
+            Canceled::NotFound if args.here => continue,
+            Canceled::NotFound => {
+                say!("loadmaster: job #{id} is not in the queue");
+                continue;
+            }
             Canceled::DroppedPlace(job) => {
                 out += &format!("dropped the kept place of #{id} `{}`\n", job.task);
+                continue;
             }
-            Canceled::Signaled(job) => {
-                let (what, since) = match job.state {
-                    JobState::Running => ("running", job.started_at),
-                    _ => ("waiting", Some(job.enqueued_at)),
-                };
-                let duration = since
-                    .and_then(|t| SystemTime::now().duration_since(t).ok())
-                    .map_or(String::new(), |d| format!(" for {}", format_duration(d)));
-                stopping.push((job, format!("{what}{duration}")));
-            }
+            Canceled::Requested(job) => (job, false),
+            Canceled::Signaled(job) => (job, true),
+        };
+        if signalled {
+            settled.insert(job.id);
         }
+        let (what, since) = match job.state {
+            JobState::Running => ("running", job.started_at),
+            _ => ("waiting", Some(job.enqueued_at)),
+        };
+        let duration = since
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .map_or(String::new(), |d| format!(" for {}", format_duration(d)));
+        stopping.push((job, format!("{what}{duration}")));
     }
     if stopping.is_empty() && out.is_empty() {
         print("no jobs to cancel\n");
         return Ok(0);
     }
     // Gone once its loadmaster has left the line, or its task has exited and
-    // freed the slot. A job can change as it is signalled: one that gave up
-    // waiting (exit code 75) at that moment keeps its place, which is
-    // dropped rather than left to expire, or is resumed by a re-run, whose
-    // loadmaster is then signalled too. With --kill, a waiting job's
-    // loadmaster was killed, so if the job had been admitted meanwhile its
-    // task runs on: it is killed too. (A second SIGTERM is not sent: the
-    // first one has normally been forwarded already, and the task would get
-    // it twice.)
+    // freed the slot. A job's loadmaster acts on the request; one that has
+    // not taken it in time (a version that does not read requests, or one
+    // stopped with Ctrl-Z), or that is gone, is signalled instead, if this
+    // process may. A job can change meanwhile: one that gave up waiting
+    // (exit code 75) keeps its place, which is dropped rather than left to
+    // expire, and a re-run that resumes the place takes the request on.
     let started = Instant::now();
     let mut hinted = false;
-    type Seen = (JobState, bool, bool, Option<ProcessId>);
-    let state =
-        |job: &Job| -> Seen { (job.state, job.is_orphaned(), job.child.is_some(), job.owner) };
-    let mut seen: Vec<(JobId, Seen)> = stopping
-        .iter()
-        .map(|(job, _)| (job.id, state(job)))
-        .collect();
     loop {
         let jobs = queue.snapshot()?.jobs;
         let left: Vec<&Job> = jobs
@@ -914,20 +955,35 @@ fn cancel(args: CancelArgs) -> Result<i32> {
             break;
         }
         for job in &left {
-            let Some((_, last)) = seen.iter_mut().find(|(id, _)| *id == job.id) else {
+            if job.state == JobState::Parked {
+                queue.stop(job.id, args.kill)?;
                 continue;
-            };
-            let (before, now) = (*last, state(job));
-            // A re-run that resumed the place after it parked has a new
-            // loadmaster, which got no signal yet.
-            let new_owner = now.3.is_some() && now.3 != before.3;
-            *last = now;
-            if now != before && (args.kill || new_owner || job.state == JobState::Parked) {
-                // As signalled: the job may have changed again in between
-                // (a parked place resumed), and that owner has the signal.
-                if let Canceled::Signaled(signalled) = queue.stop(job.id, args.kill)? {
-                    *last = state(&signalled);
-                }
+            }
+            if settled.contains(&job.id) {
+                continue;
+            }
+            if !queue.cancel_pending(job.id)? {
+                settled.insert(job.id);
+                continue;
+            }
+            let unanswered = job.is_orphaned() || started.elapsed() >= CANCEL_ANSWER_WITHIN;
+            if unanswered && queue.take_back_cancel(job.id)? {
+                settled.insert(job.id);
+                queue::signal_directly(job, args.kill).map_err(|source| Error::CannotSignal {
+                    id: job.id,
+                    why: match job.owner {
+                        Some(owner) if !job.is_orphaned() => format!(
+                            "its loadmaster (process {}) did not take the request, as a \
+                             version before 0.6 or a stopped one does not, and could not be \
+                             signalled",
+                            owner.pid
+                        ),
+                        _ => {
+                            "its loadmaster is gone, and its task could not be signalled".to_owned()
+                        }
+                    },
+                    source,
+                })?;
             }
         }
         if !hinted && started.elapsed() >= CANCEL_HINT_AFTER {
@@ -999,14 +1055,39 @@ fn report(args: ReportArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn open_state_dir() -> Result<PathBuf> {
+/// The state directory, created if needed, and the queue in it. Not being
+/// allowed to write there, as in an agent's sandbox, is said in so many
+/// words.
+fn open_queue() -> Result<(PathBuf, Queue)> {
     let dir = config::state_dir()?;
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|e| Error::io(format!("cannot create {}", dir.display()), e))?;
-    Ok(dir)
+    let not_writable = |detail: String| Error::StateDirNotWritable {
+        dir: dir.clone(),
+        detail,
+    };
+    if let Err(e) = DirBuilder::new().recursive(true).mode(0o700).create(&dir) {
+        return Err(match e.kind() {
+            io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem => {
+                not_writable(e.to_string())
+            }
+            _ => Error::io(format!("cannot create {}", dir.display()), e),
+        });
+    }
+    match Queue::open(&dir.join(STATE_DB_FILE)) {
+        Ok(queue) => Ok((dir, queue)),
+        Err(Error::Database(e))
+            if matches!(
+                e.sqlite_error_code(),
+                Some(
+                    rusqlite::ErrorCode::CannotOpen
+                        | rusqlite::ErrorCode::ReadOnly
+                        | rusqlite::ErrorCode::PermissionDenied
+                )
+            ) =>
+        {
+            Err(not_writable(e.to_string()))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn print(text: &str) {

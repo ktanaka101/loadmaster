@@ -194,3 +194,31 @@ fn usage_errors_exit_125() {
     assert_eq!(output.status.code(), Some(125), "args need `--`");
     assert!(sandbox.run(&["--help"]).status.success());
 }
+
+#[test]
+fn a_state_directory_it_may_not_write_is_named() {
+    // Root may write anywhere: nothing to check then.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let sandbox = Sandbox::new(4, &task("lint", 1, &["true"]));
+    let locked = sandbox.path("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+    // One it may not create, and one that exists but it may not write in.
+    for dir in [locked.join("state"), locked.clone()] {
+        let mut cmd = sandbox.cmd(&["run", "lint"]);
+        cmd.env("LOADMASTER_STATE_DIR", &dir);
+        let output = output(cmd);
+        assert_eq!(output.status.code(), Some(125));
+        let err = stderr(&output);
+        assert!(
+            err.contains(&format!(
+                "cannot write to the state directory {}",
+                dir.display()
+            )) && err.contains("in an agent's sandbox, allow writing to it"),
+            "{err}"
+        );
+    }
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+}

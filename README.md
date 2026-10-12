@@ -34,11 +34,11 @@ port a checkout has.
 | Approach | Every task has a weight (≈ CPU cores it keeps busy), the machine has a capacity, and the line is first come, first served. Tasks can also use named resources (database stacks, memory), limited per machine or per checkout; a job waiting for one doesn't hold up jobs that don't need it. |
 | Interface | A command wrapper: `loadmaster run <task> [-- args]`. No daemon or server; processes coordinate through a SQLite file. |
 | Crash safety | Places and slots of killed processes are reclaimed automatically (PID plus start time, so reused PIDs don't fool it). A task keeps its slot while it runs, even if `loadmaster` itself is killed. |
-| Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. `loadmaster held` lets scripts refuse to run outside the queue, whatever the agent. `loadmaster cancel --here` stops an agent's own checks without touching other agents' runs of the same commands. `loadmaster status` says what each job waits for, and `loadmaster check` what the config means on this machine. Ready-made Claude Code settings: instructions, timeouts, permissions, a hook that blocks direct runs. |
+| Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. `loadmaster held` lets scripts refuse to run outside the queue, whatever the agent. `loadmaster cancel --here` stops an agent's own checks without touching other agents' runs of the same commands. `loadmaster status` says what each job waits for, and `loadmaster check` what the config means on this machine. Works with any agent that runs shell commands, inside sandboxes too; ready-made settings for Claude Code and Codex: instructions, sandbox, timeouts, a hook that blocks direct runs. |
 | Measuring | `loadmaster report` shows failures, timeouts, run and wait times and the cores each task really used; a measure-only mode records a baseline to compare with. See [Checking that it helps](#checking-that-it-helps). |
 | Platforms | macOS and Linux. On Windows, WSL2 should work (it runs the Linux binary) but is not tested yet; native Windows is not supported. |
 | Integration cost | One binary, one `.loadmaster.toml` per repository, a few lines of agent instructions. Removing it means deleting those, `~/.local/state/loadmaster` and `~/.config/loadmaster`. |
-| Status | 0.5, new. Verified with tests, soak tests and real Claude Code sessions with biome, vitest and Playwright; see [Status](#status). |
+| Status | 0.5, new. Verified with tests, soak tests, and real Claude Code and Codex sessions; see [Status](#status). |
 | License | MIT or Apache-2.0 |
 
 ## Is it for you?
@@ -95,7 +95,7 @@ loadmaster is new (0.5). What has been verified:
   purpose are caught.
 - Five real Claude Code sessions (Sonnet, headless) in five git worktrees of a
   demo repository, set up as described in
-  [Using it with Claude Code](#using-it-with-claude-code), ran lint, test and
+  [Using it with AI coding tools](#using-it-with-ai-coding-tools), ran lint, test and
   e2e three times each on a 14-core Mac (capacity 8, weights 1/4/8,
   `LOADMASTER_MAX_WAIT=60`). The checks were stand-in scripts that sleep for 2,
   10 and 20 seconds. All 45 checks went through loadmaster, the 12 waits that
@@ -134,6 +134,15 @@ loadmaster is new (0.5). What has been verified:
   under load. The
   load average when jobs ended rose (median 7.5 to 15), as more ran side by
   side; its peaks came with a task that used more cores than its weight.
+- A real Codex agent (Codex CLI 0.162, `codex exec`, its workspace-write
+  sandbox with the state directory added as described in
+  [Using it with AI coding tools](#using-it-with-ai-coding-tools)), told only
+  by `AGENTS.md`, ran lint and test through loadmaster while another job held
+  the whole machine: it waited, re-ran right after exit code 75 and resumed
+  its place, and a wait of 2 minutes 24 seconds ran to the end. In the same
+  sandbox, `status`, waiting behind other agents' jobs, reclaiming dead ones
+  and `cancel` from a later command all worked, and the PreToolUse hook below
+  blocked `npx vitest run` while letting `loadmaster run lint` through.
 
 Not verified yet: weeks of real use. loadmaster only starts commands, so other
 tools should work too, but see [Limitations](#limitations) for tools that use
@@ -575,13 +584,17 @@ loadmaster held [--uses RESOURCE]
   every running, waiting or parked job, and what each waiting job waits for.
 - `cancel`: stop jobs, by ID or (`--here`) every job started from this
   checkout except the one `cancel` itself runs in, and wait until they have
-  left the queue. It sends SIGTERM to the job's `loadmaster`, so a waiting job
-  leaves the line and a running job's task gets the signal as described under
-  [Signals](#how-it-works), with the slot freed once it exits; a kept place
-  (exit code 75) is dropped. `--kill` sends SIGKILL to a running task
-  instead, for one that does not stop; it gets no chance to clean up.
-  `loadmaster report` leaves canceled checks out. Exits with 0 once the jobs
-  are gone.
+  left the queue. It leaves a request in the queue, and the job's own
+  `loadmaster` acts on it within a fraction of a second: a waiting job leaves
+  the line, and a running job's task gets SIGTERM, once, as described under
+  [Signals](#how-it-works), with the slot freed once it exits. That needs no
+  permission to signal another agent's processes, which sandboxes do not
+  give. A job whose `loadmaster` does not take the request (from a version
+  before 0.6, or stopped with Ctrl-Z) or is gone is signalled directly
+  instead, where that is allowed. A kept place (exit code 75) is dropped.
+  `--kill` asks for SIGKILL instead, for a task that does not stop; it gets
+  no chance to clean up. `loadmaster report` leaves canceled checks out.
+  Exits with 0 once the jobs are gone.
 - `check`: validate `.loadmaster.toml` and the machine config, list the tasks
   and resources with their limits on this machine, and warn about weights that
   take the whole machine or crowd out other tasks while waiting for a
@@ -683,8 +696,8 @@ requires the job to use `e2e-db`, for a script that needs that resource
 held.
 
 Tools you don't control, such as `npx vitest` run directly, still bypass the
-queue; in Claude Code, [blocking direct execution](#3-block-direct-execution)
-catches those.
+queue; [hooks in Claude Code and Codex](#4-keep-checks-in-the-queue) catch
+those.
 
 ### Where loadmaster must be installed
 
@@ -694,7 +707,7 @@ only the scripts that agents use and let CI call the tools directly, or install
 loadmaster in CI too (a prebuilt binary or mise). On a small CI runner, a
 weight above the capacity simply runs alone. An agent that sandboxes its
 commands must also be allowed to write to the state directory, or loadmaster
-fails with exit code 125 (see the sandbox setting for Claude Code below).
+fails with exit code 125 (see [the sandbox settings](#2-let-it-write-the-state-directory)).
 
 ### Switching over with existing worktrees
 
@@ -706,32 +719,101 @@ coordination mechanism, such as a lock file, keep taking that lock inside the
 new tasks' `cmd` while old worktrees remain, so that both sides still see each
 other; remove it once the last old worktree is gone.
 
-## Using it with Claude Code
+## Using it with AI coding tools
+
+loadmaster is an ordinary command, so any agent that runs shell commands can
+use it: Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot, Aider and the
+rest. What differs between tools is how you tell the agents, whether their
+sandbox lets loadmaster write its queue, how long they let a command run, and
+how they can be kept from running checks directly. The steps below cover
+each, with ready-made settings for Claude Code and Codex, which both have
+been checked with real sessions; for other tools, look for the same four
+settings.
 
 ### 1. Tell the agents
 
-In `CLAUDE.md` (or `AGENTS.md` for other agents), or point them at
-[Rules for agents running checks](#rules-for-agents-running-checks):
+Put this in the instructions file your tools read: `AGENTS.md`, which Codex
+and many other tools read, `CLAUDE.md` for Claude Code, or both. Or point the
+agents at [Rules for agents running checks](#rules-for-agents-running-checks).
 
 ```markdown
 Run lint, tests and e2e only through loadmaster: `loadmaster run lint`,
-`loadmaster run test`, `loadmaster run e2e`. To run part of the suite, pass
-arguments after `--`, e.g. `loadmaster run test -- src/parser.test.ts`.
-Run each `loadmaster` command on its own, without chaining other commands to
-it; its exit code is the check's exit code.
-If it exits with code 75, run exactly the same command again: your place in
-line is kept.
+`loadmaster run test`, `loadmaster run e2e` (the tasks are in
+`.loadmaster.toml`). To run part of the suite, pass arguments after `--`,
+e.g. `loadmaster run test -- src/parser.test.ts`.
+- Run each `loadmaster` command on its own, without chaining other commands
+  to it; its exit code is the check's exit code.
+- Waiting is normal: `loadmaster: waiting to run ...` on stderr means other
+  agents are using the machine. Don't stop the command.
+- If it exits with code 75 (`loadmaster: gave up waiting`), run exactly the
+  same command again, right away: your place in line is kept.
+- To stop your own checks, use `loadmaster cancel --here`, never `pkill`.
 ```
 
 The "on its own" line matters: agents like to append `; echo "exit=$?"`, and
-a chained command no longer matches an allow rule such as
+a chained command no longer matches allow rules such as Claude Code's
 `Bash(loadmaster run *)`, so it stops for approval.
 
-### 2. Make room for the wait
+### 2. Let it write the state directory
 
-The Bash tool's timeout includes the time spent waiting in line. Raise it in
-`~/.claude/settings.json`, and set `LOADMASTER_MAX_WAIT` below it, so that
-loadmaster gives up first (keeping the place) instead of being killed:
+Tools that run commands in a sandbox (Codex by default, Claude Code when its
+sandbox is on, and others) must let them write to loadmaster's state
+directory, `~/.local/state/loadmaster` (or `$XDG_STATE_HOME/loadmaster`, or
+`LOADMASTER_STATE_DIR`). Until they may, every `loadmaster` command fails with
+exit code 125 and says that it cannot write there. Nothing else needs to be
+allowed: inside such a sandbox, loadmaster still sees and reclaims the jobs of
+other agents, and `loadmaster cancel` works although the sandbox does not let
+one command signal processes that another started (it leaves a request in the
+queue that the job's own `loadmaster` acts on).
+
+All agents must share one state directory. An agent in a container or a VM
+with its own home directory is not coordinated with the others unless the
+directory is shared with it.
+
+Claude Code, in `~/.claude/settings.json`:
+
+```json
+{
+  "sandbox": {
+    "filesystem": {
+      "allowWrite": ["~/.local/state/loadmaster"]
+    }
+  }
+}
+```
+
+Codex, in `~/.codex/config.toml`, with the absolute path of your home
+directory:
+
+```toml
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+writable_roots = ["/Users/you/.local/state/loadmaster"]
+```
+
+With Codex's newer permission profiles instead (configure one or the other,
+not both: a `sandbox_mode` anywhere makes Codex ignore profiles):
+
+```toml
+default_permissions = "loadmaster"
+
+[permissions.loadmaster]
+extends = ":workspace"
+
+[permissions.loadmaster.filesystem]
+"~/.local/state/loadmaster" = "write"
+```
+
+### 3. Make room for the wait
+
+A command that waits in line takes longer than the check alone. If a tool
+kills commands after a fixed time, raise that limit, and set
+`LOADMASTER_MAX_WAIT` below it, so that loadmaster gives up first (with exit
+code 75, keeping the place) instead of being killed.
+
+Claude Code's Bash tool timeout includes the time spent waiting. In
+`~/.claude/settings.json`:
 
 ```json
 {
@@ -746,10 +828,22 @@ loadmaster gives up first (keeping the place) instead of being killed:
 Here a call can wait up to 10 minutes and still leave 20 minutes for the task
 itself under the default 30-minute timeout.
 
-### 3. Block direct execution
+Codex keeps a long command running while the agent waits for it: in Codex
+0.162, a `loadmaster run` that waited 2 minutes 24 seconds in line ran to the
+end. Set `LOADMASTER_MAX_WAIT` in the environment Codex starts from if an
+agent should get control back sooner; agents re-run on exit code 75 as told
+in step 1.
 
-Deny the direct commands and allow loadmaster, in `.claude/settings.json` or
-`~/.claude/settings.json`:
+### 4. Keep checks in the queue
+
+Instructions are not enough: agents also run the tools directly. The most
+reliable fix works for every tool: [route the repository's own entry points
+through loadmaster](#routing-existing-commands-through-loadmaster), and
+[guard the scripts](#guarding-a-script) that must not run outside it. Tools
+can also block direct runs themselves.
+
+Claude Code: deny the direct commands and allow loadmaster, in
+`.claude/settings.json` or `~/.claude/settings.json`:
 
 ```json
 {
@@ -764,20 +858,6 @@ Deny the direct commands and allow loadmaster, in `.claude/settings.json` or
 }
 ```
 
-If Claude Code runs Bash commands in its sandbox, `loadmaster` fails with exit
-code 125 ("cannot create ...: Operation not permitted") until the sandbox may
-write to the state directory. Allow it in `~/.claude/settings.json`:
-
-```json
-{
-  "sandbox": {
-    "filesystem": {
-      "allowWrite": ["~/.local/state/loadmaster"]
-    }
-  }
-}
-```
-
 Claude Code ignores `permissions.allow` in a project's `.claude/settings.json`
 until that workspace is trusted, and every git worktree is a workspace of its
 own: open each worktree interactively once and accept the trust dialog (for
@@ -785,20 +865,22 @@ headless `claude -p` runs, `--allowedTools` works regardless).
 
 Deny rules also match commands inside `&&` chains and subshells, but they match
 text: `npm test`, `npx -y vitest` or `./node_modules/.bin/vitest` still get
-through. A PreToolUse hook catches those too. Save this as
-`.claude/hooks/require-loadmaster.sh` in the repository and make it executable
-(it needs `jq`):
+through. A PreToolUse hook catches those too, and the same script works in
+Claude Code and Codex, which both pass the command to it as
+`tool_input.command` and block the call on exit code 2. Save it in the
+repository (as `.claude/hooks/require-loadmaster.sh`, or
+`.codex/hooks/require-loadmaster.sh`) and make it executable; it needs `jq`:
 
 ```bash
 #!/usr/bin/env bash
-# Claude Code PreToolUse hook: blocks lint/test/e2e commands that bypass loadmaster.
+# PreToolUse hook for Claude Code and Codex: blocks lint/test/e2e commands that bypass loadmaster.
 cmd=$(jq -r '.tool_input.command // empty')
 
 # Commands that must go through loadmaster. Adjust to your project.
 block='(^|[^[:alnum:]_.-])(vitest|playwright|biome|jest)([^[:alnum:]_./-]|$)'
 block+='|(^|[^[:alnum:]_.-])(npm|pnpm|yarn|bun)( run)? (test|lint|e2e)([^[:alnum:]_:-]|$)'
 # A single loadmaster command, with nothing chained to it.
-allow='^loadmaster (run|status|clean)( |$)'
+allow='^loadmaster (run|status|cancel|check|clean)( |$)'
 chain='[;&|`]|[$][(]|[[:cntrl:]]'
 
 if [[ $cmd =~ $block ]] && ! { [[ $cmd =~ $allow ]] && ! [[ $cmd =~ $chain ]]; }; then
@@ -808,7 +890,7 @@ fi
 exit 0
 ```
 
-and register it in `.claude/settings.json`:
+Register it for Claude Code in `.claude/settings.json`:
 
 ```json
 {
@@ -825,14 +907,30 @@ and register it in `.claude/settings.json`:
 }
 ```
 
-Exit code 2 blocks the call and shows the message to Claude. The hook blocks
-`npm test`, `cd x && npx vitest` and `loadmaster run test && npx vitest`, and
-allows a plain `loadmaster run test`. Its patterns are plain text matches, so
-adjust them to your scripts: as written, they miss `npm run test:unit`, and
-they also block harmless commands such as `grep vitest`. If your package
-scripts already go through loadmaster, drop the second `block` line. Without
-`jq` the hook lets everything through. Like permission rules, it is a
-guardrail against accidents, not a security boundary.
+and for Codex in `.codex/config.toml`:
+
+```toml
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.codex/hooks/require-loadmaster.sh"'
+timeout = 30
+```
+
+Codex loads a project's `.codex/config.toml` only once the project is trusted,
+and runs a hook only after you have reviewed and trusted it with `/hooks`
+(again after each change to it).
+
+Exit code 2 blocks the call and shows the message to the agent. The hook
+blocks `npm test`, `cd x && npx vitest` and `loadmaster run test && npx
+vitest`, and allows a plain `loadmaster run test`. Its patterns are plain text
+matches, so adjust them to your scripts: as written, they miss `npm run
+test:unit`, and they also block harmless commands such as `grep vitest`. If
+your package scripts already go through loadmaster, drop the second `block`
+line. Without `jq` the hook lets everything through. Like permission rules,
+it is a guardrail against accidents, not a security boundary.
 
 ## Checking that it helps
 

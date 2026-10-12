@@ -199,7 +199,9 @@ up to the busy timeout; everything else relies on SQLite's busy handler.
 The schema version lives in `PRAGMA user_version`. A database from an older
 version is upgraded in place (version 1 gains each job's capacity and mode);
 an older `loadmaster` refuses a newer database with an error instead of
-guessing.
+guessing. The version only changes for a change that older versions cannot
+work with: a table that they never read, such as the one for cancel
+requests, is added without one, so they keep sharing the database.
 
 ## Job IDs are never reused
 
@@ -319,27 +321,40 @@ matching command lines stopped other agents' checks too. `loadmaster cancel`
 stops jobs by ID, or every job of the caller's checkout (`--here`), the unit
 that one agent works in.
 
-- It signals the job's own `loadmaster` (checked by PID and start time) with
-  SIGTERM, so nothing new happens: a waiting job leaves the line, and a
-  running one forwards the signal to its task and frees the slot once the
-  task has exited, as with any SIGTERM. A task whose `loadmaster` is gone is
-  signalled directly. A parked place is deleted.
+- It does not signal the job. Agents' sandboxes (Codex's on macOS, measured)
+  let a command signal only processes it started itself, and each command
+  gets a sandbox of its own, so an agent could not cancel the checks it had
+  started a command earlier. Instead `cancel` leaves a request in the queue
+  database, and the job's own `loadmaster` acts on it: it looks every 100 ms
+  while waiting and every 200 ms while its task runs. A waiting job then
+  leaves the line, and a running one sends its task SIGTERM, or SIGKILL with
+  `--kill`, as for any signal it forwards, and frees the slot once the task
+  has exited. Its task is its own child, so that is allowed in any sandbox.
+  A parked place is deleted.
+- The requests live in a table that older versions never read, added
+  without a new schema version: they would refuse a database with a newer
+  one, and different branches run different versions on one machine. A job
+  of an older `loadmaster` does not take its request, so after 2 seconds
+  `cancel` takes the request back and signals the job instead, where that is
+  allowed (checked by PID and start time). Taking a request and taking it
+  back are each one delete in a write transaction, so exactly one of them
+  wins, and the job is never told twice. The same fallback reaches a
+  `loadmaster` stopped with Ctrl-Z, which acts on nothing, not even on its
+  task exiting, so it is also sent SIGCONT. Where the fallback is not allowed
+  either, `cancel` says why and how to stop the job instead. A task whose
+  `loadmaster` is gone is signalled directly, which a sandbox may not allow.
+- A job's `loadmaster` sends its task SIGTERM for a cancel at most once: a
+  second one would cut short the clean-up the first started (as in a
+  handler registered with `process.once`). A later `--kill` still goes
+  through, and a SIGTERM request does not undo a pending SIGKILL one.
 - It waits until the jobs have left the queue, so the caller knows the slot
   is free, and says after 10 seconds which ones are still stopping. It never
   escalates to SIGKILL by itself: a task that takes long to stop is usually
   cleaning up (an e2e environment, say), and cutting that short leaves the
-  next run a mess. `--kill` sends SIGKILL to the running task when asked.
+  next run a mess.
 - A job can change while it is canceled. One that gave up waiting at that
-  moment parks: its place is dropped, also when its `loadmaster` has already
-  exited and the signal finds nobody. If a re-run resumes the place first,
-  its new `loadmaster` gets the signal, which it has not had yet. With `--kill`, a waiting job's
-  `loadmaster` is killed; if the job was admitted in between, its task runs
-  on without it, so `cancel` kills the task too once it sees the change. A
-  SIGTERM is not sent twice, since the first is normally forwarded already
-  and the task would get it twice; the 10-second note covers the rest.
-- A `loadmaster` stopped with Ctrl-Z acts on nothing, not even on its task
-  exiting, so it is sent SIGCONT after the signal, and also when its task
-  has already ended and only the slot is left to free.
+  moment parks: its place is dropped. If a re-run resumes the place first,
+  its new `loadmaster` finds the request and acts on it.
 - A PID is checked by its start time right before the signal, as when a
   signal is forwarded to a task's group: a PID the OS hands out again within
   that instant would get it. macOS has no pidfd to close that gap, and the
@@ -349,12 +364,9 @@ that one agent works in.
   Agents sharing one checkout cancel by ID instead.
 - The command logs a `canceled` record for each job besides the run's own
   record, as the reaper does for `lost` jobs, and the report leaves those
-  checks out: a cancel says nothing about the machine. Marking the job in the
-  database instead would need a new schema version, which older `loadmaster`
-  versions refuse; different branches run different versions on one
-  machine, so the database format is kept for as long as it can be. The
-  report matches the record to the run by job ID, task and directory, and by
-  when the job got in line (IDs start over if the database is deleted).
+  checks out: a cancel says nothing about the machine. The report matches the
+  record to the run by job ID, task and directory, and by when the job got in
+  line (IDs start over if the database is deleted).
 
 ## Load outside the queue
 
@@ -450,6 +462,29 @@ not every agent has them.
   by the terms its holder recorded, not by the machine config.
 - The state directory is created with mode 0700: it holds command lines and
   paths.
+
+## Agent sandboxes
+
+Many agents run each command in a sandbox. In Codex's workspace-write
+sandbox on macOS (measured with `codex sandbox` and real `codex exec`
+sessions):
+
+- Writes outside the workspace and the temp directories are denied, so the
+  state directory has to be added as a writable root. Until it is, every
+  command fails with exit code 125, and the error names the state directory
+  and the sandbox rather than SQLite's "unable to open database file": the
+  person who reads it has to change the agent's settings, not loadmaster's.
+- Reading other processes' start times and listing process groups work, so
+  a sandboxed `loadmaster` sees jobs started outside its sandbox, waits
+  behind them and reclaims them once they are dead.
+- Signals reach only processes in the same sandbox, and each command gets a
+  sandbox of its own, which is why `cancel` goes through requests (see
+  [Canceling jobs](#canceling-jobs)). Forwarding a signal to a job's own task
+  stays within one sandbox.
+
+All agents must share one state directory, so an agent in a container or VM
+with its own home is only coordinated with the others if the directory is
+shared with it.
 
 ## Polling
 

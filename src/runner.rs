@@ -214,9 +214,19 @@ fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(pipe)
 }
 
+/// How often a running task's loadmaster looks for a request from
+/// `loadmaster cancel`, in polls of the task.
+const CANCEL_CHECK_EVERY: u32 = 10;
+
 /// Waits for the task's leader to exit, forwarding intercepted signals to the
-/// whole process group in the meantime.
-pub fn wait(task: &mut Task, signals: &Signals) -> io::Result<ExitStatus> {
+/// whole process group in the meantime, and the signal `canceled` asks for,
+/// which it is asked every few polls.
+pub fn wait(
+    task: &mut Task,
+    signals: &Signals,
+    mut canceled: impl FnMut() -> Option<i32>,
+) -> io::Result<ExitStatus> {
+    let mut polls = 0u32;
     loop {
         let exited = task.child.try_wait()?;
         // Forward even if the leader just exited: others in its group may
@@ -224,6 +234,14 @@ pub fn wait(task: &mut Task, signals: &Signals) -> io::Result<ExitStatus> {
         forward_pending(&task.group, signals);
         if let Some(status) = exited {
             return Ok(status);
+        }
+        polls = polls.wrapping_add(1);
+        if polls.is_multiple_of(CANCEL_CHECK_EVERY)
+            && let Some(signal) = canceled()
+            && task.group.is_alive()
+        {
+            let _ = task.group.signal(signal);
+            let _ = task.group.signal(libc::SIGCONT);
         }
         thread::sleep(CHILD_POLL_INTERVAL);
     }

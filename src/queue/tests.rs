@@ -513,6 +513,62 @@ fn migrates_a_version_2_database() {
 }
 
 #[test]
+fn a_version_3_database_gains_cancel_requests_without_a_new_version() {
+    // As an older loadmaster leaves it, with a request it never deleted.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(STATE_DB_FILE);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        for migration in MIGRATIONS {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 3").unwrap();
+    }
+    let queue = Queue::open(&path).unwrap();
+    let version: i64 = queue
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 3, "older versions must still open it");
+    queue
+        .conn
+        .execute("INSERT INTO cancel_requests (job, kill) VALUES (99, 0)", [])
+        .unwrap();
+    queue.reap().unwrap();
+    assert!(
+        !queue.cancel_pending(99).unwrap(),
+        "a request without its job is dropped"
+    );
+}
+
+#[test]
+fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
+    let f = fixture();
+    let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
+    assert_eq!(ticket.cancel_requested().unwrap(), None);
+    assert!(matches!(
+        f.queue.stop(ticket.id(), false).unwrap(),
+        Canceled::Requested(_)
+    ));
+    // A SIGKILL request is not turned back into a SIGTERM one.
+    f.queue.stop(ticket.id(), true).unwrap();
+    f.queue.stop(ticket.id(), false).unwrap();
+    assert_eq!(ticket.cancel_requested().unwrap(), Some(true));
+    assert_eq!(ticket.cancel_requested().unwrap(), None, "taken once");
+
+    f.queue.stop(ticket.id(), false).unwrap();
+    assert!(f.queue.take_back_cancel(ticket.id()).unwrap());
+    assert_eq!(ticket.cancel_requested().unwrap(), None, "taken back");
+    assert!(!f.queue.take_back_cancel(ticket.id()).unwrap());
+
+    f.queue.stop(ticket.id(), false).unwrap();
+    let id = ticket.id();
+    drop(ticket);
+    assert!(!f.queue.cancel_pending(id).unwrap(), "gone with its job");
+}
+
+#[test]
 fn refuses_a_newer_database() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(STATE_DB_FILE);
