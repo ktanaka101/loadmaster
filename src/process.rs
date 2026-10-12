@@ -41,6 +41,23 @@ impl ProcessId {
             Err(_) => true,
         }
     }
+
+    /// Sends `signal` to this exact process. `Ok(false)` if it is gone, so a
+    /// PID the OS has since given to another process is never hit (but for
+    /// a reuse within the instant between the check and the signal).
+    pub fn signal(&self, signal: i32) -> io::Result<bool> {
+        if start_time(self.pid)? != Some(self.start_time) {
+            return Ok(false);
+        }
+        // SAFETY: kill has no memory-safety preconditions.
+        if unsafe { libc::kill(self.pid as libc::pid_t, signal) } == 0 {
+            return Ok(true);
+        }
+        match io::Error::last_os_error() {
+            e if e.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+            e => Err(e),
+        }
+    }
 }
 
 /// A child process group, identified by its leader.
@@ -374,6 +391,15 @@ fn read_stat(pid: u32) -> io::Result<Option<Stat>> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("loadmaster supports macOS and Linux only");
+
+/// The CPUs online in the whole system, which is what the load average is
+/// measured against (`available_parallelism` counts only those this process
+/// may use, which a container can limit).
+pub fn online_cpus() -> Option<usize> {
+    // SAFETY: sysconf has no memory-safety preconditions.
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    usize::try_from(n).ok().filter(|&n| n > 0)
+}
 
 /// The system's 1-minute load average, if the OS reports one.
 pub fn load_average() -> Option<f64> {

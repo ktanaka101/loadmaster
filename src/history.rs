@@ -3,7 +3,9 @@
 //!
 //! Each `loadmaster run` that got in line appends one record when it finishes
 //! (or gives up). If it is killed first, whoever reaps its job appends one
-//! with outcome `lost`. Nested runs never queue and are not logged.
+//! with outcome `lost`. `loadmaster cancel` appends one with outcome
+//! `canceled` for each job it stops. Nested runs never queue and are not
+//! logged.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -33,6 +35,9 @@ pub enum Outcome {
     /// loadmaster was killed (SIGKILL, say) before it could log the result;
     /// written by the process that later reclaimed the job.
     Lost,
+    /// Stopped with `loadmaster cancel`, which writes this record besides
+    /// the one the run itself writes.
+    Canceled,
 }
 
 #[derive(Debug, Clone, Serialize)]

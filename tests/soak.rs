@@ -1,6 +1,7 @@
 //! Soak test: several simulated agents drive loadmaster the way Claude Code's
 //! Bash tool does, for a while, with timeouts, kills and crashes, in two
-//! checkouts and with two resources besides CPU.
+//! checkouts and with two resources besides CPU, while jobs are canceled at
+//! random.
 //!
 //! Ignored by default. Run it with:
 //!
@@ -46,6 +47,7 @@ struct Stats {
     gave_up: AtomicUsize,
     timed_out: AtomicUsize,
     crashed: AtomicUsize,
+    canceled: AtomicUsize,
 }
 
 #[test]
@@ -109,9 +111,14 @@ fn agents_under_timeouts_and_crashes() {
             thread::spawn(move || agent(&sandbox, &stats, i as u64 + 1, until))
         })
         .collect();
+    let canceler = {
+        let (sandbox, stats) = (Arc::clone(&sandbox), Arc::clone(&stats));
+        thread::spawn(move || canceler(&sandbox, &stats, until))
+    };
     for agent in agents {
         agent.join().unwrap();
     }
+    canceler.join().unwrap();
 
     // Orphaned tasks (their loadmaster was killed) finish on their own; then
     // nothing may be left holding capacity.
@@ -133,14 +140,15 @@ fn agents_under_timeouts_and_crashes() {
         .map(|((name, ..), ok)| format!("{name} {}", ok.load(Ordering::SeqCst)))
         .collect();
     println!(
-        "soak: {secs}s, {} runs: {} ok ({}), {} gave up (resumed), {} timed out, {} crashed; \
-         {} history lines",
+        "soak: {secs}s, {} runs: {} ok ({}), {} gave up (resumed), {} timed out, {} crashed, \
+         {} canceled; {} history lines",
         stats.runs.load(Ordering::SeqCst),
         stats.ok.load(Ordering::SeqCst),
         ok_by_task.join(", "),
         stats.gave_up.load(Ordering::SeqCst),
         stats.timed_out.load(Ordering::SeqCst),
         stats.crashed.load(Ordering::SeqCst),
+        stats.canceled.load(Ordering::SeqCst),
         history.lines().count(),
     );
     assert!(excess.is_empty(), "capacity exceeded: {excess}");
@@ -154,8 +162,12 @@ fn agents_under_timeouts_and_crashes() {
     }
     // Every run that got in line is logged once, by itself or, if it was
     // killed, by whoever reaped its job. Only a crash can come before getting
-    // in line.
-    let (lines, runs) = (history.lines().count(), stats.runs.load(Ordering::SeqCst));
+    // in line. `cancel` adds records of its own.
+    let lines = history
+        .lines()
+        .filter(|line| !line.contains(r#""outcome":"canceled""#))
+        .count();
+    let runs = stats.runs.load(Ordering::SeqCst);
     let crashed = stats.crashed.load(Ordering::SeqCst);
     assert!(
         lines <= runs && lines + crashed >= runs,
@@ -198,6 +210,39 @@ fn agent(sandbox: &Sandbox, stats: &Stats, seed: u64, until: Instant) {
             }
             break;
         }
+    }
+}
+
+/// Cancels jobs now and then, as agents stopping their own checks do: those
+/// of a checkout, or one job, sometimes with SIGKILL. Every cancel must
+/// return once its jobs are gone.
+fn canceler(sandbox: &Sandbox, stats: &Stats, until: Instant) {
+    let mut rng = Rng(0xC0FF_EE00_DEAD_BEEF);
+    while Instant::now() < until {
+        thread::sleep(Duration::from_millis(500 + rng.below(2000)));
+        let checkout = sandbox
+            .root
+            .path()
+            .join(CHECKOUTS[rng.below(CHECKOUTS.len() as u64) as usize]);
+        let jobs = sandbox.snapshot().jobs;
+        let mut args: Vec<String> = match rng.below(3) {
+            0 => vec!["--here".into()],
+            _ if jobs.is_empty() => continue,
+            _ => vec![jobs[rng.below(jobs.len() as u64) as usize].id.to_string()],
+        };
+        if rng.below(4) == 0 {
+            args.insert(0, "--kill".into());
+        }
+        let mut cmd = sandbox.cmd(&["cancel"]);
+        cmd.args(&args).current_dir(&checkout);
+        let output = output(cmd);
+        assert!(
+            output.status.success(),
+            "cancel {args:?}: {}",
+            stderr(&output)
+        );
+        let canceled = stdout(&output).matches("canceled #").count();
+        stats.canceled.fetch_add(canceled, Ordering::SeqCst);
     }
 }
 

@@ -25,6 +25,14 @@ pub enum Error {
     InvalidConfig { path: PathBuf, message: String },
 
     #[error(
+        "{} needs loadmaster {required} or newer (its `min_version`), but this is {}: \
+         upgrade loadmaster",
+        path.display(),
+        crate::config::VERSION
+    )]
+    VersionTooOld { path: PathBuf, required: String },
+
+    #[error(
         "unknown task `{name}` in {}\navailable tasks: {}",
         path.display(),
         format_tasks(available)

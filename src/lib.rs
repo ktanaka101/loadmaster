@@ -3,6 +3,7 @@
 //! The core (configuration, queue, process tracking, task supervision) lives
 //! in this library; the `loadmaster` binary is a thin CLI on top of it.
 
+pub mod check;
 pub mod config;
 pub mod error;
 pub mod history;

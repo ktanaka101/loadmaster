@@ -30,11 +30,17 @@ fn request<'a>(task: &'a str, weight: u32, args: &'a [String]) -> JobRequest<'a>
     }
 }
 
-fn waiting(ahead: u32, used: u64) -> Admission {
-    Admission::Waiting {
-        ahead,
-        used,
-        waiting_for: vec![],
+/// What the rule says about a job, as `status` words it.
+fn said(admission: Admission) -> String {
+    match admission {
+        Admission::Admitted => "admitted".to_owned(),
+        Admission::Waiting(wait) => {
+            let mut text = format!("{} ahead; waits for {}", wait.ahead, wait.waits_for());
+            if let Some(reserved) = wait.reserves_text() {
+                text += &format!("; sets aside {reserved}");
+            }
+            text
+        }
     }
 }
 
@@ -62,7 +68,10 @@ fn admits_jobs_up_to_capacity() {
     let c = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
     assert_eq!(a.try_admit(8).unwrap(), Admission::Admitted);
     assert_eq!(b.try_admit(8).unwrap(), Admission::Admitted);
-    assert_eq!(c.try_admit(8).unwrap(), waiting(0, 8));
+    assert_eq!(
+        said(c.try_admit(8).unwrap()),
+        "0 ahead; waits for 1 core (8 of 8 in use)"
+    );
     drop(a);
     assert_eq!(c.try_admit(8).unwrap(), Admission::Admitted);
     assert_eq!(f.queue.snapshot().unwrap().used(), 5);
@@ -76,11 +85,20 @@ fn small_jobs_never_overtake_the_head() {
     let big = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
     let small = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
     // The small job would fit, but the big one is ahead of it.
-    assert_eq!(small.try_admit(8).unwrap(), waiting(1, 4));
-    assert_eq!(big.try_admit(8).unwrap(), waiting(0, 4));
+    assert_eq!(
+        said(small.try_admit(8).unwrap()),
+        "1 ahead; waits for 1 core (behind #2 `e2e`, which waits for them too)"
+    );
+    assert_eq!(
+        said(big.try_admit(8).unwrap()),
+        "0 ahead; waits for all 8 cores (4 in use)"
+    );
     drop(running);
     assert_eq!(big.try_admit(8).unwrap(), Admission::Admitted);
-    assert_eq!(small.try_admit(8).unwrap(), waiting(0, 8));
+    assert_eq!(
+        said(small.try_admit(8).unwrap()),
+        "0 ahead; waits for 1 core (8 of 8 in use)"
+    );
 }
 
 #[test]
@@ -208,7 +226,10 @@ fn parked_job_keeps_its_place_and_can_be_resumed() {
     assert_eq!(resumed.id(), first_id);
     drop(running);
     assert_eq!(resumed.try_admit(4).unwrap(), Admission::Admitted);
-    assert_eq!(later.try_admit(4).unwrap(), waiting(0, 4));
+    assert_eq!(
+        said(later.try_admit(4).unwrap()),
+        "0 ahead; waits for all 4 cores (4 in use)"
+    );
 }
 
 #[test]
@@ -246,7 +267,10 @@ fn parked_head_blocks_until_it_expires() {
     let parked_id = parked.id();
     parked.park().unwrap();
     let next = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
-    assert_eq!(next.try_admit(8).unwrap(), waiting(1, 0));
+    assert_eq!(
+        said(next.try_admit(8).unwrap()),
+        "1 ahead; waits for 1 core (8 free, but 8 set aside for #1 `e2e`)"
+    );
     let expired = unix_ms(SystemTime::now() - PARK_TTL - Duration::from_secs(1));
     f.queue
         .conn
@@ -591,15 +615,41 @@ fn a_job_short_of_a_resource_holds_back_only_that_resource() {
         job(5, Waiting, 2, vec![db(1)], "/d"),
     ];
     assert_eq!(
-        decide(&jobs, 3, 8).unwrap(),
-        Admission::Waiting {
-            ahead: 0,
-            used: 4,
-            waiting_for: vec!["db".into()]
-        }
+        said(decide(&jobs, 3, 8).unwrap()),
+        "0 ahead; waits for `db` (2 of 2 in use by #1 `job1` and #2 `job2`); \
+         sets aside 2 cores and `db` in its checkout"
     );
     assert!(admitted(&jobs, 4), "a lint needs no db");
     assert!(!admitted(&jobs, 5), "job 3 is first in line for a db");
+}
+
+#[test]
+fn a_job_waiting_for_a_resource_says_what_it_sets_aside() {
+    // A long UI capture holds the one browser; a unit run that needs it too
+    // sets its cores aside while it waits, and a lint no longer fits.
+    let browser = |amount| Use {
+        name: "browser".into(),
+        amount,
+        capacity: Some(1),
+        per_checkout: None,
+    };
+    let mut jobs = vec![
+        job(1, Running, 5, vec![browser(1)], "/a"),
+        job(2, Waiting, 2, vec![browser(1)], "/b"),
+        job(3, Waiting, 2, vec![], "/c"),
+    ];
+    jobs[0].task = "ui".into();
+    jobs[1].task = "unit".into();
+    jobs[2].task = "lint".into();
+    let said_for = |id| said(decide(&jobs, id, 8).unwrap());
+    assert_eq!(
+        said_for(2),
+        "0 ahead; waits for `browser` (1 of 1 in use by #1 `ui`); sets aside 2 cores"
+    );
+    assert_eq!(
+        said_for(3),
+        "1 ahead; waits for 2 cores (3 free, but 2 set aside for #2 `unit`)"
+    );
 }
 
 #[test]
@@ -640,12 +690,9 @@ fn per_checkout_limits_count_only_their_checkout() {
         job(3, Waiting, 2, vec![db(1)], "/b"),
     ];
     assert_eq!(
-        decide(&same_checkout, 2, 8).unwrap(),
-        Admission::Waiting {
-            ahead: 0,
-            used: 2,
-            waiting_for: vec!["db".into()]
-        }
+        said(decide(&same_checkout, 2, 8).unwrap()),
+        "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
+         sets aside 2 cores and `db`"
     );
     // Job 2 still sets aside a machine-wide db: the rule cannot know that
     // job 1 will free both, and it never risks delaying a job ahead.
@@ -755,6 +802,7 @@ fn simulate(arrivals: &[Arrival], reverse: bool) -> Vec<u32> {
             started[id as usize - 1] = Some(t);
         }
         assert_within_limits(&jobs);
+        assert_explained(&jobs);
         if started.iter().all(Option::is_some) && jobs.is_empty() {
             return started.into_iter().map(Option::unwrap).collect();
         }
@@ -773,6 +821,23 @@ fn assert_within_limits(jobs: &[Job]) {
     }
     for (dim, used) in used {
         assert!(used <= limits[&dim], "{dim:?}: {used} > {}", limits[&dim]);
+    }
+}
+
+/// Once no job can start, `explain` says so for every job, giving reasons,
+/// and agrees with the rule as each job applies it.
+fn assert_explained(jobs: &[Job]) {
+    let explained = explain(jobs, 8);
+    assert_eq!(
+        explained.len(),
+        jobs.iter().filter(|j| j.state != Running).count()
+    );
+    for (id, admission) in explained {
+        assert_eq!(admission, decide(jobs, id, 8).unwrap());
+        match admission {
+            Admission::Admitted => panic!("job {id} could start but did not"),
+            Admission::Waiting(wait) => assert!(!wait.short.is_empty(), "job {id}"),
+        }
     }
 }
 

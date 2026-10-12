@@ -75,6 +75,13 @@ group would not be re-sent. On macOS, though, a terminal-generated SIGINT and a
 task lives in its own group, it does not receive terminal signals directly
 anyway, so forwarding delivers each signal once in the common cases.
 
+Every process in the task's group gets the signal, as every process in a
+terminal's foreground group gets Ctrl-C. Tools are written for that, and the
+group, not one process, is what has to stop. A wrapper that also forwards
+signals to its child (one that reads an env file and starts the real tool,
+say) makes the child get each signal twice, as it would in a terminal; the
+README says so, and that the wrapper should `exec` the child.
+
 Signals that were already ignored when `loadmaster` started (SIGHUP under
 `nohup`, SIGINT in a background job of a non-interactive script) are left
 ignored, and the task inherits that. SIGCHLD is reset to its default action,
@@ -274,6 +281,72 @@ every limit from inside the tasks.
 A nested run takes no part in admission: it has to fit in its holder's
 slot (see [Nested runs](#nested-runs)).
 
+## Why a job waits
+
+The first real user could not tell from `status` why jobs waited: a unit run
+waiting for the browser that a long UI capture held set its cores aside, and
+every check behind it stopped. That only showed in a separate experiment. So
+the admission rule explains its own decision, rather than a second piece of
+code guessing at it: for each dimension a job does not fit, it says whether
+running jobs use too much of it (naming the ones that hold a resource),
+whether it would fit but is set aside for jobs ahead (naming them), or
+whether a job ahead waits for it too (naming the first). It also lists what
+the waiting job sets aside meanwhile, which is the cost it puts on the jobs
+behind it. `status` shows this for every waiting job and the waiting
+messages for their own; both use the same words. The simulation checks, at
+every step, that the explanation agrees with the decision each job gets and
+that every waiting job has a reason.
+
+A simulator that runs a made-up list of jobs (task, arrival, duration)
+through the rule was asked for too, to try weights without touching the real
+queue. Made-up durations and core use are exactly what goes wrong with
+weights, though, so it would answer confidently from the wrong inputs. The
+explanations above, the warnings of `loadmaster check` and the report's
+measured cores cover most of the need; replaying the recorded history against
+other settings would answer the rest from real inputs, and is the form to
+build if it is needed.
+
+## Canceling jobs
+
+Agents on one machine run the same commands, so stopping one's own checks by
+matching command lines stopped other agents' checks too. `loadmaster cancel`
+stops jobs by ID, or every job of the caller's checkout (`--here`), the unit
+that one agent works in.
+
+- It signals the job's own `loadmaster` (checked by PID and start time) with
+  SIGTERM, so nothing new happens: a waiting job leaves the line, and a
+  running one forwards the signal to its task and frees the slot once the
+  task has exited, as with any SIGTERM. A task whose `loadmaster` is gone is
+  signalled directly. A parked place is deleted.
+- It waits until the jobs have left the queue, so the caller knows the slot
+  is free, and says after 10 seconds which ones are still stopping. It never
+  escalates to SIGKILL by itself: a task that takes long to stop is usually
+  cleaning up (an e2e environment, say), and cutting that short leaves the
+  next run a mess. `--kill` sends SIGKILL to the running task when asked.
+- `--here` leaves out the job it runs in (`LOADMASTER_HELD`), so a script
+  inside a task can clear the rest of its checkout without ending itself.
+- The command logs a `canceled` record for each job besides the run's own
+  record, as the reaper does for `lost` jobs, and the report leaves those
+  checks out: a cancel says nothing about the machine. Marking the job in the
+  database instead would need a new schema version, which older `loadmaster`
+  versions refuse; different branches run different versions on one
+  machine, so the database format is kept for as long as it can be. The
+  report matches the record to the run by job ID and by when the job got in
+  line.
+
+## Load outside the queue
+
+Checks run outside the queue (type checks, Docker, tasks using more cores
+than their weight) can push the load well above the capacity, and admitting
+jobs only while the load average is below a limit was suggested. It is not
+done: the load average lags by a minute, counts more than CPU (on Linux,
+processes waiting for disks), and a limit on it lets work outside the line
+delay every job indefinitely and in an order nobody can predict, which breaks
+the guarantee the line gives. `status` prints the load average next to the
+capacity in use, and says when it is above the core count, so the gap shows;
+the answer is to route that work through the queue, and to raise the weights
+the report flags.
+
 ## Nested runs
 
 A `loadmaster run` inside a task (one that sees `LOADMASTER_HELD`) runs
@@ -389,6 +462,20 @@ transaction would remove this cost; it is left out until it matters.
 - Nested runs skip the capacity check and inherit the holder's
   `LOADMASTER_WEIGHT`: they run inside the holder's slot, which they must fit
   (see [Nested runs](#nested-runs)).
+- `min_version = "X.Y.Z"` names the oldest loadmaster that can read a file.
+  Branches and machines run different versions, and strict keys make an older
+  version reject any key added later with only "unknown field". The version
+  is checked before the strict parse, so an older version says what the file
+  needs instead; an unknown key's error also names the running version and
+  the two ways it comes about. (Versions before 0.5 do not know `min_version`
+  either.)
+- `loadmaster check` loads both configs as a run would, without opening the
+  queue, so CI can validate them, and warns about what the rule will make of
+  them on this machine: a weight at or above the capacity (it takes the
+  machine, and while it waits everyone behind it waits), a resource with no
+  limit anywhere, and a task whose run, waiting for a resource held by a
+  long run, sets aside enough cores to keep other tasks out. Warnings depend
+  on the machine's capacity and do not fail the check.
 - A weight above the capacity counts as the whole capacity, and the task runs
   alone. Weights are committed with the repository while the capacity belongs
   to each machine, so a repository's weights have to work on smaller machines
@@ -404,7 +491,8 @@ transaction would remove this cost; it is left out until it matters.
 job ID, task, weight, resources used, capacity, whether the machine was in
 measure-only mode,
 caller directory, arguments, outcome (`exited`, `gave_up`, `interrupted`,
-`spawn_failed`, `error`, `lost`), queue time, wait and run durations, CPU
+`spawn_failed`, `error`, `lost`, or `canceled` for the extra record
+`loadmaster cancel` writes), queue time, wait and run durations, CPU
 time, the 1-minute load average when the task ended, the signal that killed
 the task, if any, the exit code `loadmaster run` returned, whether that code
 is one of the task's `ok_exit_codes`, and for a `lost` run whether its task

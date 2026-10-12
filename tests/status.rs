@@ -35,7 +35,7 @@ fn shows_running_and_waiting_jobs() {
     assert!(out.starts_with("3/4 in use"), "{out}");
     let rows: Vec<&str> = out
         .lines()
-        .filter(|l| l.contains("hold") || l.contains("e2e"))
+        .filter(|l| matches!(l.split_whitespace().nth(1), Some("running" | "waiting")))
         .collect();
     assert_eq!(rows.len(), 2, "{out}");
     assert!(
@@ -47,6 +47,10 @@ fn shows_running_and_waiting_jobs() {
         "{out}"
     );
     assert!(out.contains(&sandbox.repo.display().to_string()), "{out}");
+    assert!(
+        out.ends_with("why jobs wait:\n  #2 `e2e` waits for all 4 cores (3 in use)\n"),
+        "{out}"
+    );
 
     sandbox.release("hold");
     assert!(wait(&mut holder).success());
@@ -69,9 +73,9 @@ fn waiting_job_reports_progress_on_stderr() {
         .spawn()
         .unwrap();
     wait_until("the waiting message", || {
-        sandbox
-            .read("waiter.err")
-            .contains("loadmaster: waiting to run `test` (weight 4): next in line, 3/4 in use")
+        sandbox.read("waiter.err").contains(
+            "loadmaster: waiting to run `test` (weight 4, next in line) for all 4 cores (3 in use)",
+        )
     });
     sandbox.release("hold");
     assert!(wait(&mut waiter).success());

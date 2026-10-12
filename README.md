@@ -34,7 +34,7 @@ port a checkout has.
 | Approach | Every task has a weight (≈ CPU cores it keeps busy), the machine has a capacity, and the line is first come, first served. Tasks can also use named resources (database stacks, memory), limited per machine or per checkout; a job waiting for one doesn't hold up jobs that don't need it. |
 | Interface | A command wrapper: `loadmaster run <task> [-- args]`. No daemon or server; processes coordinate through a SQLite file. |
 | Crash safety | Places and slots of killed processes are reclaimed automatically (PID plus start time, so reused PIDs don't fool it). A task keeps its slot while it runs, even if `loadmaster` itself is killed. |
-| Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. `loadmaster held` lets scripts refuse to run outside the queue, whatever the agent. Ready-made Claude Code settings: instructions, timeouts, permissions, a hook that blocks direct runs. |
+| Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. `loadmaster held` lets scripts refuse to run outside the queue, whatever the agent. `loadmaster cancel --here` stops an agent's own checks without touching other agents' runs of the same commands. `loadmaster status` says what each job waits for, and `loadmaster check` what the config means on this machine. Ready-made Claude Code settings: instructions, timeouts, permissions, a hook that blocks direct runs. |
 | Measuring | `loadmaster report` shows failures, timeouts, run and wait times and the cores each task really used; a measure-only mode records a baseline to compare with. See [Checking that it helps](#checking-that-it-helps). |
 | Platforms | macOS and Linux. On Windows, WSL2 should work (it runs the Linux binary) but is not tested yet; native Windows is not supported. |
 | Integration cost | One binary, one `.loadmaster.toml` per repository, a few lines of agent instructions. Removing it means deleting those, `~/.local/state/loadmaster` and `~/.config/loadmaster`. |
@@ -199,10 +199,19 @@ loadmaster run test -- src/parser.test.ts
 loadmaster status
 ```
 
-While a job waits, loadmaster prints a line to stderr every 10 seconds, such as
-``loadmaster: waiting to run `test` (weight 4): 2 jobs ahead, 6/8 in use``.
+While a job waits, loadmaster prints a line to stderr every 10 seconds that
+says what it waits for, such as
+``loadmaster: waiting to run `test` (weight 4, 2 jobs ahead) for 4 cores (6 of 8 in use)``.
 Once it starts, the task's stdout and stderr pass straight through and
 loadmaster exits with the task's exit code.
+
+```bash
+loadmaster check
+```
+
+checks `.loadmaster.toml` and the machine config without touching the queue,
+and warns about weights that will make jobs wait on this machine; it also
+works in CI.
 
 ## Rules for agents running checks
 
@@ -233,8 +242,12 @@ If you are an AI agent working in a repository that already uses loadmaster
   | 128 + n | The check was killed by signal n (143 = SIGTERM). | It was interrupted, not failed; run it again if needed. |
   | anything else | The check's own exit code. | Treat it as the check's result. |
 
-- `loadmaster status` shows what is running and waiting, if you want to know
-  why you are waiting.
+- `loadmaster status` shows what is running and waiting, and what each
+  waiting job waits for.
+- **To stop your own checks, use `loadmaster cancel`**: `loadmaster cancel
+  --here` stops every job started from your checkout, `loadmaster cancel 43`
+  one job (IDs are in `loadmaster status`). Never stop checks by matching
+  command lines (`pkill -f vitest`): other agents run the same commands.
 
 ## Configuration
 
@@ -260,6 +273,18 @@ run against the main checkout's code: loadmaster says so and fails.
 | `cmd` | Array: the program and its arguments. No shell is involved. Arguments after `--` are appended to the end exactly as given. |
 | `uses` | Optional: the resources the task uses, such as `{ e2e-db = 1 }`; see [Resources besides CPU](#resources-besides-cpu). |
 | `ok_exit_codes` | Optional: the exit codes that mean the check passed, for the history log and `loadmaster report`; `[0]` if not set. A check that reports "differences found" with exit code 2 would set `[0, 2]`. loadmaster itself still exits with the task's code. |
+
+Unknown keys are errors, so a typo fails instead of being ignored. That also
+means an older loadmaster rejects a key added in a newer version, and branches
+and machines often run different versions. Name the oldest version your file
+needs at its top, and older versions say so instead of rejecting the key:
+
+```toml
+min_version = "0.5.0"
+```
+
+(loadmaster 0.4 and older do not know `min_version` either, and reject it as
+an unknown key.) In CI, `loadmaster check` validates the file.
 
 The weight does not change with the arguments: `loadmaster run test -- one.test.ts`
 still counts as 4. Extra arguments come after the fixed ones, so leave out of
@@ -334,6 +359,11 @@ cmd = ["npx", "eslint", "."]
   project-specific resources project-specific names.
 - An amount above a limit counts as the whole limit, like a weight above the
   capacity.
+- To keep runs from overlapping, such as a timing-sensitive test that must run
+  without another of its kind, give them a resource with `capacity = 1`. Don't
+  give the task a weight at or above the capacity for that: it would also keep
+  every other check off the machine, and while it waits, every job behind it
+  waits too.
 
 A job waiting for a resource holds back only that resource: a lint that needs
 no database can start while an e2e run waits for one, as long as it leaves the
@@ -345,7 +375,9 @@ tasks that share a resource with a long-running task low: while one of them
 waits, both its weight and the long-running task's are out of the capacity,
 and only the rest is left for everything else. A weight above the capacity
 minus the long-running task's is worse still: the waiting job is then short
-of CPU too and holds back everyone behind it.
+of CPU too and holds back everyone behind it. `loadmaster check` points out
+the tasks whose weights do that on this machine, and `loadmaster status`
+shows what each waiting job sets aside.
 
 Make manual operations on a resource tasks too, such as resetting the e2e
 database by hand: `uses = { e2e-db = 1 }` then makes them wait for the runs
@@ -435,7 +467,8 @@ and its place in line, and only records it, to get a baseline; see
 
 `$XDG_CONFIG_HOME` is honored, and `LOADMASTER_CONFIG` overrides the path; a
 file it names must exist, while a missing file in the default place means all
-defaults.
+defaults. Like `.loadmaster.toml`, the file can name the oldest loadmaster
+that reads it with `min_version`, for a file shared across machines.
 
 The queue lives in `~/.local/state/loadmaster/state.db` (`$XDG_STATE_HOME`,
 `LOADMASTER_STATE_DIR`). Next to it, `history.jsonl` gets one line per job
@@ -470,12 +503,21 @@ one with outcome `lost`.
 - **Signals**: SIGINT, SIGTERM or SIGHUP while waiting leaves the line. While
   the task runs, they are forwarded to the task's process group, and
   loadmaster waits for the task to exit before freeing the slot. Signals that
-  were ignored when loadmaster started (as under `nohup`) stay ignored.
+  were ignored when loadmaster started (as under `nohup`) stay ignored. Every
+  process in the group gets the signal, as with Ctrl-C in a terminal, so a
+  wrapper script that forwards signals to its child makes the child get each
+  one twice. Have the wrapper `exec` the child instead, or write handlers that
+  survive a second signal (a Node.js handler added with `process.once` does
+  not: the second signal ends the process).
 - **Unknown tasks and broken config files** fail immediately instead of
   waiting.
 - **A weight above the capacity** counts as the whole capacity: the task runs
   alone, with a note on stderr. Weights are committed with the repository, so
   this keeps them usable on a smaller machine, such as a CI runner.
+- **Why a job waits** is worked out by the admission rule itself, which
+  `loadmaster status` and the waiting messages report: a dimension in use by
+  running jobs, one set aside for jobs ahead, or one a job ahead waits for
+  too, with the jobs that cause it.
 
 ### Nested runs
 
@@ -519,14 +561,30 @@ happens to exit with 75 by the `loadmaster: gave up waiting` line on stderr.
 ```text
 loadmaster run [--max-wait SECONDS] <TASK> [-- ARGS...]
 loadmaster status
+loadmaster cancel [--kill] (<ID>... | --here)
+loadmaster check
 loadmaster clean
 loadmaster report [--since TIME] [--until TIME] [--dir TEXT]
 loadmaster held [--uses RESOURCE]
 ```
 
 - `run`: run a task once its weight and resources fit.
-- `status`: show used/total capacity, resources in use and every running,
-  waiting or parked job.
+- `status`: show used/total capacity, resources in use, the load average,
+  every running, waiting or parked job, and what each waiting job waits for.
+- `cancel`: stop jobs, by ID or (`--here`) every job started from this
+  checkout except the one `cancel` itself runs in, and wait until they have
+  left the queue. It sends SIGTERM to the job's `loadmaster`, so a waiting job
+  leaves the line and a running job's task gets the signal as described under
+  [Signals](#how-it-works), with the slot freed once it exits; a kept place
+  (exit code 75) is dropped. `--kill` sends SIGKILL to a running task
+  instead, for one that does not stop; it gets no chance to clean up.
+  `loadmaster report` leaves canceled checks out. Exits with 0 once the jobs
+  are gone.
+- `check`: validate `.loadmaster.toml` and the machine config, list the tasks
+  and resources with their limits on this machine, and warn about weights that
+  take the whole machine or crowd out other tasks while waiting for a
+  resource. It does not touch the queue. Exits with 0 if the configs are
+  valid, warnings or not, and with 125 if not.
 - `clean`: reclaim places and slots whose processes are gone. Every update
   already does this, so you should rarely need it.
 - `report`: summarize the history log per task. `--since` and `--until`
@@ -544,20 +602,25 @@ loadmaster held [--uses RESOURCE]
 $ loadmaster status
 6/8 in use (capacity set in /Users/you/.config/loadmaster/config.toml)
 e2e-db: 1/2 in use
+load average 22.9 over the last minute, on 14 cores: more than the cores, from work outside the queue or tasks that use more cores than their weight (see `loadmaster report`)
 
-ID  STATE    TASK  WEIGHT  USES      PID    PGID   FOR    DIR
-41  running  test  4       -         12345  12346  1m02s  /Users/you/src/app-wt1
-42  running  e2e   2       e2e-db=1  12399  12400  3.1s   /Users/you/src/app-wt2
-43  waiting  e2e   2       e2e-db=1  12410  -      0.8s   /Users/you/src/app-wt2
-44  waiting  lint  1       -         12420  -      0.5s   /Users/you/src/app-wt3
+ID  STATE    TASK  WEIGHT  USES      PID    PGID   FOR   DIR
+41  running  test  4       -         10687  10689  3.0s  /Users/you/src/app-wt1
+42  running  e2e   2       e2e-db=1  10700  10702  2.5s  /Users/you/src/app-wt2
+43  waiting  e2e   2       e2e-db=1  10753  -      2.0s  /Users/you/src/app-wt2
+44  waiting  lint  1       -         10772  -      1.4s  /Users/you/src/app-wt3
+
+why jobs wait:
+  #43 `e2e` waits for `e2e-db` in its checkout (1 of 1 in use by #42 `e2e`); sets aside 2 cores and `e2e-db` meanwhile
+  #44 `lint` waits for 1 core (2 free, but 2 set aside for #43 `e2e`)
 ```
 
 Job 43 waits because `app-wt2` already has its one `e2e-db`. Job 44 waits
 although 2 cores are free: they are set aside for job 43, which needs them as
-soon as `app-wt2`'s database is free.
-
-`FOR` is the time spent in the current state. There is no cancel command: to
-stop a running job, signal its task's process group, e.g. `kill -TERM -12346`.
+soon as `app-wt2`'s database is free. `FOR` is the time spent in the current
+state. The load average counts everything on the machine; well above the
+capacity in use, it points to work outside the queue, here a build run
+directly.
 
 ### Exit codes
 
@@ -566,7 +629,7 @@ stop a running job, signal its task's process group, e.g. `kill -TERM -12346`.
 | task's code | The task ran and exited normally. |
 | 128 + n | The task was killed by signal n, or loadmaster was interrupted by signal n while waiting. |
 | 75 | `--max-wait` elapsed. The job keeps its place in line; run the same command again to resume. |
-| 125 | loadmaster itself failed: unknown task, invalid config, no `.loadmaster.toml` in this repository, invalid `LOADMASTER_HELD` or `LOADMASTER_MAX_WAIT`, a nested task that does not fit in its holder's slot, bad arguments. |
+| 125 | loadmaster itself failed: unknown task, invalid config, a config that needs a newer loadmaster (`min_version`), no `.loadmaster.toml` in this repository, invalid `LOADMASTER_HELD` or `LOADMASTER_MAX_WAIT`, a nested task that does not fit in its holder's slot, bad arguments. |
 | 126 | The task's program could not be executed. |
 | 127 | The task's program was not found. |
 
@@ -689,7 +752,11 @@ Deny the direct commands and allow loadmaster, in `.claude/settings.json` or
 ```json
 {
   "permissions": {
-    "allow": ["Bash(loadmaster run *)", "Bash(loadmaster status)"],
+    "allow": [
+      "Bash(loadmaster run *)",
+      "Bash(loadmaster status)",
+      "Bash(loadmaster cancel *)"
+    ],
     "deny": ["Bash(npx vitest *)", "Bash(npx playwright *)", "Bash(npx biome *)"]
   }
 }
@@ -784,7 +851,8 @@ or other resources, as by an old branch during a switch-over, gets a row of
 its own. Tasks are grouped by name across all repositories; if two projects
 both have a `test` task, look at one at a time with `--dir`. To compare the
 time before and after a change, use `--until` and `--since` with the time of
-the change. This report comes
+the change. Checks stopped with `loadmaster cancel` are left out and only
+counted: they were stopped on purpose. This report comes
 from a short demo, five agents each running `test` and then `e2e` at once:
 
 ```text
@@ -853,7 +921,12 @@ loadmaster is deliberately small:
 
 - One machine. Weights are static; there are no priorities and no measurement
   of actual CPU or memory use.
-- The capacity only accounts for work that goes through loadmaster.
+- The capacity only accounts for work that goes through loadmaster. Work
+  outside it shows in the load average that `loadmaster status` prints, but
+  does not hold jobs back: the load average lags by a minute and counts more
+  than CPU, and admission based on it would let work outside the line delay
+  jobs indefinitely and in no predictable order. Route that work through the
+  queue instead.
 - Tasks run without terminal input (stdin is `/dev/null` when it would be a
   terminal). A task that opens the terminal itself, for a password prompt or a
   pager, is stopped by the OS; Ctrl-C still ends it.
@@ -875,8 +948,8 @@ cargo test
 
 Besides unit tests, this runs integration tests that start real `loadmaster`
 processes: many jobs at once, a big job among a stream of small ones, `kill -9`
-of waiting and running jobs, nested runs, resources, `loadmaster held`, exit
-codes and config errors. Design decisions and their reasons are in
+of waiting and running jobs, nested runs, resources, `loadmaster held`,
+`cancel` and `check`, exit codes and config errors. Design decisions and their reasons are in
 [docs/DECISIONS.md](docs/DECISIONS.md).
 
 A soak test simulates five agents calling `loadmaster run` the way Claude

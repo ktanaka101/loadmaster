@@ -20,6 +20,7 @@ const RESUME_WINDOW: Duration = PARK_TTL.saturating_add(Duration::from_secs(120)
 /// after `--max-wait` resume the same job, so they are joined into one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Check {
+    pub job: i64,
     pub task: String,
     /// The caller's directory (lossy).
     pub dir: String,
@@ -54,6 +55,9 @@ pub enum CheckResult {
     /// Could not be started: the program failed to start, or loadmaster
     /// itself failed.
     NotRun,
+    /// Stopped with `loadmaster cancel`: on purpose, so it says nothing about
+    /// the machine and is left out of the counts.
+    Canceled,
 }
 
 impl Check {
@@ -62,8 +66,33 @@ impl Check {
     }
 }
 
+/// How far apart the times a job got in line can be, as its loadmaster
+/// recorded it and as the queue did: at most the wait for the database lock.
+const SAME_JOB: Duration = Duration::from_secs(120);
+
 /// Joins history entries into checks, roughly in the order they ended.
 pub fn checks(entries: &[Entry]) -> Vec<Check> {
+    // `loadmaster cancel` logs its own record, besides the run's: when each
+    // canceled job got in line, by job ID.
+    let mut canceled: HashMap<i64, Vec<u64>> = HashMap::new();
+    for entry in entries.iter().filter(|e| e.outcome == Outcome::Canceled) {
+        canceled.entry(entry.job).or_default().push(entry.queued_at);
+    }
+    let mut checks = joined(entries.iter().filter(|e| e.outcome != Outcome::Canceled));
+    for check in &mut checks {
+        let same =
+            |&queued_at: &u64| queued_at.abs_diff(check.queued_at) <= SAME_JOB.as_millis() as u64;
+        if canceled
+            .get(&check.job)
+            .is_some_and(|times| times.iter().any(same))
+        {
+            check.result = CheckResult::Canceled;
+        }
+    }
+    checks
+}
+
+fn joined<'a>(entries: impl Iterator<Item = &'a Entry>) -> Vec<Check> {
     // Checks that gave up, by job ID: their first and latest attempt.
     let mut parked: HashMap<i64, (&Entry, &Entry)> = HashMap::new();
     let mut checks = Vec::new();
@@ -118,8 +147,10 @@ fn join(first: &Entry, last: &Entry) -> Check {
         Outcome::Lost => CheckResult::Killed,
         Outcome::Interrupted | Outcome::GaveUp => CheckResult::LeftLine,
         Outcome::SpawnFailed | Outcome::Error => CheckResult::NotRun,
+        Outcome::Canceled => CheckResult::Canceled,
     };
     Check {
+        job: last.job,
         task: last.task.clone(),
         dir: last.dir.clone(),
         weight: last.weight,
@@ -227,6 +258,9 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
         .filter(|c| options.until.is_none_or(|until| c.queued_at < until))
         .filter(|c| options.dir.is_none_or(|dir| c.dir.contains(dir)))
         .collect();
+    let (canceled, checks): (Vec<Check>, Vec<Check>) = checks
+        .into_iter()
+        .partition(|c| c.result == CheckResult::Canceled);
     let mut out = format!("history: {}\n", options.source.display());
     match (options.since, options.until) {
         (Some(since), Some(until)) => {
@@ -252,6 +286,12 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
     }
     if options.unreadable > 0 {
         out += &format!("skipped {} unreadable line(s)\n", options.unreadable);
+    }
+    if !canceled.is_empty() {
+        out += &format!(
+            "left out {} check(s) stopped with `loadmaster cancel`\n",
+            canceled.len()
+        );
     }
     if checks.is_empty() {
         out += if options.since.is_some() || options.until.is_some() {
@@ -726,6 +766,40 @@ mod tests {
             checks.iter().map(|c| (c.wait_ms, c.result)).collect();
         use CheckResult::*;
         assert_eq!(summary, [(1_000, LeftLine), (0, Passed), (0, Failed)]);
+    }
+
+    #[test]
+    fn canceled_checks_are_marked_by_the_cancel_record() {
+        let canceled = |job, queued_at| entry(job, "test", Outcome::Canceled, queued_at, 0);
+        let entries = [
+            // Logged by `cancel` before or after the run's own record, with
+            // the time the queue recorded, a little after the run's.
+            canceled(1, 1_050),
+            entry(1, "test", Outcome::Interrupted, 1_000, 500),
+            exited(2, 2_000, 0, 10, 143),
+            canceled(2, 2_020),
+            // A parked place, dropped.
+            entry(3, "test", Outcome::GaveUp, 3_000, 60_000),
+            canceled(3, 3_000),
+            // The same ID long after: the database was recreated.
+            exited(1, 10_000_000, 0, 10, 0),
+        ];
+        let results: Vec<CheckResult> = checks(&entries).iter().map(|c| c.result).collect();
+        assert_eq!(
+            results,
+            [
+                CheckResult::Canceled,
+                CheckResult::Canceled,
+                CheckResult::Passed,
+                CheckResult::Canceled,
+            ]
+        );
+        let out = render(&entries, &options());
+        assert!(
+            out.contains("left out 3 check(s) stopped with `loadmaster cancel`\n"),
+            "{out}"
+        );
+        assert!(out.contains(": 1 check(s), "), "{out}");
     }
 
     #[test]

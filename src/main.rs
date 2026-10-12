@@ -13,11 +13,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use clap::{Args, Parser, Subcommand};
 
+use loadmaster::check;
 use loadmaster::config::{self, MachineConfig, RepoConfig, Task};
 use loadmaster::history::{self, HISTORY_FILE, Outcome, Record};
 use loadmaster::process::{self, ProcessId};
 use loadmaster::queue::{
-    Admission, Job, JobId, JobRequest, JobState, PARK_TTL, Queue, STATE_DB_FILE, Ticket, Use,
+    self as queue, Admission, Canceled, Job, JobId, JobRequest, JobState, PARK_TTL, Queue,
+    STATE_DB_FILE, Ticket, Use, Wait,
 };
 use loadmaster::report::{self, format_duration};
 use loadmaster::runner::{self, HELD_ENV, Signals, SpawnError, WEIGHT_ENV};
@@ -67,9 +69,34 @@ enum Cmd {
     Clean,
     /// Summarize the history log: results, run and wait times, load
     Report(ReportArgs),
+    /// Validate .loadmaster.toml and the machine config, and show what they
+    /// mean on this machine; does not touch the queue
+    Check,
+    /// Stop jobs, waiting or running, and wait until they have left the queue
+    Cancel(CancelArgs),
     /// Exit 0 if this process runs inside a loadmaster job started from this
     /// checkout, 1 if not; for scripts that must only run through the queue
     Held(HeldArgs),
+}
+
+#[derive(Args)]
+struct CancelArgs {
+    /// Job IDs, as `loadmaster status` shows them
+    #[arg(
+        value_name = "ID",
+        required_unless_present = "here",
+        conflicts_with = "here"
+    )]
+    ids: Vec<JobId>,
+
+    /// Every job started from this checkout, except the one this runs in
+    #[arg(long)]
+    here: bool,
+
+    /// SIGKILL instead of SIGTERM: for a task that does not stop. A running
+    /// task gets it directly, so it has no chance to clean up
+    #[arg(long)]
+    kill: bool,
 }
 
 #[derive(Args)]
@@ -122,6 +149,8 @@ fn main() {
         Cmd::Status => status(),
         Cmd::Clean => clean(),
         Cmd::Report(args) => report(args),
+        Cmd::Check => check(),
+        Cmd::Cancel(args) => cancel(args),
         Cmd::Held(args) => held(args),
     };
     let code = result.unwrap_or_else(|e| {
@@ -149,15 +178,10 @@ fn run(args: RunArgs) -> Result<i32> {
     // Weights belong to the repository and the capacity to the machine, so a
     // weight can exceed a small machine's capacity: the task then takes all
     // of it.
-    if task.weight > machine.capacity {
-        say!(
-            "loadmaster: `{}` has weight {}, above this machine's capacity of {} ({}); \
-             it runs alone",
-            task.name,
-            task.weight,
-            machine.capacity,
-            machine.capacity_source
-        );
+    if task.weight > machine.capacity
+        && let Some(note) = check::whole_machine(task, machine.capacity)
+    {
+        say!("loadmaster: {note} (capacity {})", machine.capacity_source);
     }
     let task = &Task {
         weight: task.weight.min(machine.capacity),
@@ -238,11 +262,7 @@ fn run(args: RunArgs) -> Result<i32> {
                 wait_started,
                 &mut record,
             ),
-            Turn::GaveUp {
-                ahead,
-                used,
-                waiting_for,
-            } => {
+            Turn::GaveUp(wait) => {
                 // Logged first: killed before parking, the job is reaped and
                 // logged as lost, which the report joins to this record;
                 // killed after parking, nothing else would log it.
@@ -252,14 +272,13 @@ fn run(args: RunArgs) -> Result<i32> {
                 logged = true;
                 ticket.park()?;
                 say!(
-                    "loadmaster: gave up waiting for `{}` after {} ({}, {used}/{} in use{})\n\
+                    "loadmaster: gave up waiting to run `{}` after {} ({}); it waited for {}\n\
                      loadmaster: your place in line is kept for {}s; \
                      run the same command again from this directory to resume",
                     task.name,
                     format_duration(wait_started.elapsed()),
-                    format_ahead(ahead),
-                    machine.capacity,
-                    format_waiting_for(&waiting_for),
+                    format_ahead(wait.ahead),
+                    wait.waits_for(),
                     PARK_TTL.as_secs(),
                 );
                 Ok(EXIT_GAVE_UP)
@@ -324,11 +343,7 @@ fn resource_uses(repo: &RepoConfig, task: &Task, machine: &MachineConfig) -> Vec
 
 enum Turn {
     Admitted,
-    GaveUp {
-        ahead: u32,
-        used: u64,
-        waiting_for: Vec<String>,
-    },
+    GaveUp(Wait),
     Interrupted(i32),
 }
 
@@ -356,30 +371,26 @@ fn wait_turn(
                 }
                 return Ok(Turn::Admitted);
             }
-            Admission::Waiting {
-                ahead,
-                used,
-                waiting_for,
-            } => {
+            Admission::Waiting(wait) => {
                 if max_wait.is_some_and(|max| started.elapsed() >= max) {
                     // A signal that arrived meanwhile wins: leave the line
                     // instead of parking.
                     if let Some(&signal) = signals.take().first() {
                         return Ok(Turn::Interrupted(signal));
                     }
-                    return Ok(Turn::GaveUp {
-                        ahead,
-                        used,
-                        waiting_for,
-                    });
+                    return Ok(Turn::GaveUp(wait));
                 }
                 if last_report.is_none_or(|at| at.elapsed() >= REPORT_INTERVAL) {
                     say!(
-                        "loadmaster: waiting to run `{}` (weight {}): {}, {used}/{capacity} in use{}",
+                        "loadmaster: waiting to run `{}` (weight {}, {}) for {}{}",
                         task.name,
                         task.weight,
-                        format_ahead(ahead),
-                        format_waiting_for(&waiting_for),
+                        format_ahead(wait.ahead),
+                        wait.waits_for(),
+                        wait.reserves_text()
+                            .map_or(String::new(), |reserved| format!(
+                                "; {reserved} set aside for it meanwhile"
+                            )),
                     );
                     last_report = Some(Instant::now());
                 }
@@ -569,14 +580,8 @@ fn holder_here(value: &str, config: &Path) -> Result<std::result::Result<Job, St
     // A checkout is the resolved directory of its .loadmaster.toml, as for
     // per-checkout limits: a symlink to the same checkout matches, a worktree
     // whose config is a symlink to another's file does not.
-    let resolved_dir = |config: &Path| config.parent().and_then(|dir| fs::canonicalize(dir).ok());
-    let here = resolved_dir(config);
-    let theirs = match &job.checkout {
-        Some(dir) => Some(dir.clone()),
-        // Recorded before checkouts were.
-        None => RepoConfig::find(&job.dir).and_then(|config| resolved_dir(&config)),
-    };
-    if here.is_none() || theirs != here {
+    let here = config.parent().and_then(|dir| fs::canonicalize(dir).ok());
+    if here.is_none() || checkout_of(&job) != here {
         return Ok(Err(format!(
             "job #{} (`{}`) was started from another checkout, in {}",
             job.id,
@@ -627,6 +632,7 @@ fn status() -> Result<i32> {
         machine.capacity_source
     );
     out += &resources_in_use(&snapshot.jobs, &machine);
+    out += &load_line();
     if machine.measure_only {
         out += "measure-only: jobs start at once and are only recorded (see `loadmaster report`)\n";
     }
@@ -641,9 +647,55 @@ fn status() -> Result<i32> {
     } else {
         out += "\n";
         out += &jobs_table(&snapshot.jobs);
+        out += &why_jobs_wait(&snapshot.jobs, machine.capacity);
     }
     print(&out);
     Ok(0)
+}
+
+/// The machine's load, which also counts work outside the queue.
+fn load_line() -> String {
+    let Some(load) = process::load_average() else {
+        return String::new();
+    };
+    let Some(cores) = process::online_cpus() else {
+        return format!("load average {load:.1} over the last minute\n");
+    };
+    let mut line = format!("load average {load:.1} over the last minute, on {cores} cores");
+    if load > cores as f64 {
+        line += ": more than the cores, from work outside the queue or tasks that use \
+                 more cores than their weight (see `loadmaster report`)";
+    }
+    line + "\n"
+}
+
+/// One line per waiting job: what the admission rule says it waits for.
+fn why_jobs_wait(jobs: &[Job], capacity: u32) -> String {
+    let lines: Vec<String> = queue::explain(jobs, capacity)
+        .into_iter()
+        .filter_map(|(id, admission)| {
+            let job = jobs.iter().find(|job| job.id == id)?;
+            if job.state != JobState::Waiting || job.measure_only {
+                return None;
+            }
+            let who = format!("#{id} `{}`", job.task);
+            Some(match admission {
+                Admission::Admitted => format!("  {who} is about to start\n"),
+                Admission::Waiting(wait) => format!(
+                    "  {who} waits for {}{}\n",
+                    wait.waits_for(),
+                    wait.reserves_text()
+                        .map_or(String::new(), |reserved| format!(
+                            "; sets aside {reserved} meanwhile"
+                        ))
+                ),
+            })
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("\nwhy jobs wait:\n{}", lines.concat())
 }
 
 /// One line per machine-wide resource that any job uses: how much running
@@ -772,6 +824,120 @@ fn clean() -> Result<i32> {
     Ok(0)
 }
 
+/// After this long, `cancel` says which jobs are still stopping.
+const CANCEL_HINT_AFTER: Duration = Duration::from_secs(10);
+
+fn cancel(args: CancelArgs) -> Result<i32> {
+    let queue = Queue::open(&open_state_dir()?.join(STATE_DB_FILE))?;
+    // The job this runs in, if any: canceling it would end this command.
+    let own = env::var(HELD_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<JobId>().ok());
+    let ids: Vec<JobId> = if args.here {
+        let cwd =
+            env::current_dir().map_err(|e| Error::io("cannot read the current directory", e))?;
+        let config = RepoConfig::locate(&cwd)?;
+        let here = config.parent().and_then(|dir| fs::canonicalize(dir).ok());
+        queue
+            .snapshot()?
+            .jobs
+            .into_iter()
+            .filter(|job| here.is_some() && checkout_of(job) == here)
+            .map(|job| job.id)
+            .collect()
+    } else {
+        args.ids.clone()
+    };
+    let mut out = String::new();
+    // Each job signalled, and what it was doing for how long.
+    let mut stopping: Vec<(Job, String)> = Vec::new();
+    for id in ids {
+        if Some(id) == own {
+            say!("loadmaster: not canceling job #{id}: this command runs in it");
+            continue;
+        }
+        match queue.cancel(id, args.kill)? {
+            Canceled::NotFound if args.here => {}
+            Canceled::NotFound => say!("loadmaster: job #{id} is not in the queue"),
+            Canceled::DroppedPlace(job) => {
+                out += &format!("dropped the kept place of #{id} `{}`\n", job.task);
+            }
+            Canceled::Signaled(job) => {
+                let (what, since) = match job.state {
+                    JobState::Running => ("running", job.started_at),
+                    _ => ("waiting", Some(job.enqueued_at)),
+                };
+                let duration = since
+                    .and_then(|t| SystemTime::now().duration_since(t).ok())
+                    .map_or(String::new(), |d| format!(" for {}", format_duration(d)));
+                stopping.push((job, format!("{what}{duration}")));
+            }
+        }
+    }
+    if stopping.is_empty() && out.is_empty() {
+        print("no jobs to cancel\n");
+        return Ok(0);
+    }
+    // Gone once its loadmaster has left the line, or its task has exited and
+    // freed the slot.
+    let started = Instant::now();
+    let mut hinted = false;
+    loop {
+        let jobs = queue.snapshot()?.jobs;
+        let left: Vec<&Job> = jobs
+            .iter()
+            .filter(|job| stopping.iter().any(|(stopped, _)| stopped.id == job.id))
+            .collect();
+        if left.is_empty() {
+            break;
+        }
+        // A job that gave up waiting (exit code 75) just as it was signalled
+        // keeps its place: drop it rather than wait for it to expire.
+        for job in left.iter().filter(|job| job.state == JobState::Parked) {
+            queue.cancel(job.id, false)?;
+        }
+        if !hinted && started.elapsed() >= CANCEL_HINT_AFTER {
+            hinted = true;
+            for job in left {
+                say!(
+                    "loadmaster: #{} `{}` is still stopping{}",
+                    job.id,
+                    job.task,
+                    if args.kill {
+                        String::new()
+                    } else {
+                        format!("; `loadmaster cancel --kill {}` ends it at once", job.id)
+                    }
+                );
+            }
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    for (job, what) in &stopping {
+        out += &format!("canceled #{} `{}` ({what})\n", job.id, job.task);
+    }
+    print(&out);
+    Ok(0)
+}
+
+/// The resolved directory of the `.loadmaster.toml` a job was started from.
+fn checkout_of(job: &Job) -> Option<PathBuf> {
+    match &job.checkout {
+        Some(dir) => Some(dir.clone()),
+        // Recorded before checkouts were.
+        None => RepoConfig::find(&job.dir)
+            .and_then(|config| config.parent().and_then(|dir| fs::canonicalize(dir).ok())),
+    }
+}
+
+fn check() -> Result<i32> {
+    let cwd = env::current_dir().map_err(|e| Error::io("cannot read the current directory", e))?;
+    let repo = RepoConfig::discover(&cwd)?;
+    let machine = MachineConfig::load()?;
+    print(&check::render(&repo, &machine));
+    Ok(0)
+}
+
 fn report(args: ReportArgs) -> Result<i32> {
     let path = config::state_dir()?.join(HISTORY_FILE);
     let (entries, unreadable) = match history::read(&path) {
@@ -793,7 +959,7 @@ fn report(args: ReportArgs) -> Result<i32> {
         until,
         dir: args.dir.as_deref(),
         unreadable,
-        cpus: thread::available_parallelism().ok().map(|n| n.get()),
+        cpus: process::online_cpus(),
     };
     print(&report::render(&entries, &options));
     Ok(0)
@@ -812,15 +978,6 @@ fn open_state_dir() -> Result<PathBuf> {
 fn print(text: &str) {
     // Ignore EPIPE (e.g. `loadmaster status | head`).
     let _ = io::stdout().lock().write_all(text.as_bytes());
-}
-
-/// "; waiting for db, mem" for the resources other than CPU a job waits for.
-fn format_waiting_for(resources: &[String]) -> String {
-    if resources.is_empty() {
-        String::new()
-    } else {
-        format!("; waiting for {}", resources.join(", "))
-    }
 }
 
 fn format_ahead(ahead: u32) -> String {

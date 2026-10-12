@@ -80,7 +80,10 @@ fn a_lint_passes_an_e2e_run_waiting_for_a_database() {
     let mut e2e = spawn_in(&sandbox, &sandbox.repo, &["run", "e2e"], "e2e.err");
     wait_for_waiting(&sandbox, "e2e");
     wait_until("the reason on stderr", || {
-        sandbox.read("e2e.err").contains("waiting for db")
+        sandbox.read("e2e.err").contains(
+            "loadmaster: waiting to run `e2e` (weight 2, next in line) for `db` \
+             (1 of 1 in use by #1 `e2e-hold`); 2 cores set aside for it meanwhile",
+        )
     });
 
     // The CPU is mostly free, and lint needs no database.
@@ -108,9 +111,19 @@ fn one_e2e_run_per_checkout() {
     let mut same = spawn_in(&sandbox, &sandbox.repo, &["run", "e2e"], "same.err");
     wait_for_waiting(&sandbox, "e2e");
     wait_until("the reason on stderr", || {
-        sandbox.read("same.err").contains("waiting for db")
+        sandbox
+            .read("same.err")
+            .contains("for `db` in its checkout (1 of 1 in use by #1 `e2e-hold`)")
     });
-    assert!(stdout(&sandbox.run(&["status"])).contains("db: 1/2 in use\n"));
+    let status = stdout(&sandbox.run(&["status"]));
+    assert!(status.contains("db: 1/2 in use\n"), "{status}");
+    assert!(
+        status.contains(
+            "why jobs wait:\n  #3 `e2e` waits for `db` in its checkout \
+             (1 of 1 in use by #1 `e2e-hold`); sets aside 2 cores and `db` meanwhile\n"
+        ),
+        "{status}"
+    );
 
     sandbox.release("hold");
     assert!(wait(&mut holder).success());

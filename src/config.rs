@@ -62,6 +62,9 @@ pub struct RepoConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepoFile {
+    /// Checked before the file is read strictly; see [`check_min_version`].
+    #[serde(default, rename = "min_version")]
+    _min_version: Option<String>,
     #[serde(default)]
     tasks: BTreeMap<String, TaskFile>,
     #[serde(default)]
@@ -124,7 +127,8 @@ impl RepoConfig {
             path: path.to_owned(),
             message,
         };
-        let file: RepoFile = toml::from_str(text).map_err(|e| invalid(e.to_string()))?;
+        check_min_version(path, text)?;
+        let file: RepoFile = toml::from_str(text).map_err(|e| invalid(explain_toml_error(e)))?;
         for (name, resource) in &file.resources {
             for (key, limit) in [
                 ("capacity", resource.capacity),
@@ -155,6 +159,16 @@ impl RepoConfig {
     /// The resource declared as `name`, if any.
     pub fn resource(&self, name: &str) -> Option<&Resource> {
         self.resources.get(name)
+    }
+
+    /// The declared resources, by name.
+    pub fn resources(&self) -> &BTreeMap<String, Resource> {
+        &self.resources
+    }
+
+    /// The tasks, by name.
+    pub fn tasks(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.values()
     }
 
     pub fn path(&self) -> &Path {
@@ -324,6 +338,9 @@ pub struct MachineConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MachineFile {
+    /// Checked before the file is read strictly; see [`check_min_version`].
+    #[serde(default, rename = "min_version")]
+    _min_version: Option<String>,
     capacity: Option<u32>,
     #[serde(default)]
     measure_only: bool,
@@ -366,7 +383,8 @@ impl MachineConfig {
             path: path.to_owned(),
             message,
         };
-        let file: MachineFile = toml::from_str(text).map_err(|e| invalid(e.to_string()))?;
+        check_min_version(path, text)?;
+        let file: MachineFile = toml::from_str(text).map_err(|e| invalid(explain_toml_error(e)))?;
         if let Some((name, _)) = file.resources.iter().find(|(_, c)| **c == 0) {
             return Err(invalid(format!(
                 "resource `{name}`: capacity must be at least 1"
@@ -391,6 +409,67 @@ impl MachineConfig {
             resources: file.resources,
         })
     }
+}
+
+/// This loadmaster's version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A config file may name the oldest loadmaster that can read it, as
+/// `min_version = "0.5.0"`. It is checked before the file is read strictly,
+/// so an older version says what it needs instead of rejecting the first
+/// key it does not know.
+fn check_min_version(path: &Path, text: &str) -> Result<()> {
+    let invalid = |message: String| Error::InvalidConfig {
+        path: path.to_owned(),
+        message,
+    };
+    let table: toml::Table = toml::from_str(text).map_err(|e| invalid(e.to_string()))?;
+    let Some(value) = table.get("min_version") else {
+        return Ok(());
+    };
+    let expected = "a version such as \"0.5.0\"";
+    let required = value
+        .as_str()
+        .ok_or_else(|| invalid(format!("`min_version` must be {expected}")))?;
+    let needed = version_parts(required)
+        .ok_or_else(|| invalid(format!("`min_version` is `{required}`, not {expected}")))?;
+    let current = version_parts(VERSION).expect("the crate version is valid");
+    if needed > current {
+        return Err(Error::VersionTooOld {
+            path: path.to_owned(),
+            required: required.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// "0.5.0", "0.5" or "1" as (major, minor, patch); a pre-release suffix of
+/// this crate's own version is ignored.
+fn version_parts(text: &str) -> Option<(u64, u64, u64)> {
+    let text = text.split_once('-').map_or(text, |(release, _)| release);
+    let mut parts = text.split('.').map(|part| {
+        (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse::<u64>().ok())
+            .flatten()
+    });
+    let major = parts.next()??;
+    let minor = parts.next().unwrap_or(Some(0))?;
+    let patch = parts.next().unwrap_or(Some(0))?;
+    parts.next().is_none().then_some((major, minor, patch))
+}
+
+/// A TOML error, with a note on unknown keys: they may be typos, or keys of
+/// a newer version.
+fn explain_toml_error(e: toml::de::Error) -> String {
+    let message = e.to_string();
+    if !message.contains("unknown field") {
+        return message;
+    }
+    format!(
+        "{}\nthis is loadmaster {VERSION}: an unknown key is a typo, or one that a newer version \
+         added; a file that needs a newer version can say so with `min_version = \"X.Y.Z\"`",
+        message.trim_end()
+    )
 }
 
 /// `$LOADMASTER_CONFIG`, else `$XDG_CONFIG_HOME/loadmaster/config.toml`,
@@ -527,6 +606,60 @@ mod tests {
             assert!(msg.contains(expected), "{text:?}: {msg}");
             assert!(msg.contains("/repo/.loadmaster.toml"), "{text:?}: {msg}");
         }
+    }
+
+    #[test]
+    fn min_version_names_the_oldest_loadmaster_that_reads_the_file() {
+        let task = "[tasks.t]\nweight = 1\ncmd = [\"x\"]\n";
+        for ok in ["0.1.0", "0.1", "0", VERSION] {
+            let text = format!("min_version = \"{ok}\"\n{task}");
+            assert!(parse(&text).is_ok(), "{ok}");
+        }
+        // Checked first: an older version must not stop at a key it does
+        // not know.
+        let msg = message(
+            parse("min_version = \"99.0.0\"\n[tasks.t]\nweight = 1\nfuture = 1\ncmd = [\"x\"]\n")
+                .unwrap_err(),
+        );
+        assert_eq!(
+            msg,
+            format!(
+                "/repo/.loadmaster.toml needs loadmaster 99.0.0 or newer (its `min_version`), \
+                 but this is {VERSION}: upgrade loadmaster"
+            )
+        );
+        for (text, expected) in [
+            (
+                "min_version = 5\n",
+                "`min_version` must be a version such as",
+            ),
+            (
+                "min_version = \"latest\"\n",
+                "`min_version` is `latest`, not a version",
+            ),
+            ("min_version = \"0.5.0.1\"\n", "`min_version` is `0.5.0.1`"),
+            ("min_version = \"0..1\"\n", "`min_version` is `0..1`"),
+        ] {
+            let msg = message(parse(text).unwrap_err());
+            assert!(msg.contains(expected), "{text:?}: {msg}");
+        }
+        let machine = MachineConfig::parse(Path::new("/m.toml"), "min_version = \"99\"\n");
+        assert!(matches!(machine, Err(Error::VersionTooOld { .. })));
+    }
+
+    #[test]
+    fn an_unknown_key_says_which_version_does_not_know_it() {
+        let msg =
+            message(parse("[tasks.t]\nweight = 1\nretries = 2\ncmd = [\"x\"]\n").unwrap_err());
+        assert!(msg.contains("unknown field `retries`"), "{msg}");
+        assert!(
+            msg.contains(&format!(
+                "this is loadmaster {VERSION}: an unknown key is a typo"
+            )),
+            "{msg}"
+        );
+        let msg = message(parse("[tasks.t]\nweight = 1\ncmd = 3\n").unwrap_err());
+        assert!(!msg.contains("this is loadmaster"), "{msg}");
     }
 
     #[test]
