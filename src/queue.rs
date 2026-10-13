@@ -41,8 +41,10 @@ use crate::process::{ProcessGroup, ProcessId};
 
 pub type JobId = i64;
 
-/// File name of the queue database inside the state directory.
-pub const STATE_DB_FILE: &str = "state.db";
+/// File name of the queue database inside the state directory. The number
+/// is the version of its layout: a loadmaster that changes the layout uses
+/// a new file, never one another version made.
+pub const QUEUE_DB_FILE: &str = "queue-v1.db";
 
 /// How long to wait for another process's lock on the database.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -51,56 +53,43 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const PARK_TTL: Duration = Duration::from_secs(120);
 
 // AUTOINCREMENT: IDs are never reused, so a stale LOADMASTER_HELD can never
-// point at an unrelated newer job. This is version 1; a new database is
-// created from it and brought up to date by every migration in turn.
+// point at an unrelated newer job.
+//
+// `cancel_requests` holds the requests from `loadmaster cancel`, for the
+// job's own loadmaster to act on: in an agent's sandbox, a process may not
+// signal one started by another command. One row per job, kept until the job
+// is gone, with the strongest stop asked for and the strongest one done, by
+// the job's loadmaster and by a `cancel` that signalled the task of a job
+// whose loadmaster is gone (0 SIGTERM, 1 SIGKILL, -1 none): a later cancel
+// that asks for no more than was done does nothing.
 const SCHEMA: &str = "
 CREATE TABLE jobs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    task        TEXT    NOT NULL,
-    weight      INTEGER NOT NULL CHECK (weight > 0),
-    state       TEXT    NOT NULL CHECK (state IN ('waiting', 'parked', 'running')),
-    dir         BLOB    NOT NULL,
-    args        TEXT    NOT NULL,
-    command     TEXT    NOT NULL,
-    owner_pid   INTEGER,
-    owner_start INTEGER,
-    child_pgid  INTEGER,
-    child_start INTEGER,
-    enqueued_at INTEGER NOT NULL,
-    parked_at   INTEGER,
-    started_at  INTEGER
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task         TEXT    NOT NULL,
+    weight       INTEGER NOT NULL CHECK (weight > 0),
+    state        TEXT    NOT NULL CHECK (state IN ('waiting', 'parked', 'running')),
+    dir          BLOB    NOT NULL,
+    args         TEXT    NOT NULL,
+    command      TEXT    NOT NULL,
+    owner_pid    INTEGER,
+    owner_start  INTEGER,
+    child_pgid   INTEGER,
+    child_start  INTEGER,
+    enqueued_at  INTEGER NOT NULL,
+    parked_at    INTEGER,
+    started_at   INTEGER,
+    capacity     INTEGER NOT NULL,
+    measure_only INTEGER NOT NULL,
+    checkout     BLOB    NOT NULL,
+    uses         TEXT    NOT NULL
 );
-";
-
-/// `MIGRATIONS[n - 1]` upgrades version `n` to `n + 1`.
-const MIGRATIONS: [&str; 2] = [
-    // The machine setting of each job, so a lost job can still be logged.
-    "ALTER TABLE jobs ADD COLUMN capacity INTEGER;
-     ALTER TABLE jobs ADD COLUMN measure_only INTEGER NOT NULL DEFAULT 0;",
-    // Resources: what each job uses, and the checkout it was started from.
-    "ALTER TABLE jobs ADD COLUMN checkout BLOB;
-     ALTER TABLE jobs ADD COLUMN uses TEXT NOT NULL DEFAULT '[]';",
-];
-
-const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64 + 1;
-
-/// Requests from `loadmaster cancel`, for the job's own loadmaster to act on:
-/// in an agent's sandbox, a process may not signal one started by another
-/// command. One row per job, kept until the job is gone, with the strongest
-/// stop asked for and the strongest one done, by the job's loadmaster and by
-/// a `cancel` that signalled the job itself (0 SIGTERM, 1 SIGKILL, -1 none),
-/// and which loadmaster (by its start time) that signal went to: a later
-/// cancel that asks for no more than was done does nothing. Older
-/// versions never read this table and work without it, so it is added
-/// without a new schema version, which they would refuse.
-const CANCEL_REQUESTS: &str = "
-CREATE TABLE IF NOT EXISTS cancel_requests (
+CREATE TABLE cancel_requests (
     job          INTEGER PRIMARY KEY,
     kill         INTEGER NOT NULL,
     owner_done   INTEGER NOT NULL DEFAULT -1,
-    signal_done  INTEGER NOT NULL DEFAULT -1,
-    signal_owner INTEGER
+    signal_done  INTEGER NOT NULL DEFAULT -1
 );
+PRAGMA user_version = 1;
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,15 +134,14 @@ pub struct Job {
     pub enqueued_at: SystemTime,
     pub parked_at: Option<SystemTime>,
     pub started_at: Option<SystemTime>,
-    /// The machine's capacity when the job got in line (unknown for jobs
-    /// queued before it was recorded).
-    pub capacity: Option<u32>,
+    /// The machine's capacity when the job got in line.
+    pub capacity: u32,
     pub measure_only: bool,
     /// Resources the job uses, with the limits it got in line with.
     pub uses: Vec<Use>,
     /// The resolved directory of the `.loadmaster.toml` the job was started
-    /// from (unknown for jobs queued before it was recorded).
-    pub checkout: Option<PathBuf>,
+    /// from.
+    pub checkout: PathBuf,
 }
 
 /// A resource a job uses, and the limits it got in line with: every process
@@ -438,8 +426,7 @@ impl Queue {
             conn,
             path: path.to_owned(),
         };
-        queue.migrate()?;
-        queue.ensure_cancel_requests()?;
+        queue.create_schema()?;
         Ok(queue)
     }
 
@@ -449,58 +436,16 @@ impl Queue {
         self.conn.is_readonly(rusqlite::MAIN_DB).unwrap_or(false)
     }
 
-    fn ensure_cancel_requests(&self) -> Result<()> {
-        // Usually it is there as it should be; don't take the write lock
-        // then. One of another shape is from a build before any release, and
-        // requests only matter while their jobs run: it is made anew.
-        let current: bool = self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('cancel_requests')
-                            WHERE name = 'signal_owner')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !current {
-            let tx = self.begin()?;
-            // Again under the lock: another process may have made it since.
-            let current: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('cancel_requests')
-                                WHERE name = 'signal_owner')",
-                [],
-                |r| r.get(0),
-            )?;
-            if !current {
-                tx.execute_batch("DROP TABLE IF EXISTS cancel_requests")?;
-                tx.execute_batch(CANCEL_REQUESTS)?;
-            }
-            tx.commit()?;
-        }
-        Ok(())
-    }
-
-    fn migrate(&self) -> Result<()> {
-        // Usually the schema is already there; don't take the write lock then.
-        let found: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if found == SCHEMA_VERSION {
+    fn create_schema(&self) -> Result<()> {
+        // Usually it is there; don't take the write lock then.
+        if created(&self.conn)? {
             return Ok(());
         }
         let tx = self.begin()?;
-        let found: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !(0..=SCHEMA_VERSION).contains(&found) {
-            return Err(Error::SchemaVersion {
-                path: self.path.clone(),
-                found,
-                expected: SCHEMA_VERSION,
-            });
-        }
-        if found == 0 {
+        // Again under the lock: another process may have made it since.
+        if !created(&tx)? {
             tx.execute_batch(SCHEMA)?;
         }
-        for migration in &MIGRATIONS[found.max(1) as usize - 1..] {
-            tx.execute_batch(migration)?;
-        }
-        tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         tx.commit()?;
         Ok(())
     }
@@ -573,8 +518,8 @@ impl Queue {
     /// running one's task gets SIGTERM, or SIGKILL with `kill`. That needs
     /// no permission to signal it, which an agent's sandbox may not give. A
     /// parked job loses its place. A task whose loadmaster is gone is
-    /// signalled directly. Also for a canceled job whose state has changed
-    /// since.
+    /// signalled from here (see [`signal_task`]). Also for a canceled job
+    /// whose state has changed since.
     pub fn stop(&self, id: JobId, kill: bool) -> Result<Canceled> {
         let (canceled, _) = self.write(|tx| {
             let Some(job) = load_jobs(tx)?.into_iter().find(|job| job.id == id) else {
@@ -592,38 +537,7 @@ impl Queue {
             if job.owner_alive() {
                 return Ok(Canceled::Requested(job));
             }
-            // Its loadmaster is gone: its task is signalled from here.
-            act_directly(tx, job)
-        })?;
-        Ok(canceled)
-    }
-
-    /// Whether a stop has been asked for job `id` that nobody has done yet.
-    pub fn cancel_pending(&self, id: JobId) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM cancel_requests
-                            WHERE job = ?1 AND kill > max(owner_done, signal_done))",
-            [id],
-            |r| r.get(0),
-        )?)
-    }
-
-    /// Signals job `id` in place of its request when its loadmaster has
-    /// not acted on it (one from a version that does not read requests, or
-    /// one that is stopped), unless that much has been done already: by its
-    /// loadmaster, or by another `cancel` to the same loadmaster. The
-    /// request stays, so the loadmaster acts on it once it can; it sends its
-    /// task no second SIGTERM.
-    pub fn fallback(&self, id: JobId) -> Result<Canceled> {
-        let (canceled, _) = self.write(|tx| {
-            let Some(job) = load_jobs(tx)?.into_iter().find(|job| job.id == id) else {
-                return Ok(Canceled::NotFound);
-            };
-            if job.state == JobState::Parked {
-                delete_job(tx, job.id)?;
-                return Ok(Canceled::DroppedPlace(job));
-            }
-            act_directly(tx, job)
+            signal_task(tx, job)
         })?;
         Ok(canceled)
     }
@@ -644,7 +558,7 @@ impl Queue {
                     // could delay it if it needed more now.
                     "SELECT id FROM jobs
                  WHERE state = 'parked' AND dir = ?1 AND task = ?2 AND args = ?3
-                   AND weight = ?4 AND capacity IS ?5 AND uses = ?6 AND checkout IS ?7
+                   AND weight = ?4 AND capacity = ?5 AND uses = ?6 AND checkout = ?7
                  ORDER BY id LIMIT 1",
                     params![
                         dir,
@@ -765,141 +679,60 @@ pub enum Canceled {
     Signaled(Job),
 }
 
-/// Signals `job` for its request without going through its loadmaster's
-/// own look at requests, within the write transaction `tx`, so that the
-/// decision, the signal and its record are one step: no loadmaster can act
-/// on the request, nor hand its slot over, in between. If the signal is not
-/// allowed, the transaction is rolled back with the error, so nothing is
-/// recorded as sent.
-fn act_directly(tx: &Transaction, job: Job) -> Result<Canceled> {
-    let row: Option<(bool, i64, i64, Option<i64>)> = tx
+/// Signals the task of `job`, whose loadmaster is gone, for its request:
+/// SIGKILL as often as it is asked, SIGTERM only if the task has had none,
+/// from its loadmaster (which records what it sent before it hands the slot
+/// over) or from an earlier cancel. Within the write transaction `tx`, so
+/// that the decision, the signal and its record are one step. If the signal
+/// is not allowed, the transaction is rolled back with the error, so nothing
+/// is recorded as sent.
+fn signal_task(tx: &Transaction, job: Job) -> Result<Canceled> {
+    let row: Option<(bool, i64, i64)> = tx
         .query_row(
-            "SELECT kill, owner_done, signal_done, signal_owner FROM cancel_requests
-             WHERE job = ?1",
+            "SELECT kill, owner_done, signal_done FROM cancel_requests WHERE job = ?1",
             [job.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((kill, owner_done, signal_done, signal_owner)) = row else {
+    let Some((kill, owner_done, signal_done)) = row else {
         return Ok(Canceled::NotFound);
     };
-    let wanted = i64::from(kill);
-    let owner = job.owner.filter(|owner| owner.is_alive());
-    let send = match owner {
-        // Its loadmaster has not acted, nor been sent this much (a re-run
-        // that resumed the place has another loadmaster).
-        Some(owner) => {
-            wanted > owner_done
-                && (wanted > signal_done || signal_owner != Some(owner.start_time as i64))
-        }
-        // Its task: SIGKILL as often as it takes, SIGTERM only if it has had
-        // none: from its loadmaster (which records what it sent before it
-        // hands the slot over) or from a cancel straight to its group. A
-        // signal that went to its loadmaster is not one to the task.
-        None => {
-            let to_task = if signal_owner.is_none() {
-                signal_done
-            } else {
-                -1
-            };
-            kill || owner_done.max(to_task) < 0
-        }
-    };
-    if !send {
+    if !kill && owner_done.max(signal_done) >= 0 {
         return Ok(Canceled::Requested(job));
     }
-    let sent = signal_directly(&job, kill).map_err(|source| cannot_signal(&job, source))?;
-    let Some(sent) = sent else {
+    let Some(child) = job.child.filter(|child| child.is_alive()) else {
         // Gone in the meantime; the next look reaps it.
         return Ok(Canceled::Requested(job));
     };
-    // As it was sent: its loadmaster may have died since it was looked at,
-    // and the signal then went to the task.
-    let to = match sent {
-        Sent::Task => None,
-        Sent::Loadmaster(owner) => Some(owner.start_time as i64),
-    };
+    match child.signal(if kill { libc::SIGKILL } else { libc::SIGTERM }) {
+        Ok(()) => {
+            // Lets a stopped task act on it.
+            let _ = child.signal(libc::SIGCONT);
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(Canceled::Requested(job)),
+        Err(source) => {
+            return Err(Error::CannotSignal {
+                id: job.id,
+                why: format!(
+                    "its loadmaster is gone, and its task's process group {} could not be \
+                     signalled",
+                    child.pgid
+                ),
+                source,
+            });
+        }
+    }
     tx.execute(
-        "UPDATE cancel_requests SET signal_done = max(signal_done, kill), signal_owner = ?2
-         WHERE job = ?1",
-        params![job.id, to],
+        "UPDATE cancel_requests SET signal_done = max(signal_done, kill) WHERE job = ?1",
+        [job.id],
     )?;
     Ok(Canceled::Signaled(job))
-}
-
-/// Why signalling `job` directly failed, for `loadmaster cancel`.
-fn cannot_signal(job: &Job, source: std::io::Error) -> Error {
-    let why = match job.owner.filter(|owner| owner.is_alive()) {
-        Some(owner) => format!(
-            "its loadmaster (process {}) did not take the request, as a version before 0.6 or \
-             a stopped one does not, and could not be signalled",
-            owner.pid
-        ),
-        None => format!(
-            "its loadmaster is gone, and its task's process group {} could not be signalled",
-            job.child.map_or(0, |c| c.pgid)
-        ),
-    };
-    Error::CannotSignal {
-        id: job.id,
-        why,
-        source,
-    }
 }
 
 fn delete_job(tx: &Transaction, id: JobId) -> Result<()> {
     tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
     tx.execute("DELETE FROM cancel_requests WHERE job = ?1", [id])?;
     Ok(())
-}
-
-/// Signals a job for `loadmaster cancel` without going through a request:
-/// its loadmaster with SIGTERM (or SIGKILL), or with `kill` or without a
-/// live loadmaster its task, which needs the permission to signal them.
-/// `Ok(false)` if it is gone.
-fn signal_directly(job: &Job, kill: bool) -> std::io::Result<Option<Sent>> {
-    let signal = if kill { libc::SIGKILL } else { libc::SIGTERM };
-    let owner = job.owner.filter(|owner| owner.is_alive());
-    let sent = match job.child {
-        Some(child) if job.state == JobState::Running && (kill || owner.is_none()) => {
-            if !child.is_alive() {
-                // The task is done; its loadmaster, if any, only has to free
-                // the slot, which the SIGCONT below lets a stopped one do.
-                let Some(owner) = owner else {
-                    return Ok(None);
-                };
-                owner.signal(libc::SIGCONT)?;
-                return Ok(Some(Sent::Loadmaster(owner)));
-            }
-            match child.signal(signal) {
-                Ok(()) => {
-                    // Lets a stopped task act on it.
-                    let _ = child.signal(libc::SIGCONT);
-                    Sent::Task
-                }
-                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
-                Err(e) => return Err(e),
-            }
-        }
-        _ => match owner {
-            Some(owner) if owner.signal(signal)? => Sent::Loadmaster(owner),
-            _ => return Ok(None),
-        },
-    };
-    // A stopped loadmaster (Ctrl-Z) acts on nothing, not even on its task
-    // exiting, until it is continued.
-    if let Some(owner) = owner {
-        owner.signal(libc::SIGCONT)?;
-    }
-    Ok(Some(sent))
-}
-
-/// Whom [`signal_directly`] signalled, as it decided at that moment.
-enum Sent {
-    /// The task's process group.
-    Task,
-    /// The job's loadmaster, which passes it on to its task.
-    Loadmaster(ProcessId),
 }
 
 /// A history record for a job that its loadmaster process did not log
@@ -984,7 +817,7 @@ impl Ticket<'_> {
     }
 
     /// Starts the job if it is at the head of the line and fits.
-    pub fn try_admit(&self, capacity: u32) -> Result<Admission> {
+    pub fn try_admit(&self) -> Result<Admission> {
         // Look without the write lock first: most polls change nothing, and
         // taking the lock for them would make every waiter contend with the
         // few writes that matter (admitting the head, recording a task).
@@ -996,14 +829,12 @@ impl Ticket<'_> {
             .iter()
             .filter(|job| job.state == JobState::Running || job.id < self.id)
             .all(|job| job.is_live(now));
-        if relevant_alive
-            && let Ok(waiting @ Admission::Waiting(_)) = decide(&jobs, self.id, capacity)
-        {
+        if relevant_alive && let Ok(waiting @ Admission::Waiting(_)) = decide(&jobs, self.id) {
             return Ok(waiting);
         }
         let (admission, _) = self.queue.write(|tx| {
             let jobs = load_jobs(tx)?;
-            let admission = decide(&jobs, self.id, capacity)?;
+            let admission = decide(&jobs, self.id)?;
             let running = jobs
                 .iter()
                 .any(|job| job.id == self.id && job.state == JobState::Running);
@@ -1126,10 +957,9 @@ enum Dim<'a> {
 }
 
 /// What `job` needs on each dimension, and the limit it got in line with.
-/// Amounts above a limit count as the whole limit. `capacity` stands in for
-/// a CPU capacity the job did not record.
-fn demands(job: &Job, capacity: u32) -> Vec<(Dim<'_>, u64, u64)> {
-    let cpu = job.capacity.unwrap_or(capacity);
+/// Amounts above a limit count as the whole limit.
+fn demands(job: &Job) -> Vec<(Dim<'_>, u64, u64)> {
+    let cpu = job.capacity;
     let mut demands = vec![(Dim::Cpu, u64::from(job.weight.min(cpu)), u64::from(cpu))];
     for u in &job.uses {
         // Without a capacity of its own, the job is still counted: resource
@@ -1139,10 +969,10 @@ fn demands(job: &Job, capacity: u32) -> Vec<(Dim<'_>, u64, u64)> {
             None => (u.amount, u64::MAX),
         };
         demands.push((Dim::Resource(&u.name), u64::from(amount), limit));
-        if let (Some(limit), Some(checkout)) = (u.per_checkout, &job.checkout) {
+        if let Some(limit) = u.per_checkout {
             let amount = u64::from(u.amount.min(limit));
             demands.push((
-                Dim::PerCheckout(&u.name, checkout),
+                Dim::PerCheckout(&u.name, &job.checkout),
                 amount,
                 u64::from(limit),
             ));
@@ -1162,9 +992,7 @@ impl Dim<'_> {
 }
 
 /// The admission rule (see the module docs): whether job `id` may start.
-/// `capacity` is this process's CPU capacity, for jobs that did not record
-/// theirs.
-fn decide(jobs: &[Job], id: JobId, capacity: u32) -> Result<Admission> {
+fn decide(jobs: &[Job], id: JobId) -> Result<Admission> {
     let me = jobs
         .iter()
         .find(|job| job.id == id)
@@ -1172,7 +1000,7 @@ fn decide(jobs: &[Job], id: JobId, capacity: u32) -> Result<Admission> {
     if me.state == JobState::Running {
         return Ok(Admission::Admitted);
     }
-    assess(jobs, capacity, Some(id))
+    assess(jobs, Some(id))
         .pop()
         .map(|(_, admission)| admission)
         .ok_or(Error::JobVanished(id))
@@ -1181,8 +1009,8 @@ fn decide(jobs: &[Job], id: JobId, capacity: u32) -> Result<Admission> {
 /// The admission rule for every job that is not running, in line order:
 /// whether it may start and, if not, why. For `loadmaster status`, which
 /// thereby says exactly what the rule decides.
-pub fn explain(jobs: &[Job], capacity: u32) -> Vec<(JobId, Admission)> {
-    assess(jobs, capacity, None)
+pub fn explain(jobs: &[Job]) -> Vec<(JobId, Admission)> {
+    assess(jobs, None)
 }
 
 /// What the jobs ahead set aside on one dimension.
@@ -1197,11 +1025,11 @@ struct Reserved<'a> {
 
 /// The admission rule for the jobs not running, up to job `only` if given
 /// (which is then the last one returned).
-fn assess(jobs: &[Job], capacity: u32, only: Option<JobId>) -> Vec<(JobId, Admission)> {
+fn assess(jobs: &[Job], only: Option<JobId>) -> Vec<(JobId, Admission)> {
     // Sums of u32 amounts cannot overflow u64.
     let mut used: BTreeMap<Dim, (u64, Vec<&Job>)> = BTreeMap::new();
     for job in jobs.iter().filter(|job| job.state == JobState::Running) {
-        for (dim, amount, _) in demands(job, capacity) {
+        for (dim, amount, _) in demands(job) {
             let entry = used.entry(dim).or_default();
             entry.0 += amount;
             entry.1.push(job);
@@ -1215,7 +1043,7 @@ fn assess(jobs: &[Job], capacity: u32, only: Option<JobId>) -> Vec<(JobId, Admis
     let mut ahead = 0u32;
     let mut assessed = Vec::new();
     for job in jobs.iter().filter(|job| job.state != JobState::Running) {
-        let demands = demands(job, capacity);
+        let demands = demands(job);
         // Per dimension: whether it fits, and the limit it is judged by.
         let fits: Vec<(bool, u64)> = demands
             .iter()
@@ -1324,12 +1152,14 @@ fn reap(tx: &Transaction) -> Result<Vec<Job>> {
     for job in &dead {
         delete_job(tx, job.id)?;
     }
-    // Versions that do not know requests delete jobs without theirs.
-    tx.execute(
-        "DELETE FROM cancel_requests WHERE job NOT IN (SELECT id FROM jobs)",
-        [],
-    )?;
     Ok(dead)
+}
+
+/// Whether the schema has been made: the last statement of [`SCHEMA`] marks
+/// it.
+fn created(conn: &Connection) -> rusqlite::Result<bool> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    Ok(version != 0)
 }
 
 fn load_jobs(conn: &Connection) -> Result<Vec<Job>> {
@@ -1377,9 +1207,7 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         started_at: row.get::<_, Option<i64>>(13)?.map(from_unix_ms),
         capacity: row.get(14)?,
         measure_only: row.get(15)?,
-        checkout: row
-            .get::<_, Option<Vec<u8>>>(16)?
-            .map(|bytes| PathBuf::from(OsString::from_vec(bytes))),
+        checkout: PathBuf::from(OsString::from_vec(row.get(16)?)),
         uses: json(17, row.get(17)?)?,
     })
 }

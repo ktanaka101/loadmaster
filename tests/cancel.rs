@@ -278,9 +278,9 @@ fn cancels_where_it_may_not_signal() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn says_why_when_it_must_signal_but_may_not() {
-    // A stopped loadmaster takes no request; the signal that would replace
-    // it is not allowed.
+fn says_why_when_it_must_continue_a_loadmaster_but_may_not() {
+    // A stopped loadmaster takes no request until it is continued, which
+    // is not allowed here.
     let sandbox = sandbox();
     let mut holder = sandbox.spawn(&["run", "hold"]);
     wait_until("the child group to be recorded", || {
@@ -293,7 +293,7 @@ fn says_why_when_it_must_signal_but_may_not() {
     let err = stderr(&output);
     assert!(
         err.contains("cannot stop job #1: its loadmaster (process ")
-            && err.contains("did not take the request, as a version before 0.6 or a stopped one does not")
+            && err.contains("is stopped, and could not be continued to act on the request")
             && err.contains("in an agent's sandbox, a command may not signal processes that another command started"),
         "{err}"
     );
@@ -339,8 +339,9 @@ fn a_second_cancel_does_not_signal_a_job_already_stopping() {
     // to be taken.
     let probe = Sandbox::new(4, "");
     let (log, done) = (q(&probe.path("signals")), q(&probe.path("done")));
+    let armed = q(&probe.path("armed"));
     let script = format!(
-        "sh -c 'trap \"echo term >> {log}\" TERM; while [ ! -e {done} ]; do sleep 0.05; done' & \
+        "sh -c 'trap \"echo term >> {log}\" TERM; touch {armed}; while [ ! -e {done} ]; do sleep 0.05; done' & \
          c=$!; \
          trap 'i=0; while [ $i -lt 80 ]; do sleep 0.05; i=$((i+1)); done; touch {done}; wait $c; exit 3' TERM; \
          {}",
@@ -353,18 +354,18 @@ fn a_second_cancel_does_not_signal_a_job_already_stopping() {
     .unwrap();
     let sandbox = probe;
     let mut holder = sandbox.spawn(&["run", "hold"]);
-    wait_until("the task to start", || sandbox.started("hold"));
+    wait_until("the task and what it leaves behind to start", || {
+        sandbox.started("hold") && sandbox.path("armed").exists()
+    });
     let mut first = sandbox.spawn(&["cancel", "1"]);
     wait_until("the clean-up to start", || {
         sandbox.read("signals").contains("term")
     });
 
-    // A stopped loadmaster takes no request: a second cancel must not fall
-    // back to signalling it, since the job is stopping already.
+    // A stopped loadmaster takes no request: the second cancel continues
+    // it, and must not have it stop its task again.
     signal(holder.id(), libc::SIGSTOP);
     let mut second = sandbox.spawn(&["cancel", "1"]);
-    std::thread::sleep(std::time::Duration::from_millis(2_500));
-    signal(holder.id(), libc::SIGCONT);
 
     assert!(wait(&mut first).success());
     assert!(wait(&mut second).success());
@@ -373,9 +374,8 @@ fn a_second_cancel_does_not_signal_a_job_already_stopping() {
 }
 
 #[test]
-fn a_loadmaster_that_ignored_the_fallback_signal_still_takes_the_request() {
-    // It ignores SIGTERM and is stopped, so the signal that stands in for
-    // the request does nothing; once continued, it finds the request.
+fn continues_a_stopped_loadmaster_to_take_the_request() {
+    // It ignores SIGTERM, so only the request can make it leave.
     let sandbox = sandbox();
     let mut holder = sandbox.spawn(&["run", "hold"]);
     wait_until("the task to start", || sandbox.started("hold"));
@@ -391,11 +391,9 @@ fn a_loadmaster_that_ignored_the_fallback_signal_still_takes_the_request() {
     let mut waiter = cmd.spawn().unwrap();
     wait_for_state(&sandbox, "test", JobState::Waiting);
     signal(waiter.id(), libc::SIGSTOP);
-    let mut cancel = sandbox.spawn(&["cancel", "2"]);
-    std::thread::sleep(std::time::Duration::from_millis(2_500));
-    signal(waiter.id(), libc::SIGCONT);
 
-    assert!(wait(&mut cancel).success());
+    let output = sandbox.run(&["cancel", "2"]);
+    assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(wait(&mut waiter).code(), Some(143));
     sandbox.release("hold");
     assert!(wait(&mut holder).success());
@@ -408,8 +406,9 @@ fn processes_left_behind_get_no_second_sigterm() {
     // over to it, and a second cancel must leave it alone.
     let probe = Sandbox::new(4, "");
     let (log, done) = (q(&probe.path("signals")), q(&probe.path("done")));
+    let armed = q(&probe.path("armed"));
     let script = format!(
-        "sh -c 'trap \"echo term >> {log}\" TERM; while [ ! -e {done} ]; do sleep 0.05; done' & \
+        "sh -c 'trap \"echo term >> {log}\" TERM; touch {armed}; while [ ! -e {done} ]; do sleep 0.05; done' & \
          trap 'exit 3' TERM; {}",
         probe.hold_script("hold")
     );
@@ -420,7 +419,9 @@ fn processes_left_behind_get_no_second_sigterm() {
     .unwrap();
     let sandbox = probe;
     let mut holder = sandbox.spawn(&["run", "hold"]);
-    wait_until("the task to start", || sandbox.started("hold"));
+    wait_until("the task and what it leaves behind to start", || {
+        sandbox.started("hold") && sandbox.path("armed").exists()
+    });
     let mut first = sandbox.spawn(&["cancel", "1"]);
     assert_eq!(wait(&mut holder).code(), Some(3));
     wait_until("the slot to be handed over", || {
@@ -428,7 +429,7 @@ fn processes_left_behind_get_no_second_sigterm() {
     });
 
     let mut second = sandbox.spawn(&["cancel", "1"]);
-    std::thread::sleep(std::time::Duration::from_millis(2_500));
+    std::thread::sleep(std::time::Duration::from_millis(500));
     std::fs::write(sandbox.path("done"), "").unwrap();
     assert!(wait(&mut first).success());
     assert!(wait(&mut second).success());
@@ -441,8 +442,9 @@ fn processes_left_behind_after_a_sigterm_from_outside_get_no_second_one() {
     // timeout: that it was sent must outlive the job's loadmaster.
     let probe = Sandbox::new(4, "");
     let (log, done) = (q(&probe.path("signals")), q(&probe.path("done")));
+    let armed = q(&probe.path("armed"));
     let script = format!(
-        "sh -c 'trap \"echo term >> {log}\" TERM; while [ ! -e {done} ]; do sleep 0.05; done' & \
+        "sh -c 'trap \"echo term >> {log}\" TERM; touch {armed}; while [ ! -e {done} ]; do sleep 0.05; done' & \
          trap 'exit 3' TERM; {}",
         probe.hold_script("hold")
     );
@@ -453,7 +455,9 @@ fn processes_left_behind_after_a_sigterm_from_outside_get_no_second_one() {
     .unwrap();
     let sandbox = probe;
     let mut holder = sandbox.spawn(&["run", "hold"]);
-    wait_until("the task to start", || sandbox.started("hold"));
+    wait_until("the task and what it leaves behind to start", || {
+        sandbox.started("hold") && sandbox.path("armed").exists()
+    });
     signal(holder.id(), libc::SIGTERM);
     assert_eq!(wait(&mut holder).code(), Some(3));
     wait_until("the slot to be handed over", || {
@@ -470,8 +474,8 @@ fn processes_left_behind_after_a_sigterm_from_outside_get_no_second_one() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_cancel_refused_in_a_sandbox_does_not_stop_one_from_outside() {
-    // A stopped loadmaster takes no request; inside the sandbox the signal
-    // standing in for it is refused, outside it is not.
+    // A stopped loadmaster takes no request; inside the sandbox continuing
+    // it is refused, outside it is not.
     let sandbox = sandbox();
     let mut holder = sandbox.spawn(&["run", "hold"]);
     wait_until("the child group to be recorded", || {

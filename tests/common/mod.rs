@@ -9,7 +9,7 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use loadmaster::queue::{Job, Queue, STATE_DB_FILE, Snapshot};
+use loadmaster::queue::{Job, QUEUE_DB_FILE, Queue, Snapshot};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_loadmaster");
 pub const TIMEOUT: Duration = Duration::from_secs(60);
@@ -73,7 +73,7 @@ impl Sandbox {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        Queue::open(&self.state.join(STATE_DB_FILE))
+        Queue::open(&self.state.join(QUEUE_DB_FILE))
             .unwrap()
             .snapshot()
             .unwrap()
@@ -112,7 +112,7 @@ impl Sandbox {
 impl Drop for Sandbox {
     /// Kills anything a failed test left behind.
     fn drop(&mut self) {
-        let Ok(queue) = Queue::open(&self.state.join(STATE_DB_FILE)) else {
+        let Ok(queue) = Queue::open(&self.state.join(QUEUE_DB_FILE)) else {
             return;
         };
         let Ok(snapshot) = queue.snapshot() else {

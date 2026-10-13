@@ -18,8 +18,8 @@ use loadmaster::config::{self, MachineConfig, RepoConfig, Task};
 use loadmaster::history::{self, HISTORY_FILE, Outcome, Record};
 use loadmaster::process::{self, ProcessId};
 use loadmaster::queue::{
-    self as queue, Admission, Canceled, Job, JobId, JobRequest, JobState, PARK_TTL, Queue,
-    STATE_DB_FILE, Ticket, Use, Wait,
+    self as queue, Admission, Canceled, Job, JobId, JobRequest, JobState, PARK_TTL, QUEUE_DB_FILE,
+    Queue, Ticket, Use, Wait,
 };
 use loadmaster::report::{self, format_duration};
 use loadmaster::runner::{self, HELD_ENV, Signals, SpawnError, WEIGHT_ENV};
@@ -218,7 +218,7 @@ fn run(args: RunArgs) -> Result<i32> {
         job: ticket.id(),
         task: &task.name,
         weight: task.weight,
-        capacity: Some(machine.capacity),
+        capacity: machine.capacity,
         measure_only: machine.measure_only,
         dir: cwd.to_string_lossy(),
         args: &args.args,
@@ -249,7 +249,7 @@ fn run(args: RunArgs) -> Result<i32> {
             // behaves as without loadmaster, and is only recorded.
             ticket.admit_now().map(|()| Turn::Admitted)
         } else {
-            wait_turn(&ticket, task, machine.capacity, max_wait, &signals)
+            wait_turn(&ticket, task, max_wait, &signals)
         };
         record.wait_ms = millis(wait_started.elapsed());
         match turn? {
@@ -350,7 +350,6 @@ enum Turn {
 fn wait_turn(
     ticket: &Ticket,
     task: &Task,
-    capacity: u32,
     max_wait: Option<Duration>,
     signals: &Signals,
 ) -> Result<Turn> {
@@ -367,7 +366,7 @@ fn wait_turn(
             );
             return Ok(Turn::Interrupted(cancel_signal(kill)));
         }
-        match ticket.try_admit(capacity)? {
+        match ticket.try_admit()? {
             Admission::Admitted => {
                 if last_report.is_some() {
                     say!(
@@ -439,7 +438,7 @@ fn run_admitted(
     if let Some(path) = config::machine_config_override()? {
         command.env(config::CONFIG_ENV, path);
     }
-    let (db, id) = (state_dir.join(STATE_DB_FILE), ticket.id());
+    let (db, id) = (state_dir.join(QUEUE_DB_FILE), ticket.id());
     // Runs on another thread, so it opens its own connection.
     let register = move |group| -> Result<()> { Queue::open(&db)?.record_child(id, group) };
     let cpu_before = process::children_cpu_time();
@@ -528,12 +527,8 @@ fn run_nested(value: &str, repo: &RepoConfig, task: &Task, mut command: Command)
             ),
         })
     };
-    // Capped at the capacity the holder's slot was granted under. A holder
-    // that recorded none (queued by a version from before 0.1) is judged by
-    // the uncapped weight, which can only be stricter.
-    let weight = holder
-        .capacity
-        .map_or(task.weight, |capacity| task.weight.min(capacity));
+    // Capped at the capacity the holder's slot was granted under.
+    let weight = task.weight.min(holder.capacity);
     if weight > holder.weight {
         return does_not_fit(
             format!(
@@ -617,7 +612,7 @@ fn holder_here(value: &str, config: &Path) -> Result<std::result::Result<Job, St
     // per-checkout limits: a symlink to the same checkout matches, a worktree
     // whose config is a symlink to another's file does not.
     let here = config.parent().and_then(|dir| fs::canonicalize(dir).ok());
-    if here.is_none() || checkout_of(&job) != here {
+    if here.as_ref() != Some(&job.checkout) {
         return Ok(Err(format!(
             "job #{} (`{}`) was started from another checkout, in {}",
             job.id,
@@ -683,7 +678,7 @@ fn status() -> Result<i32> {
     } else {
         out += "\n";
         out += &jobs_table(&snapshot.jobs);
-        out += &why_jobs_wait(&snapshot.jobs, machine.capacity);
+        out += &why_jobs_wait(&snapshot.jobs);
     }
     print(&out);
     Ok(0)
@@ -707,8 +702,8 @@ fn load_line() -> String {
 }
 
 /// One line per waiting job: what the admission rule says it waits for.
-fn why_jobs_wait(jobs: &[Job], capacity: u32) -> String {
-    let lines: Vec<String> = queue::explain(jobs, capacity)
+fn why_jobs_wait(jobs: &[Job]) -> String {
+    let lines: Vec<String> = queue::explain(jobs)
         .into_iter()
         .filter_map(|(id, admission)| {
             let job = jobs.iter().find(|job| job.id == id)?;
@@ -863,10 +858,6 @@ fn clean() -> Result<i32> {
 
 /// After this long, `cancel` says which jobs are still stopping.
 const CANCEL_HINT_AFTER: Duration = Duration::from_secs(10);
-/// A job's loadmaster looks for requests every 100 ms while it waits and
-/// every 200 ms while its task runs; one that has not taken it after this
-/// long does not read them, or is stopped.
-const CANCEL_ANSWER_WITHIN: Duration = Duration::from_secs(2);
 
 /// The signal a cancel request stands for.
 fn cancel_signal(kill: bool) -> i32 {
@@ -888,7 +879,7 @@ fn cancel(args: CancelArgs) -> Result<i32> {
             .snapshot()?
             .jobs
             .into_iter()
-            .filter(|job| here.is_some() && checkout_of(job) == here)
+            .filter(|job| here.as_ref() == Some(&job.checkout))
             .map(|job| job.id)
             .collect()
     } else {
@@ -936,13 +927,11 @@ fn cancel(args: CancelArgs) -> Result<i32> {
     // Gone once its loadmaster has left the line, or its task has exited and
     // freed the slot. The request in the queue records what was asked and
     // what was done, so nothing is sent twice (see `Queue::stop`). A job's
-    // loadmaster acts on it; one that has not in time (a version that does
-    // not read requests, or one stopped with Ctrl-Z) is signalled instead,
-    // where that is allowed, and still acts on the request once it can. A
-    // job whose loadmaster is gone has its task signalled. A job can change
-    // meanwhile: one that gave up waiting (exit code 75) keeps its place,
-    // which is dropped rather than left to expire, and a re-run that resumes
-    // the place takes the request on.
+    // loadmaster acts on it; one stopped with Ctrl-Z acts on nothing, so it
+    // is continued. A job whose loadmaster is gone has its task signalled.
+    // A job can change meanwhile: one that gave up waiting (exit code 75)
+    // keeps its place, which is dropped rather than left to expire, and a
+    // re-run that resumes the place takes the request on.
     let started = Instant::now();
     let mut hinted = false;
     loop {
@@ -957,8 +946,28 @@ fn cancel(args: CancelArgs) -> Result<i32> {
         for job in &left {
             if job.state == JobState::Parked || job.is_orphaned() {
                 queue.stop(job.id, args.kill)?;
-            } else if started.elapsed() >= CANCEL_ANSWER_WITHIN {
-                queue.fallback(job.id)?;
+            } else if let Some(owner) = job.owner.filter(ProcessId::is_stopped)
+                && let Err(source) = owner.signal(libc::SIGCONT)
+            {
+                // Only if it still holds the job, stopped: since the
+                // snapshot it may have parked the job, handed it over or
+                // died, and the next look then stops the job without it.
+                let jobs = queue.snapshot()?.jobs;
+                if owner.is_stopped()
+                    && jobs
+                        .iter()
+                        .any(|j| j.id == job.id && j.owner == Some(owner))
+                {
+                    return Err(Error::CannotSignal {
+                        id: job.id,
+                        why: format!(
+                            "its loadmaster (process {}) is stopped, and could not be continued \
+                             to act on the request",
+                            owner.pid
+                        ),
+                        source,
+                    });
+                }
             }
         }
         if !hinted && started.elapsed() >= CANCEL_HINT_AFTER {
@@ -983,16 +992,6 @@ fn cancel(args: CancelArgs) -> Result<i32> {
     }
     print(&out);
     Ok(0)
-}
-
-/// The resolved directory of the `.loadmaster.toml` a job was started from.
-fn checkout_of(job: &Job) -> Option<PathBuf> {
-    match &job.checkout {
-        Some(dir) => Some(dir.clone()),
-        // Recorded before checkouts were.
-        None => RepoConfig::find(&job.dir)
-            .and_then(|config| config.parent().and_then(|dir| fs::canonicalize(dir).ok())),
-    }
 }
 
 fn check() -> Result<i32> {
@@ -1064,7 +1063,7 @@ fn open_queue() -> Result<(PathBuf, Queue)> {
     if let Err(e) = made {
         return Err(not_writable(e.to_string()));
     }
-    let path = dir.join(STATE_DB_FILE);
+    let path = dir.join(QUEUE_DB_FILE);
     let queue = Queue::open(&path)?;
     if queue.is_read_only() {
         return Err(Error::QueueReadOnly { path });

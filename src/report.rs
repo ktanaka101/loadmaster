@@ -25,7 +25,7 @@ pub struct Check {
     /// The caller's directory (lossy).
     pub dir: String,
     pub weight: u32,
-    pub capacity: Option<u32>,
+    pub capacity: u32,
     pub measure_only: bool,
     /// When it first got in line, in Unix milliseconds.
     pub queued_at: u64,
@@ -74,7 +74,7 @@ const SAME_JOB: Duration = Duration::from_secs(120);
 pub fn checks(entries: &[Entry]) -> Vec<Check> {
     // `loadmaster cancel` logs its own record, besides the run's: when each
     // canceled job got in line, by job ID, task and directory (IDs start
-    // over if the queue database is deleted).
+    // over in a new queue database: one deleted, or a new layout's file).
     let mut canceled: HashMap<(i64, &str, &str), Vec<u64>> = HashMap::new();
     for entry in entries.iter().filter(|e| e.outcome == Outcome::Canceled) {
         canceled
@@ -136,17 +136,10 @@ fn resumes(gave_up: &Entry, next: &Entry) -> bool {
 }
 
 fn join(first: &Entry, last: &Entry) -> Check {
-    let killed = match last.signal {
-        Some(signal) => signal.is_some(),
-        // Records from before signals were logged: judge by the exit code.
-        None => matches!(last.exit_code, Some(129..=192)),
-    };
     let result = match last.outcome {
-        Outcome::Exited if killed => CheckResult::Killed,
-        // Records from before `ok` was logged: only exit code 0 passes.
-        Outcome::Exited if last.ok.unwrap_or(last.exit_code == Some(0)) => CheckResult::Passed,
+        Outcome::Exited if last.signal.is_some() => CheckResult::Killed,
+        Outcome::Exited if last.ok == Some(true) => CheckResult::Passed,
         Outcome::Exited => CheckResult::Failed,
-        // Records from before `started` was logged count as killed.
         Outcome::Lost if last.started == Some(false) => CheckResult::LeftLine,
         Outcome::Lost => CheckResult::Killed,
         Outcome::Interrupted | Outcome::GaveUp => CheckResult::LeftLine,
@@ -289,7 +282,11 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
         out += &format!("only checks run from directories containing `{dir}`\n");
     }
     if options.unreadable > 0 {
-        out += &format!("skipped {} unreadable line(s)\n", options.unreadable);
+        out += &format!(
+            "skipped {} line(s) that are not records of this version's format (cut short, \
+             or written by an older version)\n",
+            options.unreadable
+        );
     }
     if !canceled.is_empty() {
         out += &format!(
@@ -309,7 +306,7 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
     }
 
     // Measure-only first: it is the baseline to compare against.
-    let mut sections: BTreeMap<(bool, Option<u32>), Vec<Check>> = BTreeMap::new();
+    let mut sections: BTreeMap<(bool, u32), Vec<Check>> = BTreeMap::new();
     for check in checks {
         sections
             .entry((!check.measure_only, check.capacity))
@@ -345,7 +342,7 @@ const OVER_WEIGHT: f64 = 1.2;
 /// One section of the report, and whether its table flags a task.
 fn section(
     measure_only: bool,
-    capacity: Option<u32>,
+    capacity: u32,
     checks: &[Check],
     cpus: Option<usize>,
 ) -> (String, bool) {
@@ -354,35 +351,30 @@ fn section(
     } else {
         "admission"
     };
-    let capacity_text = capacity.map_or("capacity not recorded".to_owned(), |c| {
-        format!("capacity {c}")
-    });
     let first = checks.iter().map(|c| c.queued_at).min().unwrap_or(0);
     let last = checks.iter().map(Check::end).max().unwrap_or(0);
     let mut out = format!(
-        "== {mode} ({capacity_text}): {} check(s), {} to {}\n",
+        "== {mode} (capacity {capacity}): {} check(s), {} to {}\n",
         checks.len(),
         format_time(first),
         format_time(last)
     );
-    if let Some(capacity) = capacity {
-        let o = overlap(checks, capacity);
-        let share = |s: Stacking| 100.0 * s.over_ms as f64 / s.busy_ms.max(1) as f64;
-        if measure_only && o.in_use.busy_ms > 0 {
-            out += &format!(
-                "weight in use: above capacity {:.0}% of the time checks ran, peak {}\n",
-                share(o.in_use),
-                o.in_use.peak
-            );
-        } else if o.demand.busy_ms > 0 {
-            out += &format!(
-                "demand: above capacity {:.0}% of the time checks ran, peak {} \
-                 (held back by loadmaster; in use peaked at {})\n",
-                share(o.demand),
-                o.demand.peak,
-                o.in_use.peak
-            );
-        }
+    let o = overlap(checks, capacity);
+    let share = |s: Stacking| 100.0 * s.over_ms as f64 / s.busy_ms.max(1) as f64;
+    if measure_only && o.in_use.busy_ms > 0 {
+        out += &format!(
+            "weight in use: above capacity {:.0}% of the time checks ran, peak {}\n",
+            share(o.in_use),
+            o.in_use.peak
+        );
+    } else if o.demand.busy_ms > 0 {
+        out += &format!(
+            "demand: above capacity {:.0}% of the time checks ran, peak {} \
+             (held back by loadmaster; in use peaked at {})\n",
+            share(o.demand),
+            o.demand.peak,
+            o.in_use.peak
+        );
     }
     let loads: Vec<f64> = checks.iter().filter_map(|c| c.load).collect();
     if let (Some(median), Some(p90)) = (percentile(&loads, 0.5), percentile(&loads, 0.9)) {
@@ -663,7 +655,7 @@ mod tests {
             weight: 4,
             dir: "/src/app-wt1".to_owned(),
             args: Vec::new(),
-            capacity: Some(8),
+            capacity: 8,
             measure_only: false,
             outcome,
             queued_at,
@@ -671,7 +663,7 @@ mod tests {
             run_ms: None,
             cpu_ms: None,
             load: None,
-            signal: Some(None),
+            signal: None,
             exit_code: None,
             started: None,
             ok: None,
@@ -683,6 +675,7 @@ mod tests {
         Entry {
             run_ms: Some(run_ms),
             exit_code: Some(code),
+            ok: Some(code == 0),
             ..entry(job, "test", Outcome::Exited, queued_at, wait_ms)
         }
     }
@@ -813,23 +806,17 @@ mod tests {
     #[test]
     fn results_are_classified() {
         let by_signal = Entry {
-            signal: Some(Some(15)),
+            signal: Some(15),
+            ok: None,
             ..exited(3, 0, 0, 10, 143)
-        };
-        let older_record = Entry {
-            signal: None,
-            ..exited(4, 0, 0, 10, 143)
         };
         let entries = [
             exited(1, 0, 0, 10, 0),
             exited(2, 0, 0, 10, 1),
             by_signal,
-            older_record,
             // A task may exit with 143 on its own.
             exited(5, 0, 0, 10, 143),
             entry(6, "test", Outcome::Interrupted, 0, 10),
-            // Records from before `started` was logged.
-            entry(7, "test", Outcome::Lost, 0, 10),
             Entry {
                 started: Some(true),
                 ..entry(8, "test", Outcome::Lost, 0, 10)
@@ -848,8 +835,8 @@ mod tests {
         assert_eq!(
             results,
             [
-                Passed, Failed, Killed, Killed, Failed, LeftLine, Killed, Killed, LeftLine, NotRun,
-                NotRun, LeftLine
+                Passed, Failed, Killed, Failed, LeftLine, Killed, LeftLine, NotRun, NotRun,
+                LeftLine
             ]
         );
     }
@@ -865,15 +852,12 @@ mod tests {
             with_ok(1, 2, Some(true)),
             with_ok(2, 2, Some(false)),
             with_ok(3, 0, Some(false)),
-            // Records from before `ok` was logged: only 0 passes.
-            with_ok(4, 2, None),
-            with_ok(5, 0, None),
         ])
         .iter()
         .map(|c| c.result)
         .collect();
         use CheckResult::*;
-        assert_eq!(results, [Passed, Failed, Failed, Failed, Passed]);
+        assert_eq!(results, [Passed, Failed, Failed]);
     }
 
     #[test]
@@ -999,7 +983,10 @@ mod tests {
             .unwrap();
         let admission = text.find("== admission (capacity 8): 1 check(s)").unwrap();
         assert!(measure < admission, "{text}");
-        assert!(text.contains("skipped 2 unreadable line(s)"), "{text}");
+        assert!(
+            text.contains("skipped 2 line(s) that are not records of this version's format"),
+            "{text}"
+        );
         assert!(text.contains("median 20.0, p90 20.0 (14 CPUs)"), "{text}");
         assert!(text.contains("demand: above capacity 0%"), "{text}");
         let row = text

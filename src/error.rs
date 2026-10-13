@@ -71,17 +71,6 @@ pub enum Error {
     NoHome,
 
     #[error(
-        "state database {} has schema version {found}, but this loadmaster expects {expected}\n\
-         delete it once no loadmaster jobs are running",
-        path.display()
-    )]
-    SchemaVersion {
-        path: PathBuf,
-        found: i64,
-        expected: i64,
-    },
-
-    #[error(
         "cannot write to the state directory {} ({detail})\n\
          loadmaster keeps the queue that every agent on this machine shares there; in an \
          agent's sandbox, allow writing to it (see \"Let it write the state directory\" in \

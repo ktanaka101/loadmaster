@@ -42,6 +42,15 @@ impl ProcessId {
         }
     }
 
+    /// Whether this exact process is stopped (Ctrl-Z, SIGSTOP), so that it
+    /// acts on nothing until it is continued. False when the OS cannot tell.
+    pub fn is_stopped(&self) -> bool {
+        inspect(self.pid)
+            .ok()
+            .flatten()
+            .is_some_and(|seen| seen.start_time == self.start_time && seen.stopped)
+    }
+
     /// Sends `signal` to this exact process. `Ok(false)` if it is gone, so a
     /// PID the OS has since given to another process is never hit (but for
     /// a reuse within the instant between the check and the signal).
@@ -231,14 +240,27 @@ fn proc_shows_all_pids() -> bool {
     })
 }
 
+/// What is known of a running process.
+struct Seen {
+    start_time: u64,
+    /// Stopped by a signal (Ctrl-Z, SIGSTOP), which SIGCONT ends.
+    stopped: bool,
+}
+
 /// Start time of `pid`, or `None` if no such (non-zombie) process exists.
+fn start_time(pid: u32) -> io::Result<Option<u64>> {
+    Ok(inspect(pid)?.map(|seen| seen.start_time))
+}
+
+/// What is known of `pid`, or `None` if no such (non-zombie) process exists.
 ///
 /// `proc_pidinfo` is fast (well under a microsecond) but fails with EPERM for
 /// other users' processes, and a dead job's PID may since have gone to one.
 /// Those fall back to `sysctl(KERN_PROC_PID)`, which works for any process but
 /// is about 40 times slower.
 #[cfg(target_os = "macos")]
-fn start_time(pid: u32) -> io::Result<Option<u64>> {
+fn inspect(pid: u32) -> io::Result<Option<Seen>> {
+    const SSTOP: u32 = 4;
     const SZOMB: u32 = 5;
     let Ok(pid) = libc::c_int::try_from(pid) else {
         return Ok(None);
@@ -264,21 +286,22 @@ fn start_time(pid: u32) -> io::Result<Option<u64>> {
         if info.pbi_status == SZOMB {
             return Ok(None);
         }
-        return Ok(Some(
-            info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
-        ));
+        return Ok(Some(Seen {
+            start_time: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+            stopped: info.pbi_status == SSTOP,
+        }));
     }
     let err = io::Error::last_os_error();
     match err.raw_os_error() {
         Some(libc::ESRCH) => Ok(None),
-        Some(libc::EPERM) => start_time_any_user(pid),
+        Some(libc::EPERM) => inspect_any_user(pid),
         _ => Err(err),
     }
 }
 
-/// [`start_time`] for a process of any user, via `sysctl(KERN_PROC_PID)`.
+/// [`inspect`] for a process of any user, via `sysctl(KERN_PROC_PID)`.
 #[cfg(target_os = "macos")]
-fn start_time_any_user(pid: libc::c_int) -> io::Result<Option<u64>> {
+fn inspect_any_user(pid: libc::c_int) -> io::Result<Option<Seen>> {
     use std::ffi::{c_char, c_int, c_void};
 
     /// The leading fields of `struct kinfo_proc` (its `kp_proc` member, a
@@ -293,6 +316,7 @@ fn start_time_any_user(pid: libc::c_int) -> io::Result<Option<u64>> {
         p_flag: c_int,
         p_stat: c_char,
     }
+    const SSTOP: c_char = 4;
     const SZOMB: c_char = 5;
 
     // sizeof(struct kinfo_proc) is 648; leave room in case it ever grows.
@@ -329,21 +353,30 @@ fn start_time_any_user(pid: libc::c_int) -> io::Result<Option<u64>> {
         return Ok(None);
     }
     let start = head.p_starttime;
-    Ok(Some(start.tv_sec as u64 * 1_000_000 + start.tv_usec as u64))
+    Ok(Some(Seen {
+        start_time: start.tv_sec as u64 * 1_000_000 + start.tv_usec as u64,
+        stopped: head.p_stat == SSTOP,
+    }))
 }
 
-/// Start time of `pid`, or `None` if no such (non-zombie) process exists.
+/// What is known of `pid`, or `None` if no such (non-zombie) process exists.
 #[cfg(target_os = "linux")]
-fn start_time(pid: u32) -> io::Result<Option<u64>> {
+fn inspect(pid: u32) -> io::Result<Option<Seen>> {
     Ok(read_stat(pid)?
         .filter(|stat| stat.running)
-        .map(|stat| stat.start_time))
+        .map(|stat| Seen {
+            start_time: stat.start_time,
+            stopped: stat.stopped,
+        }))
 }
 
 #[cfg(target_os = "linux")]
 struct Stat {
     /// False for a process that has fully exited (a zombie).
     running: bool,
+    /// Stopped by a signal (T). A debugger's stop (t) is not: SIGCONT
+    /// does not end it.
+    stopped: bool,
     pgrp: u32,
     start_time: u64,
 }
@@ -374,7 +407,8 @@ fn read_stat(pid: u32) -> io::Result<Option<Stat>> {
     // fields[i] is field i + 3: state (3), pgrp (5), num_threads (20),
     // starttime (22).
     let field = |i: usize| fields.get(i).copied().ok_or_else(malformed);
-    let running = match field(0)? {
+    let state = field(0)?;
+    let running = match state {
         "X" | "x" => false,
         // A thread-group leader that called pthread_exit shows as a zombie
         // while its other threads keep the process running. Field 20 is
@@ -384,6 +418,7 @@ fn read_stat(pid: u32) -> io::Result<Option<Stat>> {
     };
     Ok(Some(Stat {
         running,
+        stopped: state == "T",
         pgrp: field(2)?.parse().map_err(|_| malformed())?,
         start_time: field(19)?.parse().map_err(|_| malformed())?,
     }))
@@ -459,11 +494,54 @@ mod tests {
     /// Checks the hand-written `kinfo_proc` layout against `proc_pidinfo`.
     #[cfg(target_os = "macos")]
     #[test]
-    fn both_macos_start_time_sources_agree() {
-        let pid = std::process::id();
-        let fast = start_time(pid).unwrap().unwrap();
-        let any_user = start_time_any_user(pid as libc::c_int).unwrap().unwrap();
-        assert_eq!(fast, any_user);
+    fn both_macos_sources_agree() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        for stopped in [false, true] {
+            if stopped {
+                // SAFETY: kill has no memory-safety preconditions.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let fast = inspect(pid).unwrap().unwrap();
+            let any_user = inspect_any_user(pid as libc::c_int).unwrap().unwrap();
+            assert_eq!(
+                (fast.start_time, fast.stopped),
+                (any_user.start_time, any_user.stopped)
+            );
+            assert_eq!(fast.stopped, stopped);
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_stopped_process_is_stopped_until_continued() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        let process = ProcessId::of(child.id()).unwrap().unwrap();
+        assert!(!process.is_stopped());
+        let wait_for = |stopped: bool| {
+            for _ in 0..100 {
+                if process.is_stopped() == stopped {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("never became stopped={stopped}");
+        };
+        assert!(process.signal(libc::SIGSTOP).unwrap());
+        wait_for(true);
+        assert!(process.is_alive(), "stopped is not gone");
+        assert!(process.signal(libc::SIGCONT).unwrap());
+        wait_for(false);
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

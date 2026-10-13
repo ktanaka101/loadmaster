@@ -201,12 +201,15 @@ same moment on a fresh state directory occasionally got "database is locked"
 (found in the real-tools demo, about 1 run in 300). The switch is retried for
 up to the busy timeout; everything else relies on SQLite's busy handler.
 
-The schema version lives in `PRAGMA user_version`. A database from an older
-version is upgraded in place (version 1 gains each job's capacity and mode);
-an older `loadmaster` refuses a newer database with an error instead of
-guessing. The version only changes for a change that older versions cannot
-work with: a table that they never read, such as the one for cancel
-requests, is added without one, so they keep sharing the database.
+The version of the database's layout is in its file name (`queue-v1.db`): a
+`loadmaster` that changes the layout uses a new file, and never opens, reads
+or upgrades one of another layout. Versions with different layouts keep
+separate queues, and do not see each other's jobs; while both run, as for
+the few minutes of an upgrade, the machine can be loaded beyond its capacity.
+That is the price of having no code for other layouts: a queue only holds
+the jobs that run now, so nothing in it is worth carrying over. The schema
+is made once, in a write transaction, by the first process to open the file;
+`PRAGMA user_version` marks it as made.
 
 ## Job IDs are never reused
 
@@ -339,8 +342,7 @@ that one agent works in.
 - A task gets SIGTERM at most once, from a cancel or forwarded from
   outside alike: a second one would cut short the clean-up the first
   started (as in a handler registered with `process.once`), and with several
-  sources (a cancel, its fallback, a tool's timeout) it would otherwise come
-  up. Its `loadmaster` sends it, so that one rule covers every path through
+  sources (a cancel, a tool's timeout) it would otherwise come up. Its `loadmaster` sends it, so that one rule covers every path through
   it. When it hands the slot over to the processes its task left behind, it
   passes on the signals that arrived meanwhile and records whether the task
   had a SIGTERM, in the same write transaction as the handover, so a
@@ -351,30 +353,26 @@ that one agent works in.
   there to force a task: `--kill`, as often as it takes.
 - A job has one request row, kept until the job is gone, with the strongest
   stop asked for (several `cancel`s are that one row) and the strongest one
-  done, by its `loadmaster` and by a `cancel` signalling the job itself. Its
-  `loadmaster` acts on what it has not done yet; a `cancel` that asks for no
-  more than was done does nothing, so a second plain cancel never reaches a
-  job already stopping, even if its `loadmaster` is stopped by then. Each
+  done, by its `loadmaster` and by a `cancel` signalling the task of a job
+  whose `loadmaster` is gone. Its `loadmaster` acts on what it has not done
+  yet; a `cancel` that asks for no more than was done does nothing, so a
+  second plain cancel never makes a job already stopping stop again. Each
   step is one write transaction, so each stop is done once.
-- The requests live in a table that older versions never read, added
-  without a new schema version: they would refuse a database with a newer
-  one, and different branches run different versions on one machine. A job
-  of an older `loadmaster` does not act on its request, nor does one stopped
-  with Ctrl-Z, so after 2 seconds `cancel` signals the job itself, where
-  that is allowed (checked by PID and start time), and sends SIGCONT along.
-  It decides, signals and records the signal in one write transaction, by
-  the job's state at that moment, so no `loadmaster` can act on the request
-  or hand its slot over in between; if the signal is refused, the
+- A `loadmaster` stopped with Ctrl-Z acts on nothing, not even on its task
+  exiting, so `cancel` continues it (SIGCONT, checked by PID and start time),
+  and it then acts on the request itself. Only a stopped one is continued: one
+  that is merely slow to look (behind a locked database, say) needs nothing,
+  so a `cancel` in a sandbox, which may not signal it, does not fail for it.
+  If continuing it is refused, `cancel` says why and how to stop the job
+  instead; the request stays, so the job stops once its `loadmaster` is
+  continued.
+- A task whose `loadmaster` is gone is signalled from `cancel`: SIGTERM if
+  nobody has sent it one (its `loadmaster` may have, before it handed the
+  slot over to the processes the task left behind), SIGKILL whenever asked.
+  It decides, signals and records the signal in one write transaction, so
+  no other `cancel` can send it in between; if the signal is refused, the
   transaction is rolled back, so a `cancel` run outside the sandbox can
-  still send it, and `cancel` says why and how to stop the job instead. The
-  record names the `loadmaster` the signal went to: a re-run that resumed
-  the place after the signalled one parked is another, and gets its own.
-  The request stays, so a `loadmaster` that comes back, or that ignored the
-  signal (one started with SIGTERM ignored), still acts on it.
-- A task whose `loadmaster` is gone is signalled from `cancel`, in the same
-  kind of transaction: SIGTERM if nobody has sent it one (its `loadmaster`
-  may have, before it handed the slot over to the processes the task left
-  behind), SIGKILL whenever asked.
+  still send it.
   So a waiting job whose `loadmaster` was killed after its task had started
   has that task killed too. Two gaps are left, both needing a `loadmaster`
   killed with SIGKILL at a particular moment. Killed between taking a
@@ -402,7 +400,10 @@ that one agent works in.
   record, as the reaper does for `lost` jobs, and the report leaves those
   checks out: a cancel says nothing about the machine. The report matches the
   record to the run by job ID, task and directory, and by when the job got in
-  line (IDs start over if the database is deleted).
+  line, within two minutes. IDs start over in a new database (one deleted,
+  or the file of a new layout), so a run is taken for a canceled one only if
+  two databases gave them the same ID for the same task and directory within
+  those two minutes: two queues in use from one directory at once.
 
 ## Load outside the queue
 
@@ -535,8 +536,8 @@ fits, or a job that can affect its decision (a running one, or one ahead of
 it) is dead and must be reaped. Otherwise every waiter would take the write
 lock ten times a second and compete with the writes that matter, such as
 recording a task that is held at its gate. The decision is always made again
-under the lock before admitting. `Queue::open` likewise checks the schema
-version without the lock. A running task is polled for exit every 20 ms. The waiting message is
+under the lock before admitting. `Queue::open` likewise checks that the
+schema has been made without the lock. A running task is polled for exit every 20 ms. The waiting message is
 printed when a job starts waiting and then every 10 seconds: often enough to
 show progress, rarely enough not to flood an agent's context.
 
@@ -608,8 +609,10 @@ killed after parking (while its message to a full stderr blocks, say) would
 otherwise leave no line. Killed before parking, its job is reaped and logged
 as `lost`, and the report joins that line to the `gave_up` one as a single
 check. JSON Lines is easy to analyze with `jq`. It is not rotated.
-Fields added later are optional when read back, so older logs still work with
-`loadmaster report`.
+`loadmaster report` reads only records of the format this version writes, and
+says how many lines it skipped: a record of an older format may lack what the
+report judges by (whether a task passed, or had started), and guessing would
+misreport it.
 
 Known gaps, each needing an unusual combination of events, accepted rather
 than paid for with per-attempt IDs and logging inside the queue's
@@ -625,8 +628,6 @@ transactions:
   locked for the whole 60-second busy timeout), `loadmaster` warns, exits with
   the task's code and logs its result, and the job is later also logged as
   `lost`. The slot stays held until the task's processes are gone either way.
-- While a `loadmaster` from before `lost` logging is still running during an
-  upgrade, it can reap jobs without logging them.
 
 ## Measuring the effect
 
@@ -645,8 +646,8 @@ so users need a way to find out from their own use.
   so `report` joins all records of a job ID until one ends in something other
   than `gave_up`. Its wait runs from the first time it got in line to the
   start, which includes the agent's own delay before re-running: that delay is
-  part of what admission costs. Job IDs restart if the database is deleted,
-  so a record only joins a kept place if it has the queue's resume key (caller
+  part of what admission costs. Job IDs restart in a new database (one
+  deleted, or the file of a new layout), so a record only joins a kept place if it has the queue's resume key (caller
   directory, task, arguments) and starts within the place's lifetime of giving
   up (120 seconds, plus two minutes for a busy database and clocks). A `lost`
   record carries the time the job first got in line, so it may start earlier
@@ -654,22 +655,19 @@ so users need a way to find out from their own use.
 - **Results**: an exit code in the task's `ok_exit_codes` (`[0]` unless set)
   is passed and any other code failed, so a task that exits with 143 on its
   own is a failure. A check that reports "differences found" with a non-zero
-  code would otherwise bury load-induced failures among its findings; records
-  from before `ok` was logged pass only with 0. A task killed by a signal
-  (recorded from its exit status), or a `lost` run whose task had started, is
-  killed: the harm admission is meant to remove. A signal while waiting, a
+  code would otherwise bury load-induced failures among its findings. A task
+  killed by a signal (recorded from its exit status), or a `lost` run whose
+  task had started, is killed: the harm admission is meant to remove. A signal while waiting, a
   `lost` run that was still waiting, and a place given up and never resumed
   left the line: the cost of waiting. A `lost` run counts as started once
   its task's process group was recorded, since the task is let through right
-  after that; a job admitted but killed before then never ran. The two used to share one column, and
-  the first real user had to tell them apart by hand (run time 0); a period
-  of admission would otherwise look worse for its timeouts in line than a
-  baseline that never waits. `lost` records say whether the task had started
-  (`started`); older ones count as killed. A failed spawn and a loadmaster
-  error are not run. Records without a `signal` field (from before it was
-  logged; `null` means "not killed") fall back to treating 129–192 as killed.
-  A wait that never ended in a start still counts, up to when it ended, so
-  waits that ran into a timeout are not hidden.
+  after that; a job admitted but killed before then never ran. The two used
+  to share one column, and the first real user had to tell them apart by hand
+  (run time 0); a period of admission would otherwise look worse for its
+  timeouts in line than a baseline that never waits. `lost` records say
+  whether the task had started (`started`). A failed spawn and a loadmaster
+  error are not run. A wait that never ended in a start still counts, up to
+  when it ended, so waits that ran into a timeout are not hidden.
 - **Cores**: CORES MED and CORES P90 are the median and 90th percentile of
   each passed run's CPU time divided by its run time. A median alone hid a
   task that sometimes used far more than its weight (10.7 cores against 8 in

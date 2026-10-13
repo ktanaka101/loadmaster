@@ -243,7 +243,7 @@ fn a_state_directory_it_may_not_write_is_named() {
 #[test]
 fn a_broken_queue_is_not_blamed_on_permissions() {
     let sandbox = Sandbox::new(4, &task("lint", 1, &["true"]));
-    std::fs::create_dir(sandbox.state.join("state.db")).unwrap();
+    std::fs::create_dir(sandbox.state.join(loadmaster::queue::QUEUE_DB_FILE)).unwrap();
     let output = sandbox.run(&["status"]);
     assert_eq!(output.status.code(), Some(125));
     let err = stderr(&output);

@@ -8,7 +8,7 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let queue = Queue::open(&dir.path().join(STATE_DB_FILE)).unwrap();
+    let queue = Queue::open(&dir.path().join(QUEUE_DB_FILE)).unwrap();
     Fixture {
         _dir: dir,
         queue,
@@ -66,14 +66,14 @@ fn admits_jobs_up_to_capacity() {
     let a = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
     let b = f.queue.enqueue(&request("lint", 4, &[]), f.me).unwrap();
     let c = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
-    assert_eq!(a.try_admit(8).unwrap(), Admission::Admitted);
-    assert_eq!(b.try_admit(8).unwrap(), Admission::Admitted);
+    assert_eq!(a.try_admit().unwrap(), Admission::Admitted);
+    assert_eq!(b.try_admit().unwrap(), Admission::Admitted);
     assert_eq!(
-        said(c.try_admit(8).unwrap()),
+        said(c.try_admit().unwrap()),
         "0 ahead; waits for 1 core (8 of 8 in use)"
     );
     drop(a);
-    assert_eq!(c.try_admit(8).unwrap(), Admission::Admitted);
+    assert_eq!(c.try_admit().unwrap(), Admission::Admitted);
     assert_eq!(f.queue.snapshot().unwrap().used(), 5);
 }
 
@@ -81,22 +81,22 @@ fn admits_jobs_up_to_capacity() {
 fn small_jobs_never_overtake_the_head() {
     let f = fixture();
     let running = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-    assert_eq!(running.try_admit(8).unwrap(), Admission::Admitted);
+    assert_eq!(running.try_admit().unwrap(), Admission::Admitted);
     let big = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
     let small = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
     // The small job would fit, but the big one is ahead of it.
     assert_eq!(
-        said(small.try_admit(8).unwrap()),
+        said(small.try_admit().unwrap()),
         "1 ahead; waits for 1 core (behind #2 `e2e`, which waits for them too)"
     );
     assert_eq!(
-        said(big.try_admit(8).unwrap()),
+        said(big.try_admit().unwrap()),
         "0 ahead; waits for all 8 cores (4 in use)"
     );
     drop(running);
-    assert_eq!(big.try_admit(8).unwrap(), Admission::Admitted);
+    assert_eq!(big.try_admit().unwrap(), Admission::Admitted);
     assert_eq!(
-        said(small.try_admit(8).unwrap()),
+        said(small.try_admit().unwrap()),
         "0 ahead; waits for 1 core (8 of 8 in use)"
     );
 }
@@ -105,12 +105,12 @@ fn small_jobs_never_overtake_the_head() {
 fn dropping_a_waiting_ticket_leaves_the_line() {
     let f = fixture();
     let running = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
-    running.try_admit(8).unwrap();
+    running.try_admit().unwrap();
     let head = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
     let next = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
     drop(head);
     drop(running);
-    assert_eq!(next.try_admit(8).unwrap(), Admission::Admitted);
+    assert_eq!(next.try_admit().unwrap(), Admission::Admitted);
     assert_eq!(f.queue.snapshot().unwrap().jobs.len(), 1);
 }
 
@@ -123,7 +123,7 @@ fn reaps_jobs_whose_owner_died() {
         .unwrap();
     let alive = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
     // The dead head would block everyone; reaping removes it.
-    assert_eq!(alive.try_admit(8).unwrap(), Admission::Admitted);
+    assert_eq!(alive.try_admit().unwrap(), Admission::Admitted);
     std::mem::forget(dead);
     let snapshot = f.queue.snapshot().unwrap();
     assert_eq!(snapshot.jobs.len(), 1);
@@ -133,7 +133,7 @@ fn reaps_jobs_whose_owner_died() {
 fn running_job_survives_its_owner_while_child_group_lives() {
     let f = fixture();
     let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-    ticket.try_admit(8).unwrap();
+    ticket.try_admit().unwrap();
     let task = LiveGroup::start();
     f.queue.record_child(ticket.id(), task.group).unwrap();
     f.queue
@@ -182,13 +182,13 @@ impl Drop for LiveGroup {
 fn detached_slot_is_held_until_the_group_exits() {
     let f = fixture();
     let live = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-    live.try_admit(8).unwrap();
+    live.try_admit().unwrap();
     let task = LiveGroup::start();
     f.queue.record_child(live.id(), task.group).unwrap();
     live.hand_over(|| false).unwrap();
 
     let gone = f.queue.enqueue(&request("lint", 2, &[]), f.me).unwrap();
-    gone.try_admit(8).unwrap();
+    gone.try_admit().unwrap();
     let mut child = std::process::Command::new("true").spawn().unwrap();
     child.wait().unwrap();
     let dead_group = ProcessGroup {
@@ -214,7 +214,7 @@ fn parked_job_keeps_its_place_and_can_be_resumed() {
         ..request("test", 4, args)
     };
     let running = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
-    running.try_admit(8).unwrap();
+    running.try_admit().unwrap();
     let first = f.queue.enqueue(&small(&args), f.me).unwrap();
     let first_id = first.id();
     first.park().unwrap();
@@ -225,9 +225,9 @@ fn parked_job_keeps_its_place_and_can_be_resumed() {
     assert!(resumed.resumed());
     assert_eq!(resumed.id(), first_id);
     drop(running);
-    assert_eq!(resumed.try_admit(4).unwrap(), Admission::Admitted);
+    assert_eq!(resumed.try_admit().unwrap(), Admission::Admitted);
     assert_eq!(
-        said(later.try_admit(4).unwrap()),
+        said(later.try_admit().unwrap()),
         "0 ahead; waits for all 4 cores (4 in use)"
     );
 }
@@ -268,7 +268,7 @@ fn parked_head_blocks_until_it_expires() {
     parked.park().unwrap();
     let next = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
     assert_eq!(
-        said(next.try_admit(8).unwrap()),
+        said(next.try_admit().unwrap()),
         "1 ahead; waits for 1 core (8 free, but 8 set aside for #1 `e2e`)"
     );
     let expired = unix_ms(SystemTime::now() - PARK_TTL - Duration::from_secs(1));
@@ -279,7 +279,7 @@ fn parked_head_blocks_until_it_expires() {
             params![parked_id, expired],
         )
         .unwrap();
-    assert_eq!(next.try_admit(8).unwrap(), Admission::Admitted);
+    assert_eq!(next.try_admit().unwrap(), Admission::Admitted);
 }
 
 #[test]
@@ -287,7 +287,7 @@ fn live_holder_check() {
     let f = fixture();
     let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
     assert_eq!(f.queue.holder(ticket.id()).unwrap(), None, "waiting");
-    ticket.try_admit(8).unwrap();
+    ticket.try_admit().unwrap();
     let holder = f.queue.holder(ticket.id()).unwrap().unwrap();
     assert_eq!(
         (holder.id, holder.dir.as_path()),
@@ -363,7 +363,7 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
     std::mem::forget(waiting);
     // Killed while running; its task has exited too.
     let running = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-    running.try_admit(8).unwrap();
+    running.try_admit().unwrap();
     let gone = ProcessGroup {
         pgid: f.me.pid,
         leader_start_time: Some(f.me.start_time + 1),
@@ -382,7 +382,7 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
     // ran, since it is let through only after its group is recorded.
     // It waited, as checks that never started do, until it ended.
     let admitted = f.queue.enqueue(&request("build", 1, &[]), f.me).unwrap();
-    admitted.try_admit(8).unwrap();
+    admitted.try_admit().unwrap();
     f.queue
         .conn
         .execute(
@@ -436,7 +436,7 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
 fn a_detached_job_is_not_logged_when_reaped() {
     let f = fixture();
     let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-    ticket.try_admit(8).unwrap();
+    ticket.try_admit().unwrap();
     let mut child = std::process::Command::new("true").spawn().unwrap();
     child.wait().unwrap();
     let gone = ProcessGroup {
@@ -453,7 +453,7 @@ fn a_detached_job_is_not_logged_when_reaped() {
 fn admit_now_ignores_the_line_and_the_capacity() {
     let f = fixture();
     let big = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
-    big.try_admit(8).unwrap();
+    big.try_admit().unwrap();
     let parked = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
     parked.park().unwrap();
     let late = f.queue.enqueue(&request("lint", 4, &[]), f.me).unwrap();
@@ -462,84 +462,38 @@ fn admit_now_ignores_the_line_and_the_capacity() {
 }
 
 #[test]
-fn migrates_a_version_1_database() {
+fn processes_opening_a_new_database_at_once_make_its_schema_once() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(STATE_DB_FILE);
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute_batch("PRAGMA user_version = 1").unwrap();
-        conn.execute(
-            "INSERT INTO jobs (task, weight, state, dir, args, command, enqueued_at)
-             VALUES ('old', 1, 'parked', x'2f', '[]', 'old', 0)",
-            [],
-        )
-        .unwrap();
-    }
-    let queue = Queue::open(&path).unwrap();
-    let version: i64 = queue
-        .conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, SCHEMA_VERSION);
-    let jobs = load_jobs(&queue.conn).unwrap();
-    assert_eq!(jobs[0].capacity, None);
-    assert!(!jobs[0].measure_only);
-    assert_eq!(jobs[0].uses, []);
-    assert_eq!(jobs[0].checkout, None);
-}
-
-#[test]
-fn migrates_a_version_2_database() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(STATE_DB_FILE);
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute_batch(MIGRATIONS[0]).unwrap();
-        conn.execute_batch("PRAGMA user_version = 2").unwrap();
-        conn.execute(
-            "INSERT INTO jobs (task, weight, state, dir, args, command, enqueued_at, capacity)
-             VALUES ('old', 1, 'parked', x'2f', '[]', 'old', 0, 8)",
-            [],
-        )
-        .unwrap();
-    }
-    let queue = Queue::open(&path).unwrap();
-    let jobs = load_jobs(&queue.conn).unwrap();
-    assert_eq!(jobs[0].capacity, Some(8));
-    assert_eq!(jobs[0].uses, []);
-    assert_eq!(jobs[0].checkout, None);
-}
-
-#[test]
-fn a_version_3_database_gains_cancel_requests_without_a_new_version() {
-    // As an older loadmaster leaves it, with a request it never deleted.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(STATE_DB_FILE);
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        for migration in MIGRATIONS {
-            conn.execute_batch(migration).unwrap();
+    let path = dir.path().join(QUEUE_DB_FILE);
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                barrier.wait();
+                Queue::open(&path).unwrap();
+            });
         }
-        conn.execute_batch("PRAGMA user_version = 3").unwrap();
-    }
+    });
     let queue = Queue::open(&path).unwrap();
     let version: i64 = queue
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3, "older versions must still open it");
+    assert_eq!(version, 1);
+    assert!(queue.snapshot().unwrap().jobs.is_empty());
+}
+
+/// Whether a stop has been asked for job `id` that nobody has done yet.
+fn cancel_pending(queue: &Queue, id: JobId) -> bool {
     queue
         .conn
-        .execute("INSERT INTO cancel_requests (job, kill) VALUES (99, 0)", [])
-        .unwrap();
-    queue.reap().unwrap();
-    assert!(
-        !queue.cancel_pending(99).unwrap(),
-        "a request without its job is dropped"
-    );
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM cancel_requests
+                            WHERE job = ?1 AND kill > max(owner_done, signal_done))",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -551,13 +505,13 @@ fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
         f.queue.stop(ticket.id(), false).unwrap(),
         Canceled::Requested(_)
     ));
-    assert!(f.queue.cancel_pending(ticket.id()).unwrap());
+    assert!(cancel_pending(&f.queue, ticket.id()));
     assert_eq!(ticket.cancel_requested().unwrap(), Some(false));
     assert_eq!(ticket.cancel_requested().unwrap(), None, "taken once");
 
     // Asking again for no more than was done does nothing: no second SIGTERM.
     f.queue.stop(ticket.id(), false).unwrap();
-    assert!(!f.queue.cancel_pending(ticket.id()).unwrap());
+    assert!(!cancel_pending(&f.queue, ticket.id()));
     assert_eq!(ticket.cancel_requested().unwrap(), None);
     // Asking for SIGKILL is new; nothing goes above it.
     f.queue.stop(ticket.id(), true).unwrap();
@@ -567,7 +521,7 @@ fn a_cancel_request_is_taken_once_and_goes_with_its_job() {
 
     let id = ticket.id();
     drop(ticket);
-    assert!(!f.queue.cancel_pending(id).unwrap(), "gone with its job");
+    assert!(!cancel_pending(&f.queue, id), "gone with its job");
 }
 
 #[test]
@@ -576,7 +530,7 @@ fn a_sigterm_recorded_at_handover_is_not_sent_again() {
     // on; a cancel, which signals them itself, must not send another.
     let f = fixture();
     let ticket = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
-    assert_eq!(ticket.try_admit(8).unwrap(), Admission::Admitted);
+    assert_eq!(ticket.try_admit().unwrap(), Admission::Admitted);
     let left_behind = LiveGroup::start();
     f.queue
         .record_child(ticket.id(), left_behind.group)
@@ -587,22 +541,8 @@ fn a_sigterm_recorded_at_handover_is_not_sent_again() {
         f.queue.stop(id, false).unwrap(),
         Canceled::Requested(_)
     ));
-    assert!(!f.queue.cancel_pending(id).unwrap());
+    assert!(!cancel_pending(&f.queue, id));
     assert!(left_behind.group.is_alive(), "not signalled");
-}
-
-#[test]
-fn refuses_a_newer_database() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(STATE_DB_FILE);
-    Connection::open(&path)
-        .unwrap()
-        .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
-        .unwrap();
-    let Err(Error::SchemaVersion { found, .. }) = Queue::open(&path) else {
-        panic!("expected a schema version error");
-    };
-    assert_eq!(found, SCHEMA_VERSION + 1);
 }
 
 #[test]
@@ -618,7 +558,7 @@ fn records_uses_and_checkout() {
     let job = f.queue.snapshot().unwrap().jobs.remove(0);
     assert_eq!(job.id, ticket.id());
     assert_eq!(job.uses, uses);
-    assert_eq!(job.checkout.as_deref(), Some(Path::new("/repo-a")));
+    assert_eq!(job.checkout, Path::new("/repo-a"));
 }
 
 // ---- The admission rule with resources, on jobs built in memory. ----
@@ -671,17 +611,17 @@ fn job(id: JobId, state: JobState, weight: u32, uses: Vec<Use>, checkout: &str) 
         enqueued_at: UNIX_EPOCH,
         parked_at: None,
         started_at: None,
-        capacity: Some(8),
+        capacity: 8,
         measure_only: false,
         uses,
-        checkout: Some(PathBuf::from(checkout)),
+        checkout: PathBuf::from(checkout),
     }
 }
 
 use JobState::{Running, Waiting};
 
 fn admitted(jobs: &[Job], id: JobId) -> bool {
-    decide(jobs, id, 8).unwrap() == Admission::Admitted
+    decide(jobs, id).unwrap() == Admission::Admitted
 }
 
 #[test]
@@ -694,7 +634,7 @@ fn a_job_short_of_a_resource_holds_back_only_that_resource() {
         job(5, Waiting, 2, vec![db(1)], "/d"),
     ];
     assert_eq!(
-        said(decide(&jobs, 3, 8).unwrap()),
+        said(decide(&jobs, 3).unwrap()),
         "0 ahead; waits for `db` (2 of 2 in use by #1 `job1` and #2 `job2`); \
          sets aside 2 cores and `db` in its checkout"
     );
@@ -720,7 +660,7 @@ fn a_job_waiting_for_a_resource_says_what_it_sets_aside() {
     jobs[0].task = "ui".into();
     jobs[1].task = "unit".into();
     jobs[2].task = "lint".into();
-    let said_for = |id| said(decide(&jobs, id, 8).unwrap());
+    let said_for = |id| said(decide(&jobs, id).unwrap());
     assert_eq!(
         said_for(2),
         "0 ahead; waits for `browser` (1 of 1 in use by #1 `ui`); sets aside 2 cores"
@@ -736,10 +676,10 @@ fn a_smaller_limit_ahead_is_named_as_the_cause() {
     // A job queued under capacity 1 is parked ahead: the job behind it fits
     // in its own capacity of 8, but respects that one's.
     let mut small = job(1, JobState::Parked, 1, vec![], "/a");
-    small.capacity = Some(1);
+    small.capacity = 1;
     let jobs = [small, job(2, Waiting, 4, vec![], "/b")];
     assert_eq!(
-        said(decide(&jobs, 2, 8).unwrap()),
+        said(decide(&jobs, 2).unwrap()),
         "1 ahead; waits for 4 cores (#1 `job1`, ahead, got in line with a limit of 1)"
     );
 }
@@ -760,12 +700,12 @@ fn what_a_waiting_job_sets_aside_includes_unlimited_resources() {
         job(3, Waiting, 1, vec![gpu(Some(1))], "/b"),
     ];
     assert_eq!(
-        said(decide(&jobs, 2, 8).unwrap()),
+        said(decide(&jobs, 2).unwrap()),
         "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
          sets aside 1 core, `db` and `gpu`"
     );
     assert_eq!(
-        said(decide(&jobs, 3, 8).unwrap()),
+        said(decide(&jobs, 3).unwrap()),
         "1 ahead; waits for `gpu` (1 free, but 1 set aside for #2 `job2`); sets aside 1 core"
     );
 }
@@ -808,7 +748,7 @@ fn per_checkout_limits_count_only_their_checkout() {
         job(3, Waiting, 2, vec![db(1)], "/b"),
     ];
     assert_eq!(
-        said(decide(&same_checkout, 2, 8).unwrap()),
+        said(decide(&same_checkout, 2).unwrap()),
         "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
          sets aside 2 cores and `db`"
     );
@@ -862,7 +802,7 @@ fn a_job_behind_respects_the_smallest_limit_ahead() {
     // capacity 4 and waits for a db; job 2 says 8, but taking 3 cores would
     // leave job 1 too little by its own measure once a db frees up.
     let mut short_of_db = job(1, Waiting, 3, vec![db(1)], "/a");
-    short_of_db.capacity = Some(4);
+    short_of_db.capacity = 4;
     let jobs = [
         job(3, Running, 1, vec![db(1)], "/a"),
         short_of_db,
@@ -932,7 +872,7 @@ fn assert_within_limits(jobs: &[Job]) {
     let mut used: BTreeMap<Dim, u64> = BTreeMap::new();
     let mut limits: BTreeMap<Dim, u64> = BTreeMap::new();
     for job in jobs.iter().filter(|j| j.state == Running) {
-        for (dim, amount, limit) in demands(job, 8) {
+        for (dim, amount, limit) in demands(job) {
             *used.entry(dim).or_default() += amount;
             limits.insert(dim, limit);
         }
@@ -945,13 +885,13 @@ fn assert_within_limits(jobs: &[Job]) {
 /// Once no job can start, `explain` says so for every job, giving reasons,
 /// and agrees with the rule as each job applies it.
 fn assert_explained(jobs: &[Job]) {
-    let explained = explain(jobs, 8);
+    let explained = explain(jobs);
     assert_eq!(
         explained.len(),
         jobs.iter().filter(|j| j.state != Running).count()
     );
     for (id, admission) in explained {
-        assert_eq!(admission, decide(jobs, id, 8).unwrap());
+        assert_eq!(admission, decide(jobs, id).unwrap());
         match admission {
             Admission::Admitted => panic!("job {id} could start but did not"),
             Admission::Waiting(wait) => assert!(!wait.short.is_empty(), "job {id}"),

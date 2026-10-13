@@ -87,7 +87,7 @@ loadmaster is new (0.6). What has been verified:
 - A soak test simulates five agents with Claude Code-style timeouts (SIGTERM,
   then SIGKILL of the process group), re-runs after exit code 75, and crashes,
   in two checkouts with two resources besides CPU, while jobs are canceled at
-  random. 1656 runs (503 of them canceled) in 10 minutes on macOS and 503 in
+  random. 810 runs (231 of them canceled) in 5 minutes on macOS and 489 in
   3 minutes on Linux exceeded no limit, every task got through, and nothing
   was left behind.
 - A simulation checks, on random workloads with several resources, that no
@@ -481,13 +481,16 @@ file it names must exist, while a missing file in the default place means all
 defaults. Like `.loadmaster.toml`, the file can name the oldest loadmaster
 that reads it with `min_version`, for a file shared across machines.
 
-The queue lives in `~/.local/state/loadmaster/state.db` (`$XDG_STATE_HOME`,
-`LOADMASTER_STATE_DIR`). Next to it, `history.jsonl` gets one line per job
+The queue lives in `~/.local/state/loadmaster/queue-v1.db` (`$XDG_STATE_HOME`,
+`LOADMASTER_STATE_DIR`). The number is the version of its layout: loadmaster
+versions with different layouts keep separate queues and do not see each
+other's jobs, so give every agent on a machine the same version (as one
+`mise use -g` does). Next to it, `history.jsonl` gets one line per job
 (task, weight, resources, capacity, wait and run time, CPU time, load average,
 signal, exit code and whether it counts as passed), which `loadmaster report`
-summarizes. If `loadmaster` is killed
-before it can write its line, the process that later reclaims the job writes
-one with outcome `lost`.
+summarizes; it reads only lines of the format this version writes, and says
+how many others it skipped. If `loadmaster` is killed before it can write its
+line, the process that later reclaims the job writes one with outcome `lost`.
 
 ## How it works
 
@@ -592,9 +595,9 @@ loadmaster held [--uses RESOURCE]
   the line, and a running job's task gets SIGTERM, once, as described under
   [Signals](#how-it-works), with the slot freed once it exits. That needs no
   permission to signal another agent's processes, which sandboxes do not
-  give. A job whose `loadmaster` does not act on the request in time (from a
-  version before 0.6, or stopped with Ctrl-Z) or is gone is signalled
-  directly instead, where that is allowed. Canceling a job again asks for
+  give. A job whose `loadmaster` is stopped (Ctrl-Z) is continued so that it
+  can act on it, and one whose `loadmaster` is gone has its task signalled
+  directly, where that is allowed. Canceling a job again asks for
   nothing more unless it adds `--kill`. A kept place (exit code 75) is dropped.
   `--kill` asks for SIGKILL instead, for a task that does not stop; it gets
   no chance to clean up. `loadmaster report` leaves canceled checks out.

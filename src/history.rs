@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 /// File name of the history log inside the state directory.
 pub const HISTORY_FILE: &str = "history.jsonl";
@@ -45,9 +45,8 @@ pub struct Record<'a> {
     pub job: i64,
     pub task: &'a str,
     pub weight: u32,
-    /// The machine's capacity for this run (unknown only for lost jobs
-    /// queued by an older version).
-    pub capacity: Option<u32>,
+    /// The machine's capacity for this run.
+    pub capacity: u32,
     /// Whether the run was admitted without waiting (`measure_only`).
     pub measure_only: bool,
     /// Lossy for non-UTF-8 paths, so the record can always be written.
@@ -81,45 +80,40 @@ pub struct Record<'a> {
     pub uses: BTreeMap<String, u32>,
 }
 
-/// A record read back from the log. Fields that older versions did not write
-/// are optional.
+/// A record read back from the log, as [`Record`] writes it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Entry {
     pub job: i64,
     pub task: String,
     pub weight: u32,
-    #[serde(default)]
     pub dir: String,
-    #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
-    pub capacity: Option<u32>,
-    #[serde(default)]
+    pub capacity: u32,
     pub measure_only: bool,
     pub outcome: Outcome,
     pub queued_at: u64,
     pub wait_ms: u64,
     pub run_ms: Option<u64>,
-    #[serde(default)]
     pub cpu_ms: Option<u64>,
-    #[serde(default)]
     pub load: Option<f64>,
-    /// `None` if the record predates this field, `Some(None)` if the task
-    /// was not killed by a signal.
-    #[serde(default, deserialize_with = "present")]
-    pub signal: Option<Option<i32>>,
+    pub signal: Option<i32>,
     pub exit_code: Option<i32>,
-    #[serde(default)]
     pub started: Option<bool>,
-    #[serde(default)]
     pub ok: Option<bool>,
     #[serde(default)]
     pub uses: BTreeMap<String, u32>,
 }
 
-/// Tells a field that is present (even as `null`) from one that is missing.
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
-    T::deserialize(d).map(Some)
+impl Entry {
+    /// Whether it has what [`Record`] writes for its outcome. A record of
+    /// an older format may lack it, and would be misread.
+    fn is_whole(&self) -> bool {
+        match self.outcome {
+            Outcome::Exited => self.signal.is_some() || self.ok.is_some(),
+            Outcome::Lost => self.started.is_some(),
+            _ => true,
+        }
+    }
 }
 
 pub fn append(state_dir: &Path, record: &Record) -> io::Result<()> {
@@ -134,7 +128,8 @@ pub fn append(state_dir: &Path, record: &Record) -> io::Result<()> {
 }
 
 /// Reads every record of a history log, in file order, and counts the lines
-/// that could not be parsed (a line cut short by a crash, say).
+/// that are not records of this format (a line cut short by a crash, or one
+/// an older version wrote).
 pub fn read(path: &Path) -> io::Result<(Vec<Entry>, usize)> {
     let bytes = std::fs::read(path)?;
     let mut entries = Vec::new();
@@ -143,9 +138,9 @@ pub fn read(path: &Path) -> io::Result<(Vec<Entry>, usize)> {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        match serde_json::from_slice(line) {
-            Ok(entry) => entries.push(entry),
-            Err(_) => unreadable += 1,
+        match serde_json::from_slice::<Entry>(line) {
+            Ok(entry) if entry.is_whole() => entries.push(entry),
+            _ => unreadable += 1,
         }
     }
     Ok((entries, unreadable))
@@ -161,14 +156,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_read_back_and_bad_lines_are_counted() {
+    fn records_read_back_and_other_lines_are_counted() {
         let dir = tempfile::tempdir().unwrap();
         let args = ["a".to_owned()];
         let record = Record {
             job: 7,
             task: "test",
             weight: 4,
-            capacity: Some(8),
+            capacity: 8,
             measure_only: true,
             dir: Cow::Borrowed("/repo"),
             args: &args,
@@ -185,16 +180,24 @@ mod tests {
             uses: BTreeMap::from([("db".to_owned(), 1)]),
         };
         append(dir.path(), &record).unwrap();
-        append(
-            dir.path(),
-            &Record {
+        for record in [
+            Record {
                 outcome: Outcome::Lost,
                 started: Some(false),
                 ok: None,
                 ..record.clone()
             },
-        )
-        .unwrap();
+            // Killed by a signal, an exited task has no `ok`.
+            Record {
+                signal: Some(9),
+                exit_code: Some(137),
+                ok: None,
+                uses: BTreeMap::new(),
+                ..record.clone()
+            },
+        ] {
+            append(dir.path(), &record).unwrap();
+        }
         let path = dir.path().join(HISTORY_FILE);
         let mut text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -202,13 +205,20 @@ mod tests {
             1,
             "only lost records say"
         );
-        // A line from before `capacity` and `load` existed, and a torn line.
-        text += r#"{"job":8,"task":"lint","weight":1,"dir":"/r","args":[],"outcome":"gave_up","queued_at":2000,"wait_ms":5,"run_ms":null,"exit_code":75}"#;
-        text += "\n{\"job\":9,\"ta\n";
+        // Lines of older formats: an exit without `ok`, a lost job without
+        // `started`, a record without `capacity`; and a torn line.
+        let exited = r#""job":8,"task":"lint","weight":1,"dir":"/r","args":[],"queued_at":2000,"wait_ms":5,"run_ms":9,"signal":null,"exit_code":0"#;
+        text +=
+            &format!("{{{exited},\"capacity\":8,\"measure_only\":false,\"outcome\":\"exited\"}}\n");
+        text +=
+            &format!("{{{exited},\"capacity\":8,\"measure_only\":false,\"outcome\":\"lost\"}}\n");
+        text +=
+            &format!("{{{exited},\"measure_only\":false,\"outcome\":\"exited\",\"ok\":true}}\n");
+        text += "{\"job\":9,\"ta\n";
         std::fs::write(&path, text).unwrap();
 
         let (entries, unreadable) = read(&path).unwrap();
-        assert_eq!(unreadable, 1);
+        assert_eq!(unreadable, 4);
         assert_eq!(
             entries[0],
             Entry {
@@ -217,7 +227,7 @@ mod tests {
                 weight: 4,
                 dir: "/repo".into(),
                 args: vec!["a".into()],
-                capacity: Some(8),
+                capacity: 8,
                 measure_only: true,
                 outcome: Outcome::Exited,
                 queued_at: 1_000,
@@ -225,19 +235,16 @@ mod tests {
                 run_ms: Some(300),
                 cpu_ms: Some(600),
                 load: Some(2.5),
-                signal: Some(None),
+                signal: None,
                 exit_code: Some(1),
                 started: None,
                 ok: Some(false),
                 uses: BTreeMap::from([("db".to_owned(), 1)]),
             }
         );
-        assert!(entries[2].uses.is_empty());
         assert_eq!(entries[1].started, Some(false));
-        assert_eq!(entries[2].capacity, None);
-        assert_eq!(entries[2].signal, None);
-        assert_eq!(entries[2].started, None);
-        assert!(!entries[2].measure_only);
-        assert_eq!(entries[2].outcome, Outcome::GaveUp);
+        assert_eq!((entries[2].signal, entries[2].ok), (Some(9), None));
+        assert!(entries[2].uses.is_empty());
+        assert_eq!(entries.len(), 3);
     }
 }
