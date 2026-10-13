@@ -441,9 +441,11 @@ limit, was not taken, for three reasons this design answers:
   processes waiting for disks). Instead the machine's CPU time comes from the
   kernel's tick counters (each CPU's from `host_processor_info` on macOS, as
   the machine's own total is added up only once a second; `/proc/stat` on
-  Linux), measured over a quarter of a second. Measuring since an earlier
-  reading instead would count what a job that started and ended in between
-  used as outside. A reading in which a count went back (a counter wrapped,
+  Linux), measured over a quarter of a second and averaged with the last
+  measurement if that is at most 10 seconds old: on a Mac running other
+  agents' checks, single measurements 3 seconds apart ranged from 3 to 8
+  cores. Measuring since an earlier reading instead would count what a job
+  that started and ended in between used as outside. A reading in which a count went back (a counter wrapped,
   or Linux's iowait did) measures nothing. Waiting processes take turns
   measuring, through a row in the queue database that stands for 3 seconds. What the running jobs were granted counts as the
   queue's own; the rest is outside, including what a job uses beyond its

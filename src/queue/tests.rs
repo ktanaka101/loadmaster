@@ -1128,6 +1128,17 @@ fn the_cpu_is_measured_again_once_its_measurement_is_old() {
 }
 
 #[test]
+fn a_measurement_is_averaged_with_a_recent_one() {
+    let secs = Duration::from_secs;
+    assert_eq!(smoothed(Some(8.0), Some((2.0, secs(3)))), Some(5.0));
+    assert_eq!(smoothed(Some(8.0), Some((2.0, secs(20)))), Some(8.0));
+    assert_eq!(smoothed(Some(8.0), None), Some(8.0));
+    // Nothing measured this time: the recent one stands in.
+    assert_eq!(smoothed(None, Some((2.0, secs(3)))), Some(2.0));
+    assert_eq!(smoothed(None, Some((2.0, secs(20)))), None);
+}
+
+#[test]
 fn a_measurement_taken_earlier_does_not_replace_a_later_one() {
     let f = fixture();
     // Stored by another process, later than this one's (its clock is ahead).

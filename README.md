@@ -544,8 +544,8 @@ line, the process that later reclaims the job writes one with outcome `lost`.
   this keeps them usable on a smaller machine, such as a CI runner.
 - **CPU busy outside the queue**, such as a game, takes cores from the jobs
   that start. loadmaster measures how busy the machine's CPUs are, over a
-  quarter of a second at most every 3 seconds (from the kernel's CPU time,
-  not the load average), and
+  quarter of a second at most every 3 seconds, averaged with the measurement
+  before (from the kernel's CPU time, not the load average), and
   counts what its running jobs were granted as the queue's own. When the rest
   is more than the cores the capacity leaves free, a job starts with that many
   fewer cores, but at least one: a weight above that counts as all of it, so

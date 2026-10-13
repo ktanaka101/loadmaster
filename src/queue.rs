@@ -60,6 +60,9 @@ pub const PARK_TTL: Duration = Duration::from_secs(120);
 const CPU_FRESH: Duration = Duration::from_secs(3);
 /// How long the CPU is measured over.
 const CPU_SAMPLE: Duration = Duration::from_millis(250);
+/// A measurement this recent is averaged with the next, so that a moment's
+/// burst of other work does not decide what a job starts with.
+const CPU_SMOOTH: Duration = Duration::from_secs(10);
 
 // AUTOINCREMENT: IDs are never reused, so a stale LOADMASTER_HELD can never
 // point at an unrelated newer job.
@@ -722,7 +725,8 @@ impl Queue {
                 .duration_since(cpu.at)
                 .is_ok_and(|age| age < CPU_FRESH)
         };
-        if let Some(cpu) = read_cpu(&self.conn)?.filter(fresh) {
+        let last = read_cpu(&self.conn)?;
+        if let Some(cpu) = last.as_ref().filter(|cpu| fresh(cpu)) {
             return Ok(cpu.outside());
         }
         let Some(cores) = process::online_cpus().and_then(|n| u32::try_from(n).ok()) else {
@@ -748,10 +752,13 @@ impl Queue {
                 .sum()
         };
         let in_queue = in_queue(jobs).max(in_queue(&load_jobs(&self.conn)?));
-        let at = unix_ms(SystemTime::now());
+        let now = SystemTime::now();
         let busy = to
             .busy_since(from)
             .map(|share| (share * f64::from(cores) - in_queue as f64).clamp(0.0, f64::from(cores)));
+        let last = last.and_then(|cpu| Some((cpu.outside?, now.duration_since(cpu.at).ok()?)));
+        let busy = smoothed(busy, last);
+        let at = unix_ms(now);
         // Another process may have stored a later measurement meanwhile; that
         // one stands.
         let tx = self.begin()?;
@@ -1361,6 +1368,19 @@ fn reap(tx: &Transaction) -> Result<Vec<Job>> {
         delete_job(tx, job.id)?;
     }
     Ok(dead)
+}
+
+/// A new measurement of the CPU busy outside the queue (`None` if nothing
+/// could be measured), averaged with the last one and its age if that is
+/// younger than [`CPU_SMOOTH`].
+fn smoothed(now: Option<f64>, last: Option<(f64, Duration)>) -> Option<f64> {
+    let last = last
+        .filter(|&(_, age)| age < CPU_SMOOTH)
+        .map(|(busy, _)| busy);
+    match (now, last) {
+        (Some(now), Some(last)) => Some((now + last) / 2.0),
+        (now, last) => now.or(last),
+    }
 }
 
 /// The last measurement of the CPU busy outside the queue (see
