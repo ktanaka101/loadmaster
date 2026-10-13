@@ -17,7 +17,8 @@ and leader start time are recorded in the queue.
   the task's group lives makes the accounting stay true in that case: the work
   is still running, so the capacity is still used.
 - Signals that `loadmaster` receives (SIGINT, SIGTERM, SIGHUP) are forwarded to
-  the whole group. A process group is never in the terminal's foreground here,
+  the whole group (a SIGTERM as the task's stop signal; see
+  [Signals are forwarded no matter who sent them](#signals-are-forwarded-no-matter-who-sent-them)). A process group is never in the terminal's foreground here,
   so this is the only way keyboard interrupts reach the task.
 
 ## A task is tracked before it can run
@@ -53,6 +54,25 @@ daemon in its own group holds its slot until the daemon exits; `loadmaster`
 says so on stderr, and `status` lists the job as orphaned. Most daemons
 (Gradle, sccache, ...) start their own session and are not affected.
 
+Processes that start a session of their own leave the group, and with it
+everything loadmaster does for the task: they get no signals and hold no
+slot. Some are meant to (a daemon); others are left behind by accident, as
+the `webServer` a Playwright run leaves when it ends on SIGTERM, which keeps
+its port and may serve the next run stale code without an error. loadmaster
+warns of them: it walks the task's process tree about once a second while
+the task runs (and from the processes found before, since an orphan belongs
+to PID 1), and when the task exits, names those still running outside its
+group, after half a second for them to go with it. A look over 100 processes
+takes about a millisecond (macOS and Linux, measured), during which signals
+wait. Each process is checked by its start time and each child by its
+parent, so a PID handed out again meanwhile is not taken for one of them. It does not stop them or
+hold a slot for them, which would break the daemons. One whose parent exits
+between two looks is missed: neither OS keeps a record of where a process
+came from, and macOS does not show another process's environment, which
+would carry the job's `LOADMASTER_HELD` (measured). Linux's child subreaper
+would catch every one, but makes loadmaster reap every orphan, and a macOS
+equivalent does not exist.
+
 ## A task gets no terminal input when stdin is a terminal
 
 A background process group that reads from the terminal or changes its modes
@@ -82,10 +102,23 @@ signals to its child (one that reads an env file and starts the real tool,
 say) makes the child get each signal twice, as it would in a terminal; the
 README says so, and that the wrapper should `exec` the child.
 
-SIGTERM reaches the task once: a further one, from whatever source, is not
-forwarded (see [Canceling jobs](#canceling-jobs)). SIGINT and SIGHUP are
-forwarded each time, since tasks commonly act on a second Ctrl-C or carry on
-after SIGHUP.
+A SIGTERM asks loadmaster to stop the task, as a cancel does, and reaches the
+task as its stop signal: SIGTERM unless the task sets `stop_signal`. Tools
+differ in the signal they clean up on: Playwright exits at once on SIGTERM,
+leaving its `webServer` running, and shuts it down on SIGINT; Docker's
+`STOPSIGNAL` and Compose's `stop_signal` exist for the same reason. The
+SIGTERM of an agent's timeout is such a request, so it is converted too, as
+`dumb-init --rewrite` would. SIGINT is not the default: commands that a
+non-interactive shell starts in the background ignore it.
+
+The stop signal reaches the task once: a further request, from whatever
+source, is not passed on (see [Canceling jobs](#canceling-jobs)). SIGINT and
+SIGHUP are forwarded as they came, each time, since tasks commonly act on a
+second Ctrl-C or carry on after SIGHUP; one that is the stop signal counts as
+the stop, so a cancel after a Ctrl-C sends nothing more. The history log
+records that the task was asked to stop, and the report counts a run that
+then exited with a code of its own (Playwright exits with 130) as stopped,
+like one a signal ended, not as failed.
 
 Signals that were already ignored when `loadmaster` started (SIGHUP under
 `nohup`, SIGINT in a background job of a non-interactive script) are left
@@ -201,7 +234,7 @@ same moment on a fresh state directory occasionally got "database is locked"
 (found in the real-tools demo, about 1 run in 300). The switch is retried for
 up to the busy timeout; everything else relies on SQLite's busy handler.
 
-The version of the database's layout is in its file name (`queue-v2.db`): a
+The version of the database's layout is in its file name (`queue-v3.db`): a
 `loadmaster` that changes the layout uses a new file, and never opens, reads
 or upgrades one of another layout. Versions with different layouts keep
 separate queues, and do not see each other's jobs; while both run, as for
@@ -346,22 +379,23 @@ that one agent works in.
   started a command earlier. Instead `cancel` leaves a request in the queue
   database, and the job's own `loadmaster` acts on it: it looks every 100 ms
   while waiting and every 200 ms while its task runs. A waiting job then
-  leaves the line, and a running one sends its task SIGTERM, or SIGKILL with
-  `--kill`, as for any signal it forwards, and frees the slot once the task
+  leaves the line, and a running one sends its task its stop signal, or
+  SIGKILL with `--kill`, as for any signal it forwards, and frees the slot once the task
   has exited. Its task is its own child, so that is allowed in any sandbox.
   A parked place is deleted.
-- A task gets SIGTERM at most once, from a cancel or forwarded from
-  outside alike: a second one would cut short the clean-up the first
+- A task gets its stop signal at most once, from a cancel or for a SIGTERM
+  from outside alike: a second one would cut short the clean-up the first
   started (as in a handler registered with `process.once`), and with several
-  sources (a cancel, a tool's timeout) it would otherwise come up. Its `loadmaster` sends it, so that one rule covers every path through
-  it. When it hands the slot over to the processes its task left behind, it
+  sources (a cancel, a tool's timeout) it would otherwise come up. Its
+  `loadmaster` sends it, so that one rule covers every path through it.
+  When it hands the slot over to the processes its task left behind, it
   passes on the signals that arrived meanwhile and records whether the task
-  had a SIGTERM, in the same write transaction as the handover, so a
+  had its stop signal, in the same write transaction as the handover, so a
   `cancel`, which signals those processes itself, sends them none either.
   Signals that arrive after the handover are not passed on: the processes
   left behind are the job from then on, and `cancel` reaches them; passing
-  them on unrecorded would let a cancel send a second SIGTERM. SIGKILL is
-  there to force a task: `--kill`, as often as it takes.
+  them on unrecorded would let a cancel send a second stop signal. SIGKILL
+  is there to force a task: `--kill`, as often as it takes.
 - A job has one request row, kept until the job is gone, with the strongest
   stop asked for (several `cancel`s are that one row) and the strongest one
   done, by its `loadmaster` and by a `cancel` signalling the task of a job
@@ -377,19 +411,20 @@ that one agent works in.
   If continuing it is refused, `cancel` says why and how to stop the job
   instead; the request stays, so the job stops once its `loadmaster` is
   continued.
-- A task whose `loadmaster` is gone is signalled from `cancel`: SIGTERM if
-  nobody has sent it one (its `loadmaster` may have, before it handed the
-  slot over to the processes the task left behind), SIGKILL whenever asked.
+- A task whose `loadmaster` is gone is signalled from `cancel`: its stop
+  signal (which the job records) if nobody has sent it one (its
+  `loadmaster` may have, before it handed the slot over to the processes the
+  task left behind), SIGKILL whenever asked.
   It decides, signals and records the signal in one write transaction, so
   no other `cancel` can send it in between; if the signal is refused, the
   transaction is rolled back, so a `cancel` run outside the sandbox can
   still send it.
   So a waiting job whose `loadmaster` was killed after its task had started
   has that task killed too. Two gaps are left, both needing a `loadmaster`
-  killed with SIGKILL at a particular moment. Killed between taking a
-  SIGTERM request and passing it on, it leaves its task unsignalled, and
-  `cancel` waits; its note after 10 seconds points to `--kill`. Killed after
-  passing a SIGTERM on but before handing its slot over, it leaves no record
+  killed with SIGKILL at a particular moment. Killed between taking a stop
+  request and passing it on, it leaves its task unsignalled, and `cancel`
+  waits; its note after 10 seconds points to `--kill`. Killed after passing
+  the stop signal on but before handing its slot over, it leaves no record
   of it, and a later `cancel` sends one more. Closing the first would open
   the second wider, and the other way round.
 - It waits until the jobs have left the queue, so the caller knows the slot

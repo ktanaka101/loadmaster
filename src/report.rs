@@ -51,8 +51,9 @@ pub enum CheckResult {
     /// The task exited with a non-zero code.
     Failed,
     /// Ended by a signal while running (usually a timeout under load), or
-    /// its loadmaster process was killed while it ran: the harm admission
-    /// is meant to remove.
+    /// by loadmaster's request to stop it (its stop signal), or its
+    /// loadmaster process was killed while it ran: the harm admission is
+    /// meant to remove.
     Killed,
     /// Stopped waiting before it started: a signal or a kill while waiting,
     /// or it gave up and was not re-run. The cost of waiting.
@@ -144,6 +145,9 @@ fn join(first: &Entry, last: &Entry) -> Check {
     let result = match last.outcome {
         Outcome::Exited if last.signal.is_some() => CheckResult::Killed,
         Outcome::Exited if last.ok == Some(true) => CheckResult::Passed,
+        // Stopped (by its stop signal) and exited with a code of its own,
+        // as one that cleans up does.
+        Outcome::Exited if last.stopped => CheckResult::Killed,
         Outcome::Exited => CheckResult::Failed,
         Outcome::Lost if last.started == Some(false) => CheckResult::LeftLine,
         Outcome::Lost => CheckResult::Killed,
@@ -707,6 +711,7 @@ mod tests {
             exit_code: None,
             started: None,
             ok: None,
+            stopped: false,
             granted: None,
             uses: BTreeMap::new(),
         }
@@ -916,6 +921,26 @@ mod tests {
                 LeftLine
             ]
         );
+    }
+
+    #[test]
+    fn a_task_that_exits_on_its_own_after_a_stop_request_was_stopped() {
+        // Playwright, given its stop signal (SIGINT), cleans up and exits
+        // with 130: stopped as by a timeout, not failed.
+        let stopped = |ok| Entry {
+            stopped: true,
+            ok: Some(ok),
+            ..exited(1, 0, 0, 10, 130)
+        };
+        let results: Vec<CheckResult> = checks(&[stopped(false)])
+            .iter()
+            .chain(&checks(&[Entry {
+                job: 2,
+                ..stopped(true)
+            }]))
+            .map(|c| c.result)
+            .collect();
+        assert_eq!(results, [CheckResult::Killed, CheckResult::Passed]);
     }
 
     #[test]

@@ -164,6 +164,40 @@ fn a_nested_run_must_fit_in_the_slot_it_runs_in() {
     assert_eq!(stdout(&fits), "ran\n");
 }
 
+fn with_stop(task: String, signal: &str) -> String {
+    task.replacen("cmd = ", &format!("stop_signal = \"{signal}\"\ncmd = "), 1)
+}
+
+#[test]
+fn a_nested_run_must_be_stopped_as_its_holder_is() {
+    // It runs in the holder's process group, which gets the holder's stop
+    // signal.
+    let sandbox = Sandbox::new(8, "");
+    let tasks = task("term-outer", 4, &[BIN, "run", "e2e"])
+        + &with_stop(task("int-outer", 4, &[BIN, "run", "e2e"]), "SIGINT")
+        + &with_stop(task("int-for-default", 4, &[BIN, "run", "lint"]), "SIGINT")
+        + &with_stop(sh_task("e2e", 1, "echo ran"), "SIGINT")
+        + &sh_task("lint", 1, "echo ran");
+    std::fs::write(sandbox.repo.join(".loadmaster.toml"), tasks).unwrap();
+
+    let refused = sandbox.run(&["run", "term-outer"]);
+    assert_eq!(refused.status.code(), Some(125));
+    let err = stderr(&refused);
+    assert!(
+        err.contains("`e2e` stops on SIGINT, but job #")
+            && err.contains(
+                "(`term-outer`) that it would run in is stopped with SIGTERM: set \
+                 `stop_signal = \"SIGINT\"` for `term-outer`, or run `e2e` on its own"
+            ),
+        "{err}"
+    );
+    for fits in ["int-outer", "int-for-default"] {
+        let output = sandbox.run(&["run", fits]);
+        assert!(output.status.success(), "{fits}: {}", stderr(&output));
+        assert_eq!(stdout(&output), "ran\n");
+    }
+}
+
 #[test]
 fn a_nested_run_from_another_checkout_is_rejected() {
     // A LOADMASTER_HELD that leaked into another worktree.

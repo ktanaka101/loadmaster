@@ -28,7 +28,10 @@ fn a_valid_config_passes_with_its_warnings() {
         )),
         "{out}"
     );
-    assert!(out.contains("\ne2e   8 (counts as 4)  -     0\n"), "{out}");
+    assert!(
+        out.contains("\ne2e   8 (counts as 4)  -     0              SIGTERM\n"),
+        "{out}"
+    );
     assert!(
         out.contains("warning: `e2e` has weight 8, above this machine's capacity of 4"),
         "{out}"

@@ -28,6 +28,7 @@ fn request<'a>(task: &'a str, weight: u32, args: &'a [String]) -> JobRequest<'a>
         uses: &[],
         checkout: Path::new("/repo"),
         adapt_cpu: false,
+        stop_signal: libc::SIGTERM,
     }
 }
 
@@ -617,6 +618,7 @@ fn job(id: JobId, state: JobState, weight: u32, uses: Vec<Use>, checkout: &str) 
         uses,
         checkout: PathBuf::from(checkout),
         adapt_cpu: true,
+        stop_signal: libc::SIGTERM,
         granted: (state == JobState::Running).then_some(weight),
     }
 }

@@ -57,6 +57,13 @@ pub enum Error {
     )]
     NestedDoesNotFit { reason: String },
 
+    #[error(
+        "{reason}\n\
+         a nested `loadmaster run` runs in the process group of the job that holds it, and is \
+         stopped as that job is"
+    )]
+    NestedStopSignal { reason: String },
+
     #[error("{var}={value} is invalid: expected {expected}")]
     InvalidEnv {
         var: &'static str,

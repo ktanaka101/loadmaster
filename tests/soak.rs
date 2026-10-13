@@ -33,14 +33,17 @@ const AGENTS: usize = 5;
 const KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// (name, weight, db, mem, work). `slow` takes a second to shut down after
-/// SIGTERM.
+/// its stop signal, SIGINT (see [`STOP_SIGNALS`]), as Playwright does.
 const TASKS: [(&str, u32, u32, u32, &str); 5] = [
     ("lint", 1, 0, 0, "sleep 0.3"),
     ("test", 4, 0, 3, "sleep 1"),
     ("e2e", 2, 1, 2, "sleep 2"),
     ("big", 8, 0, 0, "sleep 1"),
-    ("slow", 2, 1, 4, "trap 'sleep 1; exit 143' TERM; sleep 3"),
+    ("slow", 2, 1, 4, "trap 'sleep 1; exit 130' INT; sleep 3"),
 ];
+
+/// Tasks stopped by another signal than SIGTERM.
+const STOP_SIGNALS: [(&str, &str); 1] = [("slow", "SIGINT")];
 
 #[derive(Default)]
 struct Stats {
@@ -98,9 +101,15 @@ fn agents_under_timeouts_and_crashes() {
                 .filter(|(_, amount)| **amount > 0)
                 .map(|(resource, amount)| format!("{resource} = {amount}"))
                 .collect();
+            let stop = STOP_SIGNALS
+                .iter()
+                .find(|(task, _)| task == name)
+                .map_or(String::new(), |(_, signal)| {
+                    format!("stop_signal = \"{signal}\"\n")
+                });
             sh_task(name, *weight, &script).replacen(
                 "cmd = ",
-                &format!("uses = {{ {} }}\ncmd = ", uses.join(", ")),
+                &format!("uses = {{ {} }}\n{stop}cmd = ", uses.join(", ")),
                 1,
             )
         })

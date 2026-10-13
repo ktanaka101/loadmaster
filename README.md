@@ -87,11 +87,12 @@ loadmaster is new (0.8). What has been verified:
 - A soak test simulates five agents with Claude Code-style timeouts (SIGTERM,
   then SIGKILL of the process group), re-runs after exit code 75, and crashes,
   in two checkouts with two resources besides CPU, while jobs are canceled at
-  random. 810 runs (238 of them canceled) in 5 minutes on macOS and 502 in
-  3 minutes on Linux exceeded no limit, every task got through, and nothing
-  was left behind. With jobs adapting to CPU busy outside the queue, beside
-  10 busy processes that came and went, 489 runs in 3 minutes on macOS (36
-  of them started with fewer cores) did the same.
+  random; one task stops on SIGINT, as Playwright does. 824 runs (237 of them
+  canceled) in 5 minutes on macOS and 513 in 3 minutes on Linux exceeded no
+  limit, every task got through, and nothing was left behind. With jobs
+  adapting to CPU busy outside the queue, beside 10 busy processes that came
+  and went, 493 runs in 3 minutes on macOS (60 of them started with fewer
+  cores) did the same.
 - A simulation checks, on random workloads with several resources and with
   CPU busy outside the queue that changes on its own, that no job is ever
   delayed by jobs that got in line after it and that every job starts; rules
@@ -195,6 +196,7 @@ cmd = ["npx", "vitest", "run", "--maxWorkers=4"]
 
 [tasks.e2e]
 weight = 2
+stop_signal = "SIGINT"  # Playwright shuts its webServer down only on SIGINT
 cmd = ["npx", "playwright", "test", "--workers=4"]
 ```
 
@@ -287,6 +289,7 @@ run against the main checkout's code: loadmaster says so and fails.
 | `cmd` | Array: the program and its arguments. No shell is involved. Arguments after `--` are appended to the end exactly as given. |
 | `uses` | Optional: the resources the task uses, such as `{ e2e-db = 1 }`; see [Resources besides CPU](#resources-besides-cpu). |
 | `ok_exit_codes` | Optional: the exit codes that mean the check passed, for the history log and `loadmaster report`; `[0]` if not set. A check that reports "differences found" with exit code 2 would set `[0, 2]`. loadmaster itself still exits with the task's code. |
+| `stop_signal` | Optional: the signal that asks the task to stop and clean up, one of `"SIGTERM"` (the default), `"SIGINT"`, `"SIGHUP"`, `"SIGQUIT"`, `"SIGUSR1"`, `"SIGUSR2"`. A cancel, or a SIGTERM to `loadmaster` (as from an agent's timeout), reaches the task as this signal; see [Signals](#how-it-works). Playwright cleans up its `webServer` only on SIGINT, so a Playwright task should set `"SIGINT"`. Commands a shell starts in the background (`cmd &`) ignore SIGINT. |
 
 Unknown keys are errors, so a typo fails instead of being ignored. That also
 means an older loadmaster rejects a key added in a newer version, and branches
@@ -352,6 +355,7 @@ per_checkout = 1  # and 1 per checkout: they share its ports and database
 [tasks.e2e]
 weight = 2
 uses = { e2e-db = 1, memory = 4 }
+stop_signal = "SIGINT"
 cmd = ["npx", "playwright", "test"]
 
 [tasks.lint]
@@ -491,14 +495,15 @@ file it names must exist, while a missing file in the default place means all
 defaults. Like `.loadmaster.toml`, the file can name the oldest loadmaster
 that reads it with `min_version`, for a file shared across machines.
 
-The queue lives in `~/.local/state/loadmaster/queue-v2.db` (`$XDG_STATE_HOME`,
+The queue lives in `~/.local/state/loadmaster/queue-v3.db` (`$XDG_STATE_HOME`,
 `LOADMASTER_STATE_DIR`). The number is the version of its layout: loadmaster
 versions with different layouts keep separate queues and do not see each
 other's jobs, so give every agent on a machine the same version (as one
 `mise use -g` does). Next to it, `history.jsonl` gets one line per job
 (task, weight and the cores it got if fewer, resources, capacity, wait and run
 time, CPU time, load average, the machine's CPU busy while it ran, signal,
-exit code and whether it counts as passed), which `loadmaster report`
+whether loadmaster asked it to stop, exit code and whether it counts as
+passed), which `loadmaster report`
 summarizes; it reads only lines of the format this version writes, and says
 how many others it skipped. If `loadmaster` is killed before it can write its
 line, the process that later reclaims the job writes one with outcome `lost`.
@@ -527,10 +532,13 @@ line, the process that later reclaims the job writes one with outcome `lost`.
     runs untracked.
 - **Signals**: SIGINT, SIGTERM or SIGHUP while waiting leaves the line. While
   the task runs, they are forwarded to the task's process group, and
-  loadmaster waits for the task to exit before freeing the slot. SIGTERM is
-  passed on once, whoever sends it, so a second one cannot cut short the
-  clean-up the first started; SIGKILL (or `loadmaster cancel --kill`) forces
-  a task to end. Signals that
+  loadmaster waits for the task to exit before freeing the slot. A SIGTERM
+  asks loadmaster to stop the task, and reaches it as the task's
+  `stop_signal` (SIGTERM unless set), as a cancel does: tools differ in the
+  signal they clean up on. It is passed on once, whoever sends it, so a
+  second one cannot cut short the clean-up the first started; SIGINT and
+  SIGHUP pass as they came, each time. SIGKILL (or `loadmaster cancel
+  --kill`) forces a task to end. Signals that
   were ignored when loadmaster started (as under `nohup`) stay ignored. Every
   process in the group gets the signal, as with Ctrl-C in a terminal, so a
   wrapper script that forwards signals to its child makes the child get each
@@ -620,7 +628,8 @@ loadmaster held [--uses RESOURCE]
   checkout except the one `cancel` itself runs in, and wait until they have
   left the queue. It leaves a request in the queue, and the job's own
   `loadmaster` acts on it within a fraction of a second: a waiting job leaves
-  the line, and a running job's task gets SIGTERM, once, as described under
+  the line, and a running job's task gets its stop signal (SIGTERM unless
+  the task sets `stop_signal`), once, as described under
   [Signals](#how-it-works), with the slot freed once it exits. That needs no
   permission to signal another agent's processes, which sandboxes do not
   give. A job whose `loadmaster` is stopped (Ctrl-Z) is continued so that it
@@ -1018,7 +1027,8 @@ What to compare between the two periods:
 - **FAILED and KILLED**: the false failures and timeouts loadmaster is meant
   to remove (along with real failures, which both periods have). FAILED
   counts exit codes not in the task's `ok_exit_codes`. KILLED means ended by a
-  signal while running, usually a tool timeout, including runs whose
+  signal while running, usually a tool timeout, including runs that exited on
+  their own once `loadmaster` passed them a stop request and runs whose
   `loadmaster` was killed while the task ran.
 - **LEFT LINE**: checks that stopped before they started: a tool timeout or
   an interrupt while waiting, or a place given up (exit code 75) and not
@@ -1067,12 +1077,20 @@ loadmaster is deliberately small:
   pager, is stopped by the OS; Ctrl-C still ends it.
 - A task that leaves a daemon running in its own process group holds its slot
   until the daemon exits (loadmaster warns about it).
-- Processes a task starts in a process group or session of their own are not
-  tracked after the task's own group is gone, and do not always exit with it:
-  when a Playwright run is stopped with SIGTERM (as a Claude Code timeout
-  does), its `webServer` keeps running and holding its port, so the next run
-  fails with "already used". This happens without loadmaster too; SIGINT
-  shuts it down cleanly.
+- Processes a task starts in a session of their own (as Playwright starts its
+  `webServer`) leave the task's process group: they get no signals from
+  loadmaster and hold no slot, and do not always exit with the task. When a
+  Playwright run gets SIGTERM, it exits at once and leaves its `webServer`
+  running, with loadmaster or without; on SIGINT it shuts it down, which is
+  what `stop_signal = "SIGINT"` is for. A server left running keeps its port:
+  the next run fails with "already used" if its `webServer` checks every
+  server the command starts, and otherwise reuses the old one without a
+  word. A `webServer` command that exits when its stdin closes, as Vite's dev
+  server does, also goes when Playwright does. loadmaster looks for such
+  processes about once a second while the task runs, and when the task exits,
+  warns of those it found still running, with their PIDs; it does not stop
+  them, since some are meant to stay (a build tool's daemon). One whose
+  parent exits between two looks is not found.
 - `history.jsonl` is never rotated.
 
 ## Development

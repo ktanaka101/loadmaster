@@ -37,6 +37,9 @@ pub struct Task {
     /// Exit codes that mean the check passed (`[0]` unless set), for the
     /// history log and `loadmaster report`.
     pub ok_exit_codes: Vec<i32>,
+    /// The signal that asks the task to stop and clean up (SIGTERM unless
+    /// set): what a cancel, or a SIGTERM to loadmaster, delivers.
+    pub stop_signal: i32,
     /// Program and arguments. Never empty.
     pub cmd: Vec<String>,
 }
@@ -78,6 +81,7 @@ struct TaskFile {
     #[serde(default)]
     uses: BTreeMap<String, u32>,
     ok_exit_codes: Option<Vec<i64>>,
+    stop_signal: Option<String>,
     cmd: toml::Value,
 }
 
@@ -265,6 +269,24 @@ impl Task {
                 })
                 .collect::<std::result::Result<_, _>>()?,
         };
+        let stop_signal = match def.stop_signal {
+            None => libc::SIGTERM,
+            Some(given) => crate::runner::STOP_SIGNALS
+                .iter()
+                .find(|(name, _)| *name == given)
+                .map(|&(_, signal)| signal)
+                .ok_or_else(|| {
+                    let names: Vec<&str> = crate::runner::STOP_SIGNALS
+                        .iter()
+                        .map(|(name, _)| *name)
+                        .collect();
+                    format!(
+                        "task `{name}`: `stop_signal` is one of {}, not `{given}` (SIGKILL is \
+                         `loadmaster cancel --kill`)",
+                        names.join(", ")
+                    )
+                })?,
+        };
         let cmd_hint = "e.g. cmd = [\"npx\", \"vitest\", \"run\"]; \
                         use [\"sh\", \"-c\", \"...\"] if you need shell syntax";
         let cmd = match def.cmd {
@@ -300,6 +322,7 @@ impl Task {
             weight: def.weight,
             uses: def.uses,
             ok_exit_codes,
+            stop_signal,
             cmd,
         })
     }
@@ -563,6 +586,7 @@ mod tests {
                 weight: 4,
                 uses: BTreeMap::new(),
                 ok_exit_codes: vec![0],
+                stop_signal: libc::SIGTERM,
                 cmd: vec!["npx".into(), "vitest".into(), "run".into()],
             }
         );
@@ -900,6 +924,28 @@ mod tests {
             let text = format!("[tasks.t]\nweight = 1\nok_exit_codes = {codes}\ncmd = [\"x\"]\n");
             let msg = message(parse(&text).unwrap_err());
             assert!(msg.contains(expected), "{codes}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_task_names_the_signal_that_stops_it() {
+        let config = parse(
+            "[tasks.lint]\nweight = 1\ncmd = [\"x\"]\n\
+             [tasks.e2e]\nweight = 1\nstop_signal = \"SIGINT\"\ncmd = [\"x\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.task("lint").unwrap().stop_signal, libc::SIGTERM);
+        assert_eq!(config.task("e2e").unwrap().stop_signal, libc::SIGINT);
+        for given in ["SIGKILL", "INT", "sigint"] {
+            let text = format!("[tasks.t]\nweight = 1\nstop_signal = \"{given}\"\ncmd = [\"x\"]\n");
+            let msg = message(parse(&text).unwrap_err());
+            assert!(
+                msg.contains(&format!(
+                    "task `t`: `stop_signal` is one of SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, \
+                     SIGUSR2, not `{given}`"
+                )),
+                "{msg}"
+            );
         }
     }
 

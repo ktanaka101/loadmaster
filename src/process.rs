@@ -5,6 +5,7 @@
 //! paired with the process start time, and a process only counts as alive when
 //! both match.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::time::Duration;
 
@@ -377,8 +378,11 @@ struct Stat {
     /// Stopped by a signal (T). A debugger's stop (t) is not: SIGCONT
     /// does not end it.
     stopped: bool,
+    ppid: u32,
     pgrp: u32,
     start_time: u64,
+    /// The command name (comm), lossy.
+    name: String,
 }
 
 /// The parts of `/proc/<pid>/stat` we need, or `None` if there is no such
@@ -402,10 +406,17 @@ fn read_stat(pid: u32) -> io::Result<Option<Stat>> {
         .iter()
         .rposition(|&b| b == b')')
         .ok_or_else(malformed)?;
+    let open = stat
+        .iter()
+        .position(|&b| b == b'(')
+        .filter(|&open| open < close);
+    let name = open.map_or_else(String::new, |open| {
+        String::from_utf8_lossy(&stat[open + 1..close]).into_owned()
+    });
     let rest = std::str::from_utf8(&stat[close + 1..]).map_err(|_| malformed())?;
     let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
-    // fields[i] is field i + 3: state (3), pgrp (5), num_threads (20),
-    // starttime (22).
+    // fields[i] is field i + 3: state (3), ppid (4), pgrp (5), num_threads
+    // (20), starttime (22).
     let field = |i: usize| fields.get(i).copied().ok_or_else(malformed);
     let state = field(0)?;
     let running = match state {
@@ -419,8 +430,10 @@ fn read_stat(pid: u32) -> io::Result<Option<Stat>> {
     Ok(Some(Stat {
         running,
         stopped: state == "T",
+        ppid: field(1)?.parse().map_err(|_| malformed())?,
         pgrp: field(2)?.parse().map_err(|_| malformed())?,
         start_time: field(19)?.parse().map_err(|_| malformed())?,
+        name,
     }))
 }
 
@@ -558,6 +571,200 @@ pub fn children_cpu_time() -> Option<Duration> {
             .checked_add(Duration::from_micros(u64::try_from(t.tv_usec).ok()?))
     };
     time(usage.ru_utime)?.checked_add(time(usage.ru_stime)?)
+}
+
+/// A process a task started, as seen while it ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Descendant {
+    pub pid: u32,
+    pub start_time: u64,
+    /// Its command name, as the OS reports it.
+    pub name: String,
+}
+
+/// The processes a task started that still run, found by walking the process
+/// tree from its leader, and from those found before, every so often while
+/// it runs. One that starts a session of its own leaves the task's process
+/// group, which is all that holds the task's slot and gets its signals; once
+/// its parent exits it belongs to PID 1, and only having seen it before tells
+/// it from any other. One whose parent exits between two looks is missed:
+/// the OS keeps no record of where a process came from (macOS does not even
+/// show another process's environment, which would carry LOADMASTER_HELD).
+#[derive(Debug, Default)]
+pub struct Descendants {
+    seen: BTreeMap<u32, Descendant>,
+}
+
+impl Descendants {
+    /// Walks the tree under the leader of `group` and under every process
+    /// seen before that still runs, and forgets those that have exited.
+    /// Each process is checked by its start time, and each child by its
+    /// parent, so a PID the OS hands out again meanwhile is not taken for
+    /// one of them.
+    pub fn look(&mut self, group: &ProcessGroup) {
+        self.seen
+            .retain(|_, seen| observe(seen.pid).is_some_and(|o| o.start_time == seen.start_time));
+        let mut queue: Vec<(u32, Option<u64>)> =
+            std::iter::once((group.pgid, group.leader_start_time))
+                .chain(
+                    self.seen
+                        .values()
+                        .map(|seen| (seen.pid, Some(seen.start_time))),
+                )
+                .collect();
+        let mut visited = BTreeSet::new();
+        while let Some((pid, start)) = queue.pop() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            let found: Vec<(u32, Observed)> = children(pid)
+                .into_iter()
+                .filter_map(|child| Some((child, observe(child).filter(|o| o.ppid == pid)?)))
+                .collect();
+            // Still the process whose children those are, after they were
+            // looked at.
+            if !observe(pid).is_some_and(|o| start.is_none_or(|t| o.start_time == t)) {
+                continue;
+            }
+            for (child, o) in found {
+                queue.push((child, Some(o.start_time)));
+                self.seen.insert(
+                    child,
+                    Descendant {
+                        pid: child,
+                        start_time: o.start_time,
+                        name: o.name,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Those seen that still run outside process group `group`.
+    pub fn outside_group(&self, group: u32) -> Vec<Descendant> {
+        self.seen
+            .values()
+            .filter(|seen| {
+                observe(seen.pid)
+                    .is_some_and(|o| o.start_time == seen.start_time && o.pgid != group)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// What one look at a running process tells.
+struct Observed {
+    start_time: u64,
+    ppid: u32,
+    pgid: u32,
+    name: String,
+}
+
+/// `pid`, if it runs (not a zombie) and may be looked at.
+#[cfg(target_os = "macos")]
+fn observe(pid: u32) -> Option<Observed> {
+    let info = bsd_info(pid)?;
+    // pbi_name is the longer name, when the process has one.
+    let name = if info.pbi_name[0] != 0 {
+        &info.pbi_name[..]
+    } else {
+        &info.pbi_comm[..]
+    };
+    let name: Vec<u8> = name
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    Some(Observed {
+        start_time: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        ppid: info.pbi_ppid,
+        pgid: info.pbi_pgid,
+        name: String::from_utf8_lossy(&name).into_owned(),
+    })
+}
+
+/// The process's BSD info, unless it is gone, a zombie, or another user's.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    const SZOMB: u32 = 5;
+    let pid = libc::c_int::try_from(pid).ok().filter(|&pid| pid > 0)?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is valid for writes of `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    // SAFETY: proc_pidinfo filled the whole struct.
+    (n == size)
+        .then(|| unsafe { info.assume_init() })
+        .filter(|info| info.pbi_status != SZOMB)
+}
+
+/// The children of `pid`; none if it is gone.
+#[cfg(target_os = "macos")]
+fn children(pid: u32) -> Vec<u32> {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return Vec::new();
+    };
+    let mut pids: Vec<libc::pid_t> = vec![0; 16];
+    loop {
+        let Ok(size) = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice())) else {
+            return Vec::new();
+        };
+        // SAFETY: the buffer is valid for writes of `size` bytes.
+        let n = unsafe { libc::proc_listchildpids(pid, pids.as_mut_ptr().cast(), size) };
+        // A number of PIDs, as with proc_listpgrppids.
+        let Ok(count) = usize::try_from(n) else {
+            return Vec::new();
+        };
+        if count < pids.len() {
+            pids.truncate(count);
+            break;
+        }
+        pids.resize(pids.len() * 2, 0);
+    }
+    pids.into_iter()
+        .filter(|&pid| pid > 0)
+        .map(|pid| pid as u32)
+        .collect()
+}
+
+/// `pid`, if it runs (not a zombie) and may be looked at.
+#[cfg(target_os = "linux")]
+fn observe(pid: u32) -> Option<Observed> {
+    let stat = read_stat(pid).ok()??;
+    stat.running.then_some(Observed {
+        start_time: stat.start_time,
+        ppid: stat.ppid,
+        pgid: stat.pgrp,
+        name: stat.name,
+    })
+}
+
+/// The children of `pid`, from each of its threads' `children` file; none
+/// if it is gone.
+#[cfg(target_os = "linux")]
+fn children(pid: u32) -> Vec<u32> {
+    let Ok(threads) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for thread in threads.flatten() {
+        if let Ok(list) = std::fs::read_to_string(thread.path().join("children")) {
+            pids.extend(
+                list.split_ascii_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            );
+        }
+    }
+    pids
 }
 
 #[cfg(test)]

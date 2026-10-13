@@ -47,7 +47,7 @@ pub type JobId = i64;
 /// File name of the queue database inside the state directory. The number
 /// is the version of its layout: a loadmaster that changes the layout uses
 /// a new file, never one another version made.
-pub const QUEUE_DB_FILE: &str = "queue-v2.db";
+pub const QUEUE_DB_FILE: &str = "queue-v3.db";
 
 /// How long to wait for another process's lock on the database.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -72,8 +72,8 @@ const CPU_SMOOTH: Duration = Duration::from_secs(10);
 // signal one started by another command. One row per job, kept until the job
 // is gone, with the strongest stop asked for and the strongest one done, by
 // the job's loadmaster and by a `cancel` that signalled the task of a job
-// whose loadmaster is gone (0 SIGTERM, 1 SIGKILL, -1 none): a later cancel
-// that asks for no more than was done does nothing.
+// whose loadmaster is gone (0 the task's stop signal, 1 SIGKILL, -1 none):
+// a later cancel that asks for no more than was done does nothing.
 //
 // `cpu` holds the last measurement of the cores busy outside the queue (see
 // [`Queue::outside`]), so that the processes that wait take turns measuring.
@@ -98,6 +98,7 @@ CREATE TABLE jobs (
     checkout     BLOB    NOT NULL,
     uses         TEXT    NOT NULL,
     adapt_cpu    INTEGER NOT NULL,
+    stop_signal  INTEGER NOT NULL,
     granted      INTEGER
 );
 CREATE TABLE cancel_requests (
@@ -168,6 +169,9 @@ pub struct Job {
     /// Whether it starts with fewer cores while CPU is busy outside the
     /// queue (see [`Outside`]): the machine setting it got in line with.
     pub adapt_cpu: bool,
+    /// The signal that asks its task to stop, for a cancel that signals the
+    /// task itself.
+    pub stop_signal: i32,
     /// The cores it started with: its weight, or fewer while CPU was busy
     /// outside the queue. `None` until it starts.
     pub granted: Option<u32>,
@@ -279,6 +283,8 @@ pub struct JobRequest<'a> {
     pub checkout: &'a Path,
     /// The machine setting `adapt_to_outside_cpu`.
     pub adapt_cpu: bool,
+    /// The task's stop signal.
+    pub stop_signal: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,7 +669,8 @@ impl Queue {
                     tx.execute(
                         "UPDATE jobs SET state = 'waiting', weight = ?2, command = ?3,
                          owner_pid = ?4, owner_start = ?5, parked_at = NULL,
-                         capacity = ?6, measure_only = ?7, checkout = ?8, uses = ?9
+                         capacity = ?6, measure_only = ?7, checkout = ?8, uses = ?9,
+                         stop_signal = ?10
                      WHERE id = ?1",
                         params![
                             id,
@@ -674,7 +681,8 @@ impl Queue {
                             request.capacity,
                             request.measure_only,
                             checkout,
-                            uses
+                            uses,
+                            request.stop_signal
                         ],
                     )?;
                     (id, true)
@@ -683,8 +691,10 @@ impl Queue {
                     tx.execute(
                         "INSERT INTO jobs (task, weight, state, dir, args, command,
                                        owner_pid, owner_start, enqueued_at,
-                                       capacity, measure_only, checkout, uses, adapt_cpu)
-                     VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                       capacity, measure_only, checkout, uses, adapt_cpu,
+                                       stop_signal)
+                     VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                             ?14)",
                         params![
                             request.task,
                             request.weight,
@@ -698,7 +708,8 @@ impl Queue {
                             request.measure_only,
                             checkout,
                             uses,
-                            request.adapt_cpu
+                            request.adapt_cpu,
+                            request.stop_signal
                         ],
                     )?;
                     (tx.last_insert_rowid(), false)
@@ -826,7 +837,7 @@ pub enum Canceled {
 }
 
 /// Signals the task of `job`, whose loadmaster is gone, for its request:
-/// SIGKILL as often as it is asked, SIGTERM only if the task has had none,
+/// SIGKILL as often as it is asked, its stop signal only if it has had none,
 /// from its loadmaster (which records what it sent before it hands the slot
 /// over) or from an earlier cancel. Within the write transaction `tx`, so
 /// that the decision, the signal and its record are one step. If the signal
@@ -850,7 +861,7 @@ fn signal_task(tx: &Transaction, job: Job) -> Result<Canceled> {
         // Gone in the meantime; the next look reaps it.
         return Ok(Canceled::Requested(job));
     };
-    match child.signal(if kill { libc::SIGKILL } else { libc::SIGTERM }) {
+    match child.signal(if kill { libc::SIGKILL } else { job.stop_signal }) {
         Ok(()) => {
             // Lets a stopped task act on it.
             let _ = child.signal(libc::SIGCONT);
@@ -907,6 +918,7 @@ fn record(job: &Job, outcome: Outcome, waited_until: SystemTime) -> Record<'_> {
         exit_code: None,
         started: None,
         ok: None,
+        stopped: false,
         granted: job.granted.filter(|&granted| granted < job.weight),
         uses: job
             .uses
@@ -1424,7 +1436,7 @@ fn load_jobs(conn: &Connection) -> Result<Vec<Job>> {
     let mut stmt = conn.prepare(
         "SELECT id, task, weight, state, dir, args, command, owner_pid, owner_start,
                 child_pgid, child_start, enqueued_at, parked_at, started_at,
-                capacity, measure_only, checkout, uses, adapt_cpu, granted
+                capacity, measure_only, checkout, uses, adapt_cpu, stop_signal, granted
          FROM jobs ORDER BY id",
     )?;
     let jobs = stmt
@@ -1468,7 +1480,8 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         checkout: PathBuf::from(OsString::from_vec(row.get(16)?)),
         uses: json(17, row.get(17)?)?,
         adapt_cpu: row.get(18)?,
-        granted: row.get(19)?,
+        stop_signal: row.get(19)?,
+        granted: row.get(20)?,
     })
 }
 

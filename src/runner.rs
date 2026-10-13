@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::process::{ProcessGroup, ProcessId};
+use crate::process::{Descendants, ProcessGroup, ProcessId};
 
 /// Set in a running task's environment to the job ID that holds the slot.
 /// A nested `loadmaster run` sees it and runs directly instead of queueing.
@@ -24,6 +24,26 @@ pub const WEIGHT_ENV: &str = "LOADMASTER_WEIGHT";
 /// Signals loadmaster intercepts: they abort a wait, and are forwarded to the
 /// task's process group while it runs.
 pub const INTERCEPTED_SIGNALS: [i32; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+/// The signals a task may name as its `stop_signal`: ones it can handle.
+/// SIGKILL is `loadmaster cancel --kill`.
+pub const STOP_SIGNALS: [(&str, i32); 6] = [
+    ("SIGTERM", libc::SIGTERM),
+    ("SIGINT", libc::SIGINT),
+    ("SIGHUP", libc::SIGHUP),
+    ("SIGQUIT", libc::SIGQUIT),
+    ("SIGUSR1", libc::SIGUSR1),
+    ("SIGUSR2", libc::SIGUSR2),
+];
+
+/// "SIGTERM", "SIGKILL", or "signal 7", for messages.
+pub fn signal_name(signal: i32) -> String {
+    match STOP_SIGNALS.iter().find(|&&(_, s)| s == signal) {
+        Some((name, _)) => (*name).to_owned(),
+        None if signal == libc::SIGKILL => "SIGKILL".to_owned(),
+        None => format!("signal {signal}"),
+    }
+}
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -217,17 +237,33 @@ fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 /// How often a running task's loadmaster looks for a request from
 /// `loadmaster cancel`, in polls of the task.
 const CANCEL_CHECK_EVERY: u32 = 10;
+/// How often the processes a task started are looked for, in polls: about
+/// once a second, and first after a tenth of one.
+const LOOK_EVERY: u32 = 50;
+const FIRST_LOOK: u32 = 5;
 
 /// Sends a task the signals meant for it: those intercepted from outside
-/// and those a cancel asks for. SIGTERM reaches it once, whichever way it
-/// came: a second one would cut short the clean-up the first started (as in
-/// a handler registered with `process.once`); SIGKILL is there to force it.
-#[derive(Debug, Default)]
+/// and those a cancel asks for. A SIGTERM, from outside or from a cancel,
+/// asks loadmaster to stop the task, and reaches it as the task's stop
+/// signal (which tools differ on: Playwright cleans up only on SIGINT), and
+/// once, whichever way it came: a second one would cut short the clean-up
+/// the first started (as in a handler registered with `process.once`).
+/// Other signals pass as they came, each time; SIGKILL is there to force it.
+#[derive(Debug)]
 pub struct Forwarder {
-    term_sent: bool,
+    stop: i32,
+    stop_sent: bool,
 }
 
 impl Forwarder {
+    /// For a task whose stop signal is `stop`.
+    pub fn new(stop: i32) -> Forwarder {
+        Forwarder {
+            stop,
+            stop_sent: false,
+        }
+    }
+
     /// Forwards intercepted signals that arrived since the last call to the
     /// task's process group, if it still has running members. The check goes
     /// by the leader's start time, so a group ID the OS has since reused is
@@ -237,53 +273,82 @@ impl Forwarder {
         if pending.is_empty() || !group.is_alive() {
             return;
         }
-        for signal in pending {
-            self.send(group, signal);
+        self.forward(pending, |signal| signal_group(group, signal));
+    }
+
+    /// Sends what `received` asks for with `kill`, which says whether the
+    /// signal was sent. The stop signal as it came goes first: a SIGTERM
+    /// that came with it then asks for nothing more.
+    fn forward(&mut self, mut received: Vec<i32>, mut kill: impl FnMut(i32) -> bool) {
+        received.sort_by_key(|&signal| signal != self.stop);
+        for signal in received {
+            self.send_with(signal, &mut kill);
         }
     }
 
-    /// Whether the task has had a SIGTERM.
-    pub fn term_sent(&self) -> bool {
-        self.term_sent
+    /// Whether the task has had its stop signal.
+    pub fn stop_sent(&self) -> bool {
+        self.stop_sent
     }
 
-    fn send(&mut self, group: &ProcessGroup, signal: i32) {
-        if signal == libc::SIGTERM && self.term_sent {
+    fn send(&mut self, group: &ProcessGroup, received: i32) {
+        self.send_with(received, |signal| signal_group(group, signal));
+    }
+
+    fn send_with(&mut self, received: i32, kill: impl FnOnce(i32) -> bool) {
+        let request = received == libc::SIGTERM;
+        if request && self.stop_sent {
             return;
         }
-        // Only a SIGTERM that was sent counts: one the OS refused (a task
-        // that changed its user, say) may be tried again.
-        if group.signal(signal).is_ok() && signal == libc::SIGTERM {
-            self.term_sent = true;
+        let signal = if request { self.stop } else { received };
+        // Only a stop signal that was sent counts: one the OS refused (a task
+        // that changed its user, say) may be tried again. One that came as
+        // itself counts too (Ctrl-C, for a stop signal of SIGINT), and still
+        // passes each time.
+        if kill(signal) && signal == self.stop {
+            self.stop_sent = true;
         }
-        // SIGCONT lets a stopped task (e.g. one that touched the terminal)
-        // act on the signal.
-        let _ = group.signal(libc::SIGCONT);
     }
 }
 
+/// Sends `signal` to `group`, and SIGCONT, which lets a stopped task (e.g.
+/// one that touched the terminal) act on it. Whether `signal` was sent.
+fn signal_group(group: &ProcessGroup, signal: i32) -> bool {
+    let sent = group.signal(signal).is_ok();
+    let _ = group.signal(libc::SIGCONT);
+    sent
+}
+
 /// Waits for the task's leader to exit, forwarding intercepted signals to the
-/// whole process group in the meantime, and the signal `canceled` asks for,
-/// which it is asked every few polls; it is told whether the task has had a
-/// SIGTERM already, and the forwarder sends none twice.
+/// whole process group in the meantime, and the signal `canceled` asks for
+/// (SIGTERM to stop it, SIGKILL to kill it), which it is asked every few
+/// polls; it is told whether the task has had its stop signal already, and
+/// the forwarder sends none twice. Meanwhile it looks for the processes the
+/// task starts (see [`Descendants`]). Returns the leader's exit status, and
+/// whether it had had its stop signal by then.
 pub fn wait(
     task: &mut Task,
     signals: &Signals,
     forwarder: &mut Forwarder,
+    descendants: &mut Descendants,
     mut canceled: impl FnMut(bool) -> Option<i32>,
-) -> io::Result<ExitStatus> {
+) -> io::Result<(ExitStatus, bool)> {
     let mut polls = 0u32;
     loop {
         let exited = task.child.try_wait()?;
+        let stopped = forwarder.stop_sent();
         // Forward even if the leader just exited: others in its group may
         // still be running.
         forwarder.forward_pending(&task.group, signals);
         if let Some(status) = exited {
-            return Ok(status);
+            return Ok((status, stopped));
         }
         polls = polls.wrapping_add(1);
+        if polls % LOOK_EVERY == FIRST_LOOK {
+            descendants.look(&task.group);
+        }
         if polls.is_multiple_of(CANCEL_CHECK_EVERY)
-            && let Some(signal) = canceled(forwarder.term_sent())
+            && let Some(signal) = canceled(forwarder.stop_sent())
             && task.group.is_alive()
         {
             forwarder.send(&task.group, signal);
@@ -303,6 +368,47 @@ pub fn exit_code(status: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `forwarder` sends for each batch of `received` signals.
+    fn sent(forwarder: &mut Forwarder, batches: &[&[i32]]) -> Vec<i32> {
+        let mut sent = Vec::new();
+        for batch in batches {
+            forwarder.forward(batch.to_vec(), |signal| {
+                sent.push(signal);
+                true
+            });
+        }
+        sent
+    }
+
+    #[test]
+    fn a_stop_request_is_sent_as_the_stop_signal_once() {
+        use libc::{SIGHUP, SIGINT, SIGTERM};
+        // The default: SIGTERM once, SIGINT and SIGHUP each time.
+        let mut default = Forwarder::new(SIGTERM);
+        let batches: &[&[i32]] = &[&[SIGTERM], &[SIGINT, SIGTERM], &[SIGHUP]];
+        assert_eq!(sent(&mut default, batches), [SIGTERM, SIGINT, SIGHUP]);
+        // Stopped with SIGINT: a Ctrl-C passes each time and counts as the
+        // stop, a SIGTERM becomes it.
+        let mut int = Forwarder::new(SIGINT);
+        assert_eq!(sent(&mut int, &[&[SIGTERM], &[SIGTERM]]), [SIGINT]);
+        let mut int = Forwarder::new(SIGINT);
+        let batches: &[&[i32]] = &[&[SIGINT], &[SIGINT, SIGTERM]];
+        assert_eq!(sent(&mut int, batches), [SIGINT, SIGINT]);
+        // Stopped with SIGHUP, which comes with a SIGTERM in one batch (in
+        // the order they are taken): one SIGHUP.
+        let mut hup = Forwarder::new(SIGHUP);
+        assert_eq!(sent(&mut hup, &[&[SIGTERM, SIGHUP]]), [SIGHUP]);
+        assert!(hup.stop_sent());
+    }
+
+    #[test]
+    fn a_stop_signal_that_was_refused_may_be_sent_again() {
+        let mut forwarder = Forwarder::new(libc::SIGINT);
+        forwarder.forward(vec![libc::SIGTERM], |_| false);
+        assert!(!forwarder.stop_sent());
+        assert_eq!(sent(&mut forwarder, &[&[libc::SIGTERM]]), [libc::SIGINT]);
+    }
 
     #[test]
     fn extra_args_are_appended_verbatim() {

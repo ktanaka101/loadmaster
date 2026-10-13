@@ -207,6 +207,7 @@ fn run(args: RunArgs) -> Result<i32> {
         uses: &uses,
         checkout: &checkout,
         adapt_cpu: machine.adapt_to_outside_cpu,
+        stop_signal: task.stop_signal,
     };
     // Both clocks start here, so wait times include getting in line.
     let (queued_at, wait_started) = (SystemTime::now(), Instant::now());
@@ -234,6 +235,7 @@ fn run(args: RunArgs) -> Result<i32> {
         exit_code: None,
         started: None,
         ok: None,
+        stopped: false,
         granted: None,
         uses: task.uses.clone(),
     };
@@ -372,7 +374,7 @@ fn wait_turn(
                 "loadmaster: `{}` was canceled with `loadmaster cancel` while it waited",
                 task.name
             );
-            return Ok(Turn::Interrupted(cancel_signal(kill)));
+            return Ok(Turn::Interrupted(cancel_signal(kill, task)));
         }
         match ticket.try_admit()? {
             Admission::Admitted => {
@@ -433,7 +435,7 @@ fn run_admitted(
             task.name
         );
         record.outcome = Outcome::Interrupted;
-        return Ok(128 + cancel_signal(kill));
+        return Ok(128 + cancel_signal(kill, task));
     }
     // Fewer cores than its weight while CPU is busy outside the queue: the
     // task can size its parallelism by them.
@@ -477,23 +479,31 @@ fn run_admitted(
     let machine_before = process::cpu_ticks();
     record.wait_ms = millis(started.duration_since(wait_started));
     // A request to kill always goes through; one to stop only if the task
-    // has had no SIGTERM yet (see `runner::wait`).
-    let canceled = |term_sent: bool| {
+    // has had its stop signal yet (see `runner::wait`).
+    let canceled = |stop_sent: bool| {
         // A failed look (a busy database) only puts it off to the next one.
         let kill = ticket.cancel_requested().ok()??;
-        if !kill && term_sent {
+        if !kill && stop_sent {
             return None;
         }
         say!(
             "loadmaster: `{}` was canceled with `loadmaster cancel`; sending it {}",
             task.name,
-            if kill { "SIGKILL" } else { "SIGTERM" }
+            runner::signal_name(cancel_signal(kill, task))
         );
-        Some(cancel_signal(kill))
+        // SIGTERM asks to stop: the forwarder sends the task's stop signal.
+        Some(if kill { libc::SIGKILL } else { libc::SIGTERM })
     };
-    let mut forwarder = runner::Forwarder::default();
-    let status = runner::wait(&mut child, signals, &mut forwarder, canceled)
-        .map_err(|e| Error::io("cannot wait for the task", e))?;
+    let mut forwarder = runner::Forwarder::new(task.stop_signal);
+    let mut descendants = process::Descendants::default();
+    let (status, stopped) = runner::wait(
+        &mut child,
+        signals,
+        &mut forwarder,
+        &mut descendants,
+        canceled,
+    )
+    .map_err(|e| Error::io("cannot wait for the task", e))?;
     // Measured before the slot is released, which may wait for the database.
     record.run_ms = Some(millis(started.elapsed()));
     record.cpu_ms = process::children_cpu_time()
@@ -503,6 +513,10 @@ fn run_admitted(
     record.load = process::load_average();
     record.machine_busy = machine_busy(machine_before);
     record.signal = status.signal();
+    // Asked to stop before it exited: one sent to what is left after does
+    // not make a failure a stop.
+    record.stopped = stopped;
+    warn_of_processes_left(task, &child.group, &mut descendants);
     let handed_over = if child.group.is_alive() {
         say!(
             "loadmaster: `{}` exited, but processes it started are still running \
@@ -511,11 +525,11 @@ fn run_admitted(
             child.group.pgid
         );
         // Signals that arrived meanwhile still go to them, and whether they
-        // had a SIGTERM is recorded, in one step with the handover, so a
-        // cancel of the job sends them no second one.
+        // had the stop signal is recorded, in one step with the handover, so
+        // a cancel of the job sends them no second one.
         ticket.hand_over(|| {
             forwarder.forward_pending(&child.group, signals);
-            forwarder.term_sent()
+            forwarder.stop_sent()
         })
     } else {
         drop(ticket);
@@ -532,6 +546,53 @@ fn run_admitted(
         );
     }
     Ok(runner::exit_code(status))
+}
+
+/// How long processes a task started outside its process group get to exit
+/// with it before they count as left running.
+const LEFT_GRACE: Duration = Duration::from_millis(500);
+
+/// Warns of processes the task started that left its process group and
+/// still run: nothing holds a slot for them or sends them signals, and they
+/// may keep ports or files a later run needs (a server that a test runner
+/// started, say). Not stopped: some are meant to stay, such as a build
+/// tool's daemon.
+fn warn_of_processes_left(
+    task: &Task,
+    group: &process::ProcessGroup,
+    seen: &mut process::Descendants,
+) {
+    seen.look(group);
+    let started = Instant::now();
+    let mut left = seen.outside_group(group.pgid);
+    while !left.is_empty() && started.elapsed() < LEFT_GRACE {
+        thread::sleep(POLL_INTERVAL);
+        left = seen.outside_group(group.pgid);
+    }
+    if left.is_empty() {
+        return;
+    }
+    const SHOWN: usize = 3;
+    let mut names: Vec<String> = left
+        .iter()
+        .take(SHOWN)
+        .map(|p| format!("{} `{}`", p.pid, p.name))
+        .collect();
+    if left.len() > SHOWN {
+        names.push(format!("{} more", left.len() - SHOWN));
+    }
+    let last = names.pop().unwrap_or_default();
+    let list = if names.is_empty() {
+        last
+    } else {
+        format!("{} and {last}", names.join(", "))
+    };
+    say!(
+        "loadmaster: warning: `{}` exited, but processes it started outside its process group \
+         are still running ({list}); nothing holds a slot for them, and they may hold ports or \
+         files that a later run needs",
+        task.name
+    );
 }
 
 /// The machine's CPUs busy since `before`, on average, in cores (one
@@ -601,6 +662,21 @@ fn run_nested(value: &str, repo: &RepoConfig, task: &Task, mut command: Command)
                 format!("add `{name} = {amount}` to the `uses` of `{}`", holder.task),
             );
         }
+    }
+    // It runs in the holder's group, which gets the holder's stop signal: one
+    // it asks for of its own would never come.
+    if task.stop_signal != libc::SIGTERM && task.stop_signal != holder.stop_signal {
+        let (own, held) = (
+            runner::signal_name(task.stop_signal),
+            runner::signal_name(holder.stop_signal),
+        );
+        return Err(Error::NestedStopSignal {
+            reason: format!(
+                "`{}` stops on {own}, but job #{} (`{}`) that it would run in is stopped with \
+                 {held}: set `stop_signal = \"{own}\"` for `{}`, or run `{}` on its own",
+                task.name, holder.id, holder.task, holder.task, task.name
+            ),
+        });
     }
     let program = command.get_program().to_string_lossy().into_owned();
     let err = command.exec();
@@ -934,9 +1010,14 @@ fn clean() -> Result<i32> {
 /// After this long, `cancel` says which jobs are still stopping.
 const CANCEL_HINT_AFTER: Duration = Duration::from_secs(10);
 
-/// The signal a cancel request stands for.
-fn cancel_signal(kill: bool) -> i32 {
-    if kill { libc::SIGKILL } else { libc::SIGTERM }
+/// The signal a cancel request stands for: the task's stop signal, or
+/// SIGKILL.
+fn cancel_signal(kill: bool, task: &Task) -> i32 {
+    if kill {
+        libc::SIGKILL
+    } else {
+        task.stop_signal
+    }
 }
 
 fn cancel(args: CancelArgs) -> Result<i32> {

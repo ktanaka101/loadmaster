@@ -78,6 +78,10 @@ pub struct Record<'a> {
     /// one of the task's `ok_exit_codes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// loadmaster passed the task a request to stop (its stop signal, for a
+    /// SIGTERM or a cancel) before it exited.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
     /// The cores the task started with, if fewer than its weight because CPU
     /// was busy outside the queue.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +113,8 @@ pub struct Entry {
     pub exit_code: Option<i32>,
     pub started: Option<bool>,
     pub ok: Option<bool>,
+    #[serde(default)]
+    pub stopped: bool,
     pub granted: Option<u32>,
     #[serde(default)]
     pub uses: BTreeMap<String, u32>,
@@ -188,6 +194,7 @@ mod tests {
             exit_code: Some(1),
             started: None,
             ok: Some(false),
+            stopped: false,
             granted: None,
             uses: BTreeMap::from([("db".to_owned(), 1)]),
         };
@@ -252,6 +259,7 @@ mod tests {
                 exit_code: Some(1),
                 started: None,
                 ok: Some(false),
+                stopped: false,
                 granted: None,
                 uses: BTreeMap::from([("db".to_owned(), 1)]),
             }

@@ -27,7 +27,8 @@ pub fn render(repo: &RepoConfig, machine: &MachineConfig) -> String {
         );
     }
 
-    let mut rows = vec![["TASK", "WEIGHT", "USES", "OK EXIT CODES"].map(String::from)];
+    let mut rows =
+        vec![["TASK", "WEIGHT", "USES", "OK EXIT CODES", "STOP SIGNAL"].map(String::from)];
     for task in repo.tasks() {
         rows.push([
             task.name.clone(),
@@ -50,6 +51,7 @@ pub fn render(repo: &RepoConfig, machine: &MachineConfig) -> String {
                 .map(i32::to_string)
                 .collect::<Vec<_>>()
                 .join(", "),
+            crate::runner::signal_name(task.stop_signal),
         ]);
     }
     if rows.len() == 1 {
@@ -454,7 +456,8 @@ mod tests {
     fn renders_tasks_resources_and_warnings() {
         let text = "[resources.db]\ncapacity = 2\nper_checkout = 1\n\n".to_owned()
             + &task("e2e", 9, "db = 1")
-            + "[tasks.ui]\nweight = 2\nok_exit_codes = [0, 2]\ncmd = [\"true\"]\n";
+            + "[tasks.ui]\nweight = 2\nok_exit_codes = [0, 2]\nstop_signal = \"SIGINT\"\n\
+               cmd = [\"true\"]\n";
         let repo = repo(&text);
         let out = render(&repo, &machine(8));
         let cores = crate::process::online_cpus().unwrap();
@@ -462,9 +465,9 @@ mod tests {
             "{}: valid\ncapacity: 8 (default: 8 cores minus 2)\n\
              CPU busy outside the queue: beyond the {} of {cores} cores the capacity leaves \
              free, it lowers what jobs start with\n\n\
-             TASK  WEIGHT           USES  OK EXIT CODES\n\
-             e2e   9 (counts as 8)  db=1  0\n\
-             ui    2                -     0, 2\n\n\
+             TASK  WEIGHT           USES  OK EXIT CODES  STOP SIGNAL\n\
+             e2e   9 (counts as 8)  db=1  0              SIGTERM\n\
+             ui    2                -     0, 2           SIGINT\n\n\
              RESOURCE  CAPACITY  PER CHECKOUT\n\
              db        2         1\n\n\
              warning: `e2e` has weight 9",
