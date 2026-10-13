@@ -88,6 +88,21 @@ impl Signals {
     }
 }
 
+/// Gives the task `stop`'s default action, whatever this process inherited:
+/// a stop signal it inherited as ignored (SIGINT, in a job a script started
+/// in the background) would make every request to stop the task do nothing,
+/// and a shell cannot even trap a signal it starts with ignored.
+pub fn deliver_stop_signal(command: &mut Command, stop: i32) {
+    // SAFETY: the hook runs in the forked child and only calls signal(),
+    // which is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            libc::signal(stop, libc::SIG_DFL);
+            Ok(())
+        })
+    };
+}
+
 fn is_ignored(signal: i32) -> io::Result<bool> {
     let mut action = MaybeUninit::<libc::sigaction>::zeroed();
     // SAFETY: with a null new action, sigaction only reports the current one.

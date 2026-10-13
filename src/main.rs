@@ -460,6 +460,7 @@ fn run_admitted(
     if let Some(path) = config::machine_config_override()? {
         command.env(config::CONFIG_ENV, path);
     }
+    runner::deliver_stop_signal(&mut command, task.stop_signal);
     let (db, id) = (state_dir.join(QUEUE_DB_FILE), ticket.id());
     // Runs on another thread, so it opens its own connection.
     let register = move |group| -> Result<()> { Queue::open(&db)?.record_child(id, group) };

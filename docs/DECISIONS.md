@@ -122,7 +122,11 @@ like one a signal ended, not as failed.
 
 Signals that were already ignored when `loadmaster` started (SIGHUP under
 `nohup`, SIGINT in a background job of a non-interactive script) are left
-ignored, and the task inherits that. SIGCHLD is reset to its default action,
+ignored, and the task inherits that, except its stop signal: that is how
+loadmaster asks it to stop, so the task gets its default action. A task
+stopped with SIGINT, run by an agent in the background (`loadmaster run e2e
+&`), would otherwise ignore every request to stop, and a shell cannot even
+trap a signal it starts with ignored. SIGCHLD is reset to its default action,
 because an inherited "ignore" would make the task's exit status unobtainable.
 
 Each intercepted signal has its own pending flag, so a SIGINT followed by a

@@ -53,6 +53,31 @@ fn a_sigterm_reaches_the_task_as_its_stop_signal_once() {
 }
 
 #[test]
+fn the_stop_signal_reaches_a_task_whose_loadmaster_inherited_it_ignored() {
+    // As a script's background job does SIGINT: the task must not inherit
+    // that, or nothing would stop it.
+    let sandbox = logging_sandbox();
+    let mut cmd = sandbox.cmd(&["run", "hold"]);
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut runner = cmd.spawn().unwrap();
+    wait_until("the task to start", || sandbox.started("hold"));
+    signal(runner.id(), libc::SIGTERM);
+    wait_until("the stop signal", || {
+        sandbox.read("signals").contains("int")
+    });
+    sandbox.release("hold");
+    assert!(wait(&mut runner).success());
+    assert_eq!(sandbox.read("signals"), "int\n");
+}
+
+#[test]
 fn ctrl_c_passes_each_time_and_counts_as_the_stop() {
     let sandbox = logging_sandbox();
     let mut runner = sandbox.spawn(&["run", "hold"]);
