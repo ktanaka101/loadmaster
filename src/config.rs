@@ -331,6 +331,9 @@ pub struct MachineConfig {
     /// Admit every job at once and only record it: a baseline to compare
     /// against (see `loadmaster report`).
     pub measure_only: bool,
+    /// Start jobs with fewer cores while CPU is busy outside the queue
+    /// beyond the cores the capacity leaves free.
+    pub adapt_to_outside_cpu: bool,
     /// Resource capacities, overriding the repositories' defaults.
     pub resources: BTreeMap<String, u32>,
 }
@@ -344,8 +347,14 @@ struct MachineFile {
     capacity: Option<u32>,
     #[serde(default)]
     measure_only: bool,
+    #[serde(default = "yes")]
+    adapt_to_outside_cpu: bool,
     #[serde(default)]
     resources: BTreeMap<String, u32>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl MachineConfig {
@@ -406,6 +415,7 @@ impl MachineConfig {
             capacity,
             capacity_source,
             measure_only: file.measure_only,
+            adapt_to_outside_cpu: file.adapt_to_outside_cpu,
             resources: file.resources,
         })
     }

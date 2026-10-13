@@ -444,6 +444,106 @@ pub fn load_average() -> Option<f64> {
     (n == 1 && load[0].is_finite()).then_some(load[0])
 }
 
+/// The whole machine's CPU time so far, in clock ticks summed over its CPUs:
+/// what was busy, and all of it. It counts every process, inside the queue
+/// or not, and only CPU time (not waits for disks, as the load average does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuTicks {
+    pub busy: u64,
+    pub total: u64,
+}
+
+impl CpuTicks {
+    /// The share of the machine's CPU time that was busy from `earlier` to
+    /// this reading, or `None` if no tick passed or a count went back (a
+    /// counter wrapped, or Linux's iowait, which can, did).
+    pub fn busy_since(&self, earlier: CpuTicks) -> Option<f64> {
+        let busy = self.busy.checked_sub(earlier.busy)?;
+        let idle = (self.total - self.busy).checked_sub(earlier.total - earlier.busy)?;
+        let total = busy + idle;
+        (total > 0).then(|| busy as f64 / total as f64)
+    }
+}
+
+/// The machine's [`CpuTicks`] now, summed over its CPUs, if the OS reports
+/// them. Each CPU's counters, unlike the machine's (`host_statistics`), are
+/// kept up to date: the machine's are added up about once a second, too
+/// rarely to measure a quarter of a second by. They are 32 bits and count
+/// 100 times a second, so one wraps after 497 days of uptime: the share
+/// across that is not measured.
+#[cfg(target_os = "macos")]
+pub fn cpu_ticks() -> Option<CpuTicks> {
+    use std::sync::OnceLock;
+    // Each call of mach_host_self adds a reference to the port; one is enough.
+    static HOST: OnceLock<libc::mach_port_t> = OnceLock::new();
+    // libc deprecates its Mach bindings for the mach2 crate; a few calls are
+    // not worth a dependency.
+    // SAFETY: mach_host_self has no preconditions.
+    #[allow(deprecated)]
+    let host = *HOST.get_or_init(|| unsafe { libc::mach_host_self() });
+    let mut cpus: libc::natural_t = 0;
+    let mut info: libc::processor_info_array_t = std::ptr::null_mut();
+    let mut count: libc::mach_msg_type_number_t = 0;
+    // SAFETY: the out-pointers are valid for the call, which allocates the
+    // array in this task.
+    let r = unsafe {
+        libc::host_processor_info(
+            host,
+            libc::PROCESSOR_CPU_LOAD_INFO,
+            &mut cpus,
+            &mut info,
+            &mut count,
+        )
+    };
+    if r != libc::KERN_SUCCESS || info.is_null() {
+        return None;
+    }
+    // SAFETY: the call returned `count` integers at `info`.
+    let values = unsafe { std::slice::from_raw_parts(info.cast::<u32>(), count as usize) };
+    let (mut busy, mut total) = (0u64, 0u64);
+    let (per_cpu, _) = values.as_chunks::<{ libc::CPU_STATE_MAX as usize }>();
+    for cpu in per_cpu {
+        let tick = |state: libc::c_int| u64::from(cpu[state as usize]);
+        let used =
+            tick(libc::CPU_STATE_USER) + tick(libc::CPU_STATE_SYSTEM) + tick(libc::CPU_STATE_NICE);
+        busy += used;
+        total += used + tick(libc::CPU_STATE_IDLE);
+    }
+    // SAFETY: the array was allocated for this task by the call, with this
+    // size, and is not used after.
+    #[allow(deprecated)]
+    unsafe {
+        libc::vm_deallocate(
+            libc::mach_task_self(),
+            info as libc::vm_address_t,
+            count as usize * std::mem::size_of::<libc::integer_t>(),
+        );
+    }
+    Some(CpuTicks { busy, total })
+}
+
+/// The machine's [`CpuTicks`] now, from the first line of `/proc/stat`. Time
+/// waiting for disks (iowait) counts as idle; time stolen by a hypervisor
+/// counts as busy, since this machine could not use it.
+#[cfg(target_os = "linux")]
+pub fn cpu_ticks() -> Option<CpuTicks> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = stat.lines().next()?.strip_prefix("cpu ")?;
+    // user nice system idle iowait irq softirq steal (guest time is in user).
+    let fields: Vec<u64> = line
+        .split_ascii_whitespace()
+        .take(8)
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let total: u64 = fields.iter().sum();
+    let idle = fields.get(3)? + fields.get(4).copied().unwrap_or(0);
+    Some(CpuTicks {
+        busy: total - idle,
+        total,
+    })
+}
+
 /// CPU time (user plus system) used by this process's children that have
 /// exited and been waited for, and by their own waited-for descendants.
 pub fn children_cpu_time() -> Option<Duration> {
@@ -464,6 +564,59 @@ pub fn children_cpu_time() -> Option<Duration> {
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn busy_cpu_time_shows_in_the_machine_ticks() {
+        let cores = online_cpus().unwrap();
+        // A container's quota can leave this process fewer.
+        let usable = std::thread::available_parallelism().unwrap().get();
+        let before = cpu_ticks().expect("the OS reports CPU ticks");
+        // Every core it may use busy for a while: the share busy is up.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..usable {
+                scope.spawn(|| {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let after = cpu_ticks().unwrap();
+        // Seen, at least: a quota can keep the threads to a share of a core
+        // (tests/outside.rs checks a machine kept busy).
+        let busy = after.busy_since(before).unwrap();
+        assert!(busy > 0.0, "busy share {busy}");
+        assert!(busy <= 1.0);
+        assert_eq!(after.busy_since(after), None, "no tick passed");
+        // A quarter of a second is enough to measure: the counters move
+        // all the time, not once a second.
+        for _ in 0..4 {
+            let from = cpu_ticks().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            let to = cpu_ticks().unwrap();
+            let ticks = to.total - from.total;
+            assert!(ticks >= u64::from(cores as u32) * 10, "{ticks} ticks");
+        }
+    }
+
+    #[test]
+    fn a_count_that_went_back_measures_nothing() {
+        let earlier = CpuTicks {
+            busy: 100,
+            total: 1_000,
+        };
+        let later = |busy, idle| CpuTicks {
+            busy,
+            total: busy + idle,
+        };
+        assert_eq!(later(130, 910).busy_since(earlier), Some(0.75));
+        // A CPU's idle count wrapped, so the sum dropped.
+        assert_eq!(later(130, 4).busy_since(earlier), None);
+        assert_eq!(later(90, 950).busy_since(earlier), None);
+    }
 
     #[test]
     fn load_average_is_reported() {

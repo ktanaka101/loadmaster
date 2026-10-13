@@ -35,6 +35,11 @@ pub struct Check {
     pub run_ms: Option<u64>,
     pub cpu_ms: Option<u64>,
     pub load: Option<f64>,
+    /// The machine's CPUs busy while it ran, in cores (see
+    /// [`Entry::machine_busy`]).
+    pub machine_busy: Option<f64>,
+    /// The cores it started with, if fewer than its weight.
+    pub granted: Option<u32>,
     /// The resources it used, by name.
     pub uses: BTreeMap<String, u32>,
     pub result: CheckResult,
@@ -158,6 +163,8 @@ fn join(first: &Entry, last: &Entry) -> Check {
         run_ms: last.run_ms,
         cpu_ms: last.cpu_ms,
         load: last.load,
+        machine_busy: last.machine_busy,
+        granted: last.granted,
         uses: last.uses.clone(),
         result,
     }
@@ -191,9 +198,10 @@ pub fn overlap(checks: &[Check], capacity: u32) -> Overlap {
     let demand = ran
         .iter()
         .map(|&(c, run)| (c.queued_at, c.queued_at + run, c.weight));
+    // What each held: its weight, or the fewer cores it started with.
     let in_use = ran.iter().map(|&(c, run)| {
         let start = c.queued_at + c.wait_ms;
-        (start, start + run, c.weight)
+        (start, start + run, c.granted.unwrap_or(c.weight))
     });
     Overlap {
         demand: stacking(demand, capacity),
@@ -381,11 +389,42 @@ fn section(
         let cpus = cpus.map_or(String::new(), |n| format!(" ({n} CPUs)"));
         out += &format!("load average when tasks ended: median {median:.1}, p90 {p90:.1}{cpus}\n");
     }
+    out += &saturated_line(checks, cpus);
     out += "\n";
     let (table, flagged) = task_table(checks);
     out += &table;
     (out, flagged)
 }
+
+/// How many of the checks that failed or were killed ran while the machine's
+/// CPUs were nearly all busy, inside the queue or outside it: those may have
+/// failed from the load rather than the code.
+fn saturated_line(checks: &[Check], cpus: Option<usize>) -> String {
+    let Some(cpus) = cpus else {
+        return String::new();
+    };
+    let bad: Vec<&Check> = checks
+        .iter()
+        .filter(|c| matches!(c.result, CheckResult::Failed | CheckResult::Killed))
+        .filter(|c| c.machine_busy.is_some())
+        .collect();
+    if bad.is_empty() {
+        return String::new();
+    }
+    let saturated = bad
+        .iter()
+        .filter(|c| c.machine_busy.is_some_and(|b| b >= SATURATED * cpus as f64))
+        .count();
+    format!(
+        "failed or killed with the CPUs {:.0}% busy or more while they ran: {saturated} of {}\n",
+        SATURATED * 100.0,
+        bad.len()
+    )
+}
+
+/// The share of the CPUs busy above which a failed check counts as run on a
+/// saturated machine; `loadmaster run` notes those as they happen.
+pub const SATURATED: f64 = 0.95;
 
 /// A task with one weight and one set of resources: a row of the table.
 type Setting<'a> = (&'a str, u32, &'a BTreeMap<String, u32>);
@@ -663,10 +702,12 @@ mod tests {
             run_ms: None,
             cpu_ms: None,
             load: None,
+            machine_busy: None,
             signal: None,
             exit_code: None,
             started: None,
             ok: None,
+            granted: None,
             uses: BTreeMap::new(),
         }
     }
@@ -804,6 +845,42 @@ mod tests {
     }
 
     #[test]
+    fn failures_on_a_saturated_machine_are_counted() {
+        let busy = |entry: Entry, busy| Entry {
+            machine_busy: Some(busy),
+            ..entry
+        };
+        let entries = [
+            busy(exited(1, 0, 0, 10, 1), 13.5),
+            busy(exited(2, 0, 0, 10, 1), 5.0),
+            Entry {
+                signal: Some(15),
+                ok: None,
+                ..busy(exited(3, 0, 0, 10, 143), 14.0)
+            },
+            // Passed: not counted, however busy.
+            busy(exited(4, 0, 0, 10, 0), 14.0),
+            // Not measured: not counted.
+            exited(5, 0, 0, 10, 1),
+        ];
+        let text = render(
+            &entries,
+            &Options {
+                cpus: Some(14),
+                ..options()
+            },
+        );
+        assert!(
+            text.contains(
+                "failed or killed with the CPUs 95% busy or more while they ran: 2 of 3\n"
+            ),
+            "{text}"
+        );
+        let unknown = render(&entries, &options());
+        assert!(!unknown.contains("failed or killed with"), "{unknown}");
+    }
+
+    #[test]
     fn results_are_classified() {
         let by_signal = Entry {
             signal: Some(15),
@@ -926,6 +1003,25 @@ mod tests {
                 peak: 8
             }
         );
+    }
+
+    #[test]
+    fn what_is_in_use_is_what_each_started_with() {
+        // Started with 2 of its 8 cores, beside a check of 6: 8 held, though
+        // 14 were asked for.
+        let checks = checks(&[
+            Entry {
+                weight: 8,
+                granted: Some(2),
+                ..exited(1, 0, 0, 1_000, 0)
+            },
+            Entry {
+                weight: 6,
+                ..exited(2, 0, 0, 1_000, 0)
+            },
+        ]);
+        let o = overlap(&checks, 8);
+        assert_eq!((o.demand.peak, o.in_use.peak, o.in_use.over_ms), (14, 8, 0));
     }
 
     #[test]

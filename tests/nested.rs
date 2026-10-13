@@ -204,7 +204,11 @@ fn a_relative_machine_config_means_the_same_file_in_a_nested_run() {
     let sandbox = Sandbox::new(8, "");
     let tasks = task("outer", 8, &[BIN, "run", "inner"]) + &sh_task("inner", 8, "echo ran");
     std::fs::write(sandbox.repo.join(".loadmaster.toml"), tasks).unwrap();
-    std::fs::write(sandbox.repo.join("machine.toml"), "capacity = 4\n").unwrap();
+    std::fs::write(
+        sandbox.repo.join("machine.toml"),
+        format!("capacity = 4\n{STATIC_CPU}"),
+    )
+    .unwrap();
     let sub = sandbox.repo.join("sub");
     std::fs::create_dir_all(&sub).unwrap();
     let mut cmd = sandbox.cmd(&["run", "outer"]);

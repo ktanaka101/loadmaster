@@ -140,7 +140,7 @@ fn the_machine_config_overrides_a_resource_capacity() {
     let sandbox = sandbox("capacity = 1", log.path());
     std::fs::write(
         &sandbox.machine_config,
-        "capacity = 8\n[resources]\ndb = 2\n",
+        format!("capacity = 8\n{STATIC_CPU}[resources]\ndb = 2\n"),
     )
     .unwrap();
     let mut holder = hold_database(&sandbox);

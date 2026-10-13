@@ -62,6 +62,10 @@ pub struct Record<'a> {
     pub cpu_ms: Option<u64>,
     /// The 1-minute load average when the task finished.
     pub load: Option<f64>,
+    /// The machine's CPUs busy while the task ran, on average, in cores:
+    /// inside the queue and outside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_busy: Option<f64>,
     /// The signal that killed the task, if one did.
     pub signal: Option<i32>,
     /// What `loadmaster run` exited with.
@@ -74,6 +78,10 @@ pub struct Record<'a> {
     /// one of the task's `ok_exit_codes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// The cores the task started with, if fewer than its weight because CPU
+    /// was busy outside the queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted: Option<u32>,
     /// The resources the task used, by name, so runs of one task with
     /// different settings can be told apart.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -96,10 +104,12 @@ pub struct Entry {
     pub run_ms: Option<u64>,
     pub cpu_ms: Option<u64>,
     pub load: Option<f64>,
+    pub machine_busy: Option<f64>,
     pub signal: Option<i32>,
     pub exit_code: Option<i32>,
     pub started: Option<bool>,
     pub ok: Option<bool>,
+    pub granted: Option<u32>,
     #[serde(default)]
     pub uses: BTreeMap<String, u32>,
 }
@@ -173,10 +183,12 @@ mod tests {
             run_ms: Some(300),
             cpu_ms: Some(600),
             load: Some(2.5),
+            machine_busy: Some(3.5),
             signal: None,
             exit_code: Some(1),
             started: None,
             ok: Some(false),
+            granted: None,
             uses: BTreeMap::from([("db".to_owned(), 1)]),
         };
         append(dir.path(), &record).unwrap();
@@ -235,10 +247,12 @@ mod tests {
                 run_ms: Some(300),
                 cpu_ms: Some(600),
                 load: Some(2.5),
+                machine_busy: Some(3.5),
                 signal: None,
                 exit_code: Some(1),
                 started: None,
                 ok: Some(false),
+                granted: None,
                 uses: BTreeMap::from([("db".to_owned(), 1)]),
             }
         );

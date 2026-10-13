@@ -201,7 +201,7 @@ same moment on a fresh state directory occasionally got "database is locked"
 (found in the real-tools demo, about 1 run in 300). The switch is retried for
 up to the busy timeout; everything else relies on SQLite's busy handler.
 
-The version of the database's layout is in its file name (`queue-v1.db`): a
+The version of the database's layout is in its file name (`queue-v2.db`): a
 `loadmaster` that changes the layout uses a new file, and never opens, reads
 or upgrades one of another layout. Versions with different layouts keep
 separate queues, and do not see each other's jobs; while both run, as for
@@ -259,9 +259,10 @@ it holds back only what it is short of. Jobs are considered in line order, on
 every dimension at once (CPU, each machine-wide resource, each per-checkout
 resource of each checkout):
 
-- A job fits if, on every dimension, what running jobs use plus what is set
-  aside for jobs ahead of it plus its own amount is within the limit, and it
-  uses nothing that a job ahead of it is short of. A job that fits may start.
+- A job fits if, on every dimension, what the running jobs ahead of it use
+  plus what is set aside for jobs ahead of it plus its own amount is within
+  the limit, and it uses nothing that a job ahead of it is short of. A job
+  that fits may start.
 - A job that does not fit is short of some dimensions: no job behind it may
   use those at all. On the dimensions where it fits, its amount is set aside,
   so jobs behind it can only use what is left.
@@ -270,7 +271,16 @@ resource of each checkout):
 
 A job behind can therefore start first only by using nothing the waiting job
 is short of and leaving it its share everywhere else, so no job is ever
-delayed by jobs that got in line after it. Every task uses CPU, so a job
+delayed by jobs that got in line after it. Running jobs behind a job do not
+count against it: they only started in room it did not need then, and while
+the limits stay put that changes nothing. CPU busy outside the queue can
+lower the CPU limit after they started, though (see
+[Load outside the queue](#load-outside-the-queue)), and counting them would
+then make the job wait for them. Not counting them can take the machine past
+that lowered limit, never past the capacity: a job behind only started
+beside the whole amount of each job ahead that fit, and none of those can
+start with more. Measure-only jobs did not start by the rule, so they count
+against every job, wherever they are in line. Every task uses CPU, so a job
 waiting for CPU still holds back everyone behind it: with CPU alone, no job
 starts while one ahead of it is short of CPU, as in the strict line of the
 first version. (One difference is for the better: a parked job that fits used
@@ -287,9 +297,10 @@ which one agent per worktree rarely causes. Skipping that set-aside when the
 release the job waits for would free enough anyway was considered; it breaks
 the guarantee when a waiting job leaves the line instead.
 
-A unit test simulates random workloads with several resources and checks that
-each job starts at the same time whether or not the jobs that got in line
-after it exist. The soak test adds resources and a second checkout and checks
+A unit test simulates random workloads with several resources, with and
+without CPU outside the queue that changes on its own, and checks that each
+job starts at the same time whether or not the jobs that got in line after it
+exist, and that every job starts. The soak test adds resources and a second checkout and checks
 every limit from inside the tasks.
 
 A nested run takes no part in admission: it has to fit in its holder's
@@ -407,16 +418,57 @@ that one agent works in.
 
 ## Load outside the queue
 
-Checks run outside the queue (type checks, Docker, tasks using more cores
-than their weight) can push the load well above the capacity, and admitting
-jobs only while the load average is below a limit was suggested. It is not
-done: the load average lags by a minute, counts more than CPU (on Linux,
-processes waiting for disks), and a limit on it lets work outside the line
-delay every job indefinitely and in an order nobody can predict, which breaks
-the guarantee the line gives. `status` prints the load average next to the
-capacity in use, and says when it is above the core count, so the gap shows;
-the answer is to route that work through the queue, and to raise the weights
-the report flags.
+Work that cannot go through the queue (a game, a video call, other people's
+builds on a shared machine) takes CPU the capacity counts on, and heavy
+checks then run into timeouts. Two answers were asked for: to adjust after a
+check times out or fails, and to keep checks from crowding a busy machine.
+
+Adjusting after a failure is not done. loadmaster cannot tell a failure from
+the load from one in the code, so retrying would hide real failures and run
+every failing check twice, and raising a weight would change, on one
+machine's bad hour, a setting committed for every machine; a timeout of the
+agent's own also ends loadmaster with its task. What loadmaster can tell is
+whether the machine was saturated: it measures the machine's CPU busy while
+each task runs, records it in the history log, notes on stderr when a task
+fails or is killed while the CPUs were 95% busy or more, and `report` counts
+such checks. That leaves the agent or person to re-run, with the reason.
+
+Keeping checks off a busy machine is done, at the start of each job. An
+earlier proposal, to admit jobs only while the load average is below a
+limit, was not taken, for three reasons this design answers:
+
+- The load average lags by a minute and counts more than CPU (on Linux,
+  processes waiting for disks). Instead the machine's CPU time comes from the
+  kernel's tick counters (each CPU's from `host_processor_info` on macOS, as
+  the machine's own total is added up only once a second; `/proc/stat` on
+  Linux), measured over a quarter of a second. Measuring since an earlier
+  reading instead would count what a job that started and ended in between
+  used as outside. A reading in which a count went back (a counter wrapped,
+  or Linux's iowait did) measures nothing. Waiting processes take turns
+  measuring, through a row in the queue database that stands for 3 seconds. What the running jobs were granted counts as the
+  queue's own; the rest is outside, including what a job uses beyond its
+  grant, since those cores are busy too.
+- A limit on it lets work outside the line delay every job indefinitely.
+  Instead the outside load beyond the cores the capacity leaves free lowers
+  the CPU limit of the jobs that start, to at least one core, and a weight
+  above that counts as all of it, as a weight above the capacity does. The
+  first job in line therefore still starts once the jobs ahead of it are
+  done: outside work can slow the line, but not stop it.
+- It breaks the guarantee the line gives, in an order nobody can predict.
+  Instead the rule stays the same rule with a lower CPU limit, and judges a
+  job only by the jobs ahead of it (see [Resources](#resources)), so jobs
+  behind never delay it, however the CPU outside the queue changes; a
+  simulation with outside load that changes on its own checks that.
+
+A job keeps what it started with: a task cannot be made to use fewer cores
+once it runs, and counting its grant anew would make jobs behind wait for
+cores it does not take. The task learns what it got from `LOADMASTER_WEIGHT`,
+so one that sizes its workers by it runs fewer of them, which is what keeps
+a single heavy check from timing out next to a game. `adapt_to_outside_cpu =
+false` in the machine config turns this off; each job records the setting it
+got in line with, as it does its capacity. GPU and memory are not measured:
+there is no portable, unprivileged way to read either per machine, and CPU is
+what checks contend for most.
 
 ## Nested runs
 
@@ -537,9 +589,14 @@ it) is dead and must be reaped. Otherwise every waiter would take the write
 lock ten times a second and compete with the writes that matter, such as
 recording a task that is held at its gate. The decision is always made again
 under the lock before admitting. `Queue::open` likewise checks that the
-schema has been made without the lock. A running task is polled for exit every 20 ms. The waiting message is
-printed when a job starts waiting and then every 10 seconds: often enough to
-show progress, rarely enough not to flood an agent's context.
+schema has been made without the lock. The CPU busy outside the queue is
+measured again only once its row is 3 seconds old, by whichever waiter finds
+it so: a quarter of a second of one waiter's time and one short write every
+3 seconds while jobs wait, and a quarter of a second more for a job that
+starts after 3 quiet seconds. A running
+task is polled for exit every 20 ms. The waiting message is printed when a
+job starts waiting and then every 10 seconds: often enough to show progress,
+rarely enough not to flood an agent's context.
 
 Only the head of the line can be admitted, and the new head notices free
 capacity on its own next poll, so a backlog drains at roughly one admission per
@@ -581,9 +638,10 @@ transaction would remove this cost; it is left out until it matters.
   to each machine, so a repository's weights have to work on smaller machines
   too (a CI runner, a laptop); rejecting them, as the first version did, made
   the shared config unusable there. A note on stderr still points out a typo
-  such as `weight = 80`. The capped weight is what the job records, what
-  `LOADMASTER_WEIGHT` says and what the history log shows: it is the slot the
-  task really held.
+  such as `weight = 80`. The capped weight is what the job records and what
+  the history log shows as its weight; `LOADMASTER_WEIGHT` says the cores it
+  started with, which are fewer while CPU is busy outside the queue (the log
+  then has them as `granted`).
 
 ## History log
 

@@ -180,7 +180,11 @@ fn broken_machine_config_is_rejected() {
         std::fs::write(&sandbox.machine_config, text).unwrap();
         assert_fails_fast(&sandbox, &["run", "lint"], &[expected, "machine.toml"]);
     }
-    std::fs::write(&sandbox.machine_config, "capacity = 4\n").unwrap();
+    std::fs::write(
+        &sandbox.machine_config,
+        format!("capacity = 4\n{STATIC_CPU}"),
+    )
+    .unwrap();
     sandbox.release("hold");
     wait(&mut holder);
 }

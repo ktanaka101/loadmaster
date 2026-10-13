@@ -87,12 +87,15 @@ loadmaster is new (0.7). What has been verified:
 - A soak test simulates five agents with Claude Code-style timeouts (SIGTERM,
   then SIGKILL of the process group), re-runs after exit code 75, and crashes,
   in two checkouts with two resources besides CPU, while jobs are canceled at
-  random. 810 runs (231 of them canceled) in 5 minutes on macOS and 489 in
+  random. 810 runs (238 of them canceled) in 5 minutes on macOS and 502 in
   3 minutes on Linux exceeded no limit, every task got through, and nothing
-  was left behind.
-- A simulation checks, on random workloads with several resources, that no
-  job is ever delayed by jobs that got in line after it; rules broken on
-  purpose are caught.
+  was left behind. With jobs adapting to CPU busy outside the queue, beside
+  10 busy processes that came and went, 489 runs in 3 minutes on macOS (36
+  of them started with fewer cores) did the same.
+- A simulation checks, on random workloads with several resources and with
+  CPU busy outside the queue that changes on its own, that no job is ever
+  delayed by jobs that got in line after it and that every job starts; rules
+  broken on purpose are caught.
 - Five real Claude Code sessions (Sonnet, headless) in five git worktrees of a
   demo repository, set up as described in
   [Using it with AI coding tools](#using-it-with-ai-coding-tools), ran lint, test and
@@ -396,8 +399,9 @@ using it, and keeps new runs off it until they are done.
 
 The running task gets two environment variables:
 
-- `LOADMASTER_WEIGHT`: the task's weight, so the task can size its own
-  parallelism to match the slot it holds.
+- `LOADMASTER_WEIGHT`: the cores the task got: its weight, or fewer while CPU
+  is busy outside the queue, so the task can size its own parallelism to
+  match the slot it holds.
 - `LOADMASTER_HELD`: the ID of the job holding the slot (see
   [Nested runs](#nested-runs) and
   [Guarding a script](#guarding-a-script)).
@@ -476,18 +480,25 @@ starting point.
 and its place in line, and only records it, to get a baseline; see
 [Checking that it helps](#checking-that-it-helps).
 
+While CPU is busy outside the queue (a game, a video call, a build that does
+not go through loadmaster) beyond the cores the capacity leaves free, jobs
+start with fewer cores; see [How it works](#how-it-works).
+`adapt_to_outside_cpu = false` turns that off, so jobs always start with
+their weight.
+
 `$XDG_CONFIG_HOME` is honored, and `LOADMASTER_CONFIG` overrides the path; a
 file it names must exist, while a missing file in the default place means all
 defaults. Like `.loadmaster.toml`, the file can name the oldest loadmaster
 that reads it with `min_version`, for a file shared across machines.
 
-The queue lives in `~/.local/state/loadmaster/queue-v1.db` (`$XDG_STATE_HOME`,
+The queue lives in `~/.local/state/loadmaster/queue-v2.db` (`$XDG_STATE_HOME`,
 `LOADMASTER_STATE_DIR`). The number is the version of its layout: loadmaster
 versions with different layouts keep separate queues and do not see each
 other's jobs, so give every agent on a machine the same version (as one
 `mise use -g` does). Next to it, `history.jsonl` gets one line per job
-(task, weight, resources, capacity, wait and run time, CPU time, load average,
-signal, exit code and whether it counts as passed), which `loadmaster report`
+(task, weight and the cores it got if fewer, resources, capacity, wait and run
+time, CPU time, load average, the machine's CPU busy while it ran, signal,
+exit code and whether it counts as passed), which `loadmaster report`
 summarizes; it reads only lines of the format this version writes, and says
 how many others it skipped. If `loadmaster` is killed before it can write its
 line, the process that later reclaims the job writes one with outcome `lost`.
@@ -495,8 +506,8 @@ line, the process that later reclaims the job writes one with outcome `lost`.
 ## How it works
 
 - **Admission**: jobs are considered in line order. A job starts when its
-  weight and each resource it uses fit in what running jobs leave free and in
-  what the jobs ahead of it set aside: a job waiting in line sets aside what
+  weight and each resource it uses fit in what the running jobs ahead of it
+  leave free and in what the jobs ahead of it set aside: a job waiting in line sets aside what
   it needs wherever that fits, and holds back entirely what it is short of.
   No job is ever delayed by jobs that got in line after it. Every task uses
   CPU, so a small job never overtakes a big job waiting for CPU, and the big
@@ -531,6 +542,22 @@ line, the process that later reclaims the job writes one with outcome `lost`.
 - **A weight above the capacity** counts as the whole capacity: the task runs
   alone, with a note on stderr. Weights are committed with the repository, so
   this keeps them usable on a smaller machine, such as a CI runner.
+- **CPU busy outside the queue**, such as a game, takes cores from the jobs
+  that start. loadmaster measures how busy the machine's CPUs are, over a
+  quarter of a second at most every 3 seconds (from the kernel's CPU time,
+  not the load average), and
+  counts what its running jobs were granted as the queue's own. When the rest
+  is more than the cores the capacity leaves free, a job starts with that many
+  fewer cores, but at least one: a weight above that counts as all of it, so
+  the first job in line still starts once the jobs ahead of it are done. The
+  task learns the cores it got from `LOADMASTER_WEIGHT`, and `loadmaster run`
+  says so on stderr; a task that sizes its workers by it
+  (`--maxWorkers=$LOADMASTER_WEIGHT`) runs fewer of them rather than crowding
+  a busy machine into timeouts. A task that runs keeps what it started with.
+  When a task fails or is killed while the CPUs were 95% busy or more,
+  `loadmaster run` notes it on stderr, since a check slowed that much can run
+  into a timeout, and `loadmaster report` counts such checks. loadmaster
+  cannot tell why a check failed, so it does not retry it or change weights.
 - **Why a job waits** is worked out by the admission rule itself, which
   `loadmaster status` and the waiting messages report: a dimension in use by
   running jobs, one set aside for jobs ahead, or one a job ahead waits for
@@ -587,7 +614,8 @@ loadmaster held [--uses RESOURCE]
 
 - `run`: run a task once its weight and resources fit.
 - `status`: show used/total capacity, resources in use, the load average,
-  every running, waiting or parked job, and what each waiting job waits for.
+  the CPU busy outside the queue, every running, waiting or parked job, and
+  what each waiting job waits for.
 - `cancel`: stop jobs, by ID or (`--here`) every job started from this
   checkout except the one `cancel` itself runs in, and wait until they have
   left the queue. It leaves a request in the queue, and the job's own
@@ -603,7 +631,8 @@ loadmaster held [--uses RESOURCE]
   no chance to clean up. `loadmaster report` leaves canceled checks out.
   Exits with 0 once the jobs are gone.
 - `check`: validate `.loadmaster.toml` and the machine config, list the tasks
-  and resources with their limits on this machine, and warn about weights that
+  and resources with their limits on this machine, say how many cores the
+  capacity leaves for CPU busy outside the queue, and warn about weights that
   take the whole machine or crowd out other tasks while waiting for a
   resource. It does not touch the queue. Exits with 0 if the configs are
   valid, warnings or not, and with 125 if not.
@@ -1027,14 +1056,12 @@ comparable, and a few dozen checks are noisy; compare similar weeks.
 
 loadmaster is deliberately small:
 
-- One machine. Weights are static; there are no priorities and no measurement
-  of actual CPU or memory use.
-- The capacity only accounts for work that goes through loadmaster. Work
-  outside it shows in the load average that `loadmaster status` prints, but
-  does not hold jobs back: the load average lags by a minute and counts more
-  than CPU, and admission based on it would let work outside the line delay
-  jobs indefinitely and in no predictable order. Route that work through the
-  queue instead.
+- One machine. Weights are static; there are no priorities, and no
+  measurement of the CPU or memory each task uses.
+- The capacity only accounts for work that goes through loadmaster. CPU busy
+  outside it lowers what jobs start with, but a task that is already running
+  keeps its cores, and GPU and memory used outside the queue are not
+  measured. Route work through the queue where you can.
 - Tasks run without terminal input (stdin is `/dev/null` when it would be a
   terminal). A task that opens the terminal itself, for a password prompt or a
   pager, is stopped by the OS; Ctrl-C still ends it.

@@ -8,6 +8,9 @@
 //! ```text
 //! LOADMASTER_SOAK_SECS=600 cargo test --release --test soak -- --ignored --nocapture
 //! ```
+//!
+//! Tasks record the cores they got (`LOADMASTER_WEIGHT`), so the limits are
+//! checked against what each holds.
 
 mod common;
 
@@ -58,6 +61,12 @@ fn agents_under_timeouts_and_crashes() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
     let probe = Sandbox::new(CAPACITY, "");
+    // With LOADMASTER_SOAK_ADAPT set, jobs start with fewer cores while CPU
+    // is busy outside the queue, as by default: run something CPU-heavy
+    // beside the soak to see it.
+    if std::env::var_os("LOADMASTER_SOAK_ADAPT").is_some() {
+        std::fs::write(&probe.machine_config, format!("capacity = {CAPACITY}\n")).unwrap();
+    }
     let markers = probe.path("markers");
     let violations = probe.path("violations");
     std::fs::create_dir_all(&markers).unwrap();
@@ -69,7 +78,7 @@ fn agents_under_timeouts_and_crashes() {
         .iter()
         .map(|(name, weight, db, mem, work)| {
             let script = format!(
-                "ck=${{PWD##*/}}; m={markers}/$$.{weight}.{db}.{mem}.$ck; : > \"$m\"; \
+                "ck=${{PWD##*/}}; m={markers}/$$.$LOADMASTER_WEIGHT.{db}.{mem}.$ck; : > \"$m\"; \
                  cpu=0; db=0; mem=0; dbck=0; \
                  for f in {markers}/*; do [ -e \"$f\" ] || continue; \
                    set -- $(echo \"${{f##*/}}\" | tr . ' '); \
@@ -141,7 +150,7 @@ fn agents_under_timeouts_and_crashes() {
         .collect();
     println!(
         "soak: {secs}s, {} runs: {} ok ({}), {} gave up (resumed), {} timed out, {} crashed, \
-         {} canceled; {} history lines",
+         {} canceled; {} history lines, {} started with fewer cores",
         stats.runs.load(Ordering::SeqCst),
         stats.ok.load(Ordering::SeqCst),
         ok_by_task.join(", "),
@@ -150,6 +159,7 @@ fn agents_under_timeouts_and_crashes() {
         stats.crashed.load(Ordering::SeqCst),
         stats.canceled.load(Ordering::SeqCst),
         history.lines().count(),
+        history.matches("\"granted\":").count(),
     );
     assert!(excess.is_empty(), "capacity exceeded: {excess}");
     assert!(

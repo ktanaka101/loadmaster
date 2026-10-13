@@ -27,6 +27,7 @@ fn request<'a>(task: &'a str, weight: u32, args: &'a [String]) -> JobRequest<'a>
         measure_only: false,
         uses: &[],
         checkout: Path::new("/repo"),
+        adapt_cpu: false,
     }
 }
 
@@ -615,13 +616,15 @@ fn job(id: JobId, state: JobState, weight: u32, uses: Vec<Use>, checkout: &str) 
         measure_only: false,
         uses,
         checkout: PathBuf::from(checkout),
+        adapt_cpu: true,
+        granted: (state == JobState::Running).then_some(weight),
     }
 }
 
 use JobState::{Running, Waiting};
 
 fn admitted(jobs: &[Job], id: JobId) -> bool {
-    decide(jobs, id).unwrap() == Admission::Admitted
+    decide(jobs, id, None).unwrap() == Admission::Admitted
 }
 
 #[test]
@@ -634,7 +637,7 @@ fn a_job_short_of_a_resource_holds_back_only_that_resource() {
         job(5, Waiting, 2, vec![db(1)], "/d"),
     ];
     assert_eq!(
-        said(decide(&jobs, 3).unwrap()),
+        said(decide(&jobs, 3, None).unwrap()),
         "0 ahead; waits for `db` (2 of 2 in use by #1 `job1` and #2 `job2`); \
          sets aside 2 cores and `db` in its checkout"
     );
@@ -660,7 +663,7 @@ fn a_job_waiting_for_a_resource_says_what_it_sets_aside() {
     jobs[0].task = "ui".into();
     jobs[1].task = "unit".into();
     jobs[2].task = "lint".into();
-    let said_for = |id| said(decide(&jobs, id).unwrap());
+    let said_for = |id| said(decide(&jobs, id, None).unwrap());
     assert_eq!(
         said_for(2),
         "0 ahead; waits for `browser` (1 of 1 in use by #1 `ui`); sets aside 2 cores"
@@ -679,7 +682,7 @@ fn a_smaller_limit_ahead_is_named_as_the_cause() {
     small.capacity = 1;
     let jobs = [small, job(2, Waiting, 4, vec![], "/b")];
     assert_eq!(
-        said(decide(&jobs, 2).unwrap()),
+        said(decide(&jobs, 2, None).unwrap()),
         "1 ahead; waits for 4 cores (#1 `job1`, ahead, got in line with a limit of 1)"
     );
 }
@@ -700,12 +703,12 @@ fn what_a_waiting_job_sets_aside_includes_unlimited_resources() {
         job(3, Waiting, 1, vec![gpu(Some(1))], "/b"),
     ];
     assert_eq!(
-        said(decide(&jobs, 2).unwrap()),
+        said(decide(&jobs, 2, None).unwrap()),
         "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
          sets aside 1 core, `db` and `gpu`"
     );
     assert_eq!(
-        said(decide(&jobs, 3).unwrap()),
+        said(decide(&jobs, 3, None).unwrap()),
         "1 ahead; waits for `gpu` (1 free, but 1 set aside for #2 `job2`); sets aside 1 core"
     );
 }
@@ -748,7 +751,7 @@ fn per_checkout_limits_count_only_their_checkout() {
         job(3, Waiting, 2, vec![db(1)], "/b"),
     ];
     assert_eq!(
-        said(decide(&same_checkout, 2).unwrap()),
+        said(decide(&same_checkout, 2, None).unwrap()),
         "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
          sets aside 2 cores and `db`"
     );
@@ -823,10 +826,14 @@ struct Arrival {
     checkout: &'static str,
 }
 
+/// CPU busy outside the queue at each time step, of a machine with 14 cores
+/// (the jobs' capacity is 8).
+type Load<'a> = &'a dyn Fn(u32) -> Option<Outside>;
+
 /// Runs `arrivals` through the admission rule in discrete time steps, letting
 /// every waiting job poll (in `order`) until nothing changes, and returns
 /// when each job started. Checks every limit after each step.
-fn simulate(arrivals: &[Arrival], reverse: bool) -> Vec<u32> {
+fn simulate(arrivals: &[Arrival], reverse: bool, outside: Load) -> Vec<u32> {
     let mut jobs: Vec<Job> = Vec::new();
     let mut started = vec![None; arrivals.len()];
     for t in 0..10_000 {
@@ -854,13 +861,17 @@ fn simulate(arrivals: &[Arrival], reverse: bool) -> Vec<u32> {
             if reverse {
                 ids.reverse();
             }
-            let admit = ids.into_iter().find(|&id| admitted(&jobs, id));
+            let admit = ids
+                .into_iter()
+                .find(|&id| decide(&jobs, id, outside(t)).unwrap() == Admission::Admitted);
             let Some(id) = admit else { break };
-            jobs.iter_mut().find(|j| j.id == id).unwrap().state = Running;
+            let job = jobs.iter_mut().find(|j| j.id == id).unwrap();
+            job.granted = Some(cpu_demand(job, outside(t)).0);
+            job.state = Running;
             started[id as usize - 1] = Some(t);
         }
         assert_within_limits(&jobs);
-        assert_explained(&jobs);
+        assert_explained(&jobs, outside(t));
         if started.iter().all(Option::is_some) && jobs.is_empty() {
             return started.into_iter().map(Option::unwrap).collect();
         }
@@ -872,7 +883,7 @@ fn assert_within_limits(jobs: &[Job]) {
     let mut used: BTreeMap<Dim, u64> = BTreeMap::new();
     let mut limits: BTreeMap<Dim, u64> = BTreeMap::new();
     for job in jobs.iter().filter(|j| j.state == Running) {
-        for (dim, amount, limit) in demands(job) {
+        for (dim, amount, limit) in demands(job, None) {
             *used.entry(dim).or_default() += amount;
             limits.insert(dim, limit);
         }
@@ -884,14 +895,14 @@ fn assert_within_limits(jobs: &[Job]) {
 
 /// Once no job can start, `explain` says so for every job, giving reasons,
 /// and agrees with the rule as each job applies it.
-fn assert_explained(jobs: &[Job]) {
-    let explained = explain(jobs);
+fn assert_explained(jobs: &[Job], outside: Option<Outside>) {
+    let explained = explain(jobs, outside);
     assert_eq!(
         explained.len(),
         jobs.iter().filter(|j| j.state != Running).count()
     );
     for (id, admission) in explained {
-        assert_eq!(admission, decide(jobs, id).unwrap());
+        assert_eq!(admission, decide(jobs, id, outside).unwrap());
         match admission {
             Admission::Admitted => panic!("job {id} could start but did not"),
             Admission::Waiting(wait) => assert!(!wait.short.is_empty(), "job {id}"),
@@ -944,10 +955,14 @@ fn no_job_is_delayed_by_jobs_that_got_in_line_after_it() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for round in 0..300 {
         let arrivals = random_workload(&mut rng, 12, true);
-        let all = simulate(&arrivals, false);
-        assert_eq!(all, simulate(&arrivals, true), "round {round}: poll order");
+        let all = simulate(&arrivals, false, &|_| None);
+        assert_eq!(
+            all,
+            simulate(&arrivals, true, &|_| None),
+            "round {round}: poll order"
+        );
         for k in 0..arrivals.len() {
-            let alone = simulate(&arrivals[..=k], false);
+            let alone = simulate(&arrivals[..=k], false, &|_| None);
             assert_eq!(
                 alone[k],
                 all[k],
@@ -961,11 +976,174 @@ fn no_job_is_delayed_by_jobs_that_got_in_line_after_it() {
 }
 
 #[test]
+fn cpu_busy_outside_delays_no_job_for_jobs_behind_it_and_stalls_none() {
+    // The CPU outside the queue changes on its own, sometimes taking all
+    // 14 cores: every job still starts (or `simulate` panics), and still
+    // when it would without the jobs that got in line after it.
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    for round in 0..300 {
+        let arrivals = random_workload(&mut rng, 12, true);
+        let steps: Vec<f64> = (0..64).map(|_| f64::from(rng.below(15))).collect();
+        let outside = |t: u32| {
+            Some(Outside {
+                busy: steps[(t as usize / 3) % steps.len()],
+                cores: 14,
+            })
+        };
+        let all = simulate(&arrivals, false, &outside);
+        assert_eq!(
+            all,
+            simulate(&arrivals, true, &outside),
+            "round {round}: poll order"
+        );
+        for k in 0..arrivals.len() {
+            let alone = simulate(&arrivals[..=k], false, &outside);
+            assert_eq!(alone[k], all[k], "round {round}: job {}", k + 1);
+        }
+    }
+}
+
+#[test]
+fn cpu_busy_outside_lowers_what_jobs_start_with() {
+    let outside = Some(Outside {
+        busy: 10.2,
+        cores: 14,
+    });
+    // 4 cores are left; a weight of 8 counts as all of them.
+    let big = job(1, Waiting, 8, vec![], "/a");
+    assert_eq!(cpu_demand(&big, outside), (4, 4));
+    assert_eq!(decide(&[big], 1, outside).unwrap(), Admission::Admitted);
+
+    let jobs = [
+        Job {
+            granted: Some(4),
+            ..job(1, Running, 8, vec![], "/a")
+        },
+        job(2, Waiting, 2, vec![], "/a"),
+    ];
+    assert_eq!(
+        said(decide(&jobs, 2, outside).unwrap()),
+        "0 ahead; waits for 2 cores (4 of 4 in use; 10 of 14 cores are busy outside the \
+         queue)"
+    );
+    assert!(
+        admitted(&jobs, 2),
+        "without the outside load, 4 of 8 are free"
+    );
+}
+
+#[test]
+fn a_measure_only_job_behind_still_counts() {
+    // It started without the rule, behind a job that waits: judged by the
+    // jobs ahead alone, that job would start next to it, past every limit.
+    let mut measured = job(2, Running, 1, vec![db(1)], "/b");
+    measured.measure_only = true;
+    let jobs = [job(1, Waiting, 8, vec![db(1)], "/a"), measured];
+    assert!(!admitted(&jobs, 1));
+}
+
+#[test]
+fn a_running_job_keeps_the_cores_it_started_with() {
+    // It started with 8; the CPU outside has since taken 12 of 14 cores.
+    let outside = Some(Outside {
+        busy: 12.0,
+        cores: 14,
+    });
+    let jobs = [
+        job(1, Running, 8, vec![], "/a"),
+        job(2, Waiting, 1, vec![], "/a"),
+    ];
+    assert!(!matches!(
+        decide(&jobs, 2, outside).unwrap(),
+        Admission::Admitted
+    ));
+    assert_eq!(cpu_demand(&jobs[0], outside), (8, 8));
+}
+
+#[test]
+fn the_cpu_limit_is_what_is_free_outside_the_queue_within_the_capacity() {
+    let at = |busy| Outside { busy, cores: 14 };
+    assert_eq!(at(0.0).cpu_limit(12), 12, "the capacity bounds it");
+    assert_eq!(
+        at(2.4).cpu_limit(12),
+        12,
+        "within the 2 cores it leaves free"
+    );
+    assert_eq!(at(2.6).cpu_limit(12), 11);
+    assert_eq!(at(14.0).cpu_limit(12), 1, "never below one core");
+    assert_eq!(at(f64::NAN).cpu_limit(12), 12, "no number lowers nothing");
+    // A capacity above the cores is meant: CPU outside takes from it alone.
+    assert_eq!(at(0.0).cpu_limit(20), 20);
+    assert_eq!(at(3.0).cpu_limit(20), 17);
+}
+
+#[test]
+fn a_job_starts_with_what_the_shared_measurement_leaves() {
+    let f = fixture();
+    // Fresh, so every process uses it rather than measuring again.
+    f.queue
+        .conn
+        .execute(
+            "INSERT INTO cpu (id, at, cores, outside) VALUES (1, ?1, 14, 10.0)",
+            [unix_ms(SystemTime::now())],
+        )
+        .unwrap();
+    let request = JobRequest {
+        adapt_cpu: true,
+        ..request("e2e", 8, &[])
+    };
+    let ticket = f.queue.enqueue(&request, f.me).unwrap();
+    assert_eq!(ticket.try_admit().unwrap(), Admission::Admitted);
+    assert_eq!(ticket.granted().unwrap(), 4);
+    assert_eq!(f.queue.snapshot().unwrap().used(), 4);
+}
+
+/// Stores a measurement of the CPU taken `ago` ms ago (negative: in the
+/// future).
+fn store_cpu(f: &Fixture, ago: i64) {
+    f.queue
+        .conn
+        .execute(
+            "INSERT INTO cpu (id, at, cores, outside) VALUES (1, ?1, 14, 3.0)
+             ON CONFLICT (id) DO UPDATE SET at = ?1",
+            [unix_ms(SystemTime::now()) - ago],
+        )
+        .unwrap();
+}
+
+#[test]
+fn the_cpu_is_measured_again_once_its_measurement_is_old() {
+    let f = fixture();
+    let jobs = f.queue.snapshot().unwrap().jobs;
+    let took = |ago| {
+        store_cpu(&f, ago);
+        let start = Instant::now();
+        let outside = f.queue.outside(&jobs).unwrap().unwrap();
+        (start.elapsed(), outside.busy)
+    };
+    let (fast, busy) = took(1_000);
+    assert!(fast < CPU_SAMPLE);
+    assert_eq!(busy, 3.0, "the stored one");
+    assert!(took(5_000).0 >= CPU_SAMPLE);
+}
+
+#[test]
+fn a_measurement_taken_earlier_does_not_replace_a_later_one() {
+    let f = fixture();
+    // Stored by another process, later than this one's (its clock is ahead).
+    store_cpu(&f, -60_000);
+    let jobs = f.queue.snapshot().unwrap().jobs;
+    f.queue.outside(&jobs).unwrap();
+    let kept = read_cpu(&f.queue.conn).unwrap().unwrap();
+    assert!(kept.at > SystemTime::now(), "the later one stands");
+}
+
+#[test]
 fn with_cpu_alone_jobs_start_in_line_order() {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     for round in 0..300 {
         let arrivals = random_workload(&mut rng, 12, false);
-        let started = simulate(&arrivals, false);
+        let started = simulate(&arrivals, false, &|_| None);
         assert!(
             started.windows(2).all(|w| w[0] <= w[1]),
             "round {round}: {started:?}"

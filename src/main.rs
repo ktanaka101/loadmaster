@@ -206,6 +206,7 @@ fn run(args: RunArgs) -> Result<i32> {
         measure_only: machine.measure_only,
         uses: &uses,
         checkout: &checkout,
+        adapt_cpu: machine.adapt_to_outside_cpu,
     };
     // Both clocks start here, so wait times include getting in line.
     let (queued_at, wait_started) = (SystemTime::now(), Instant::now());
@@ -228,10 +229,12 @@ fn run(args: RunArgs) -> Result<i32> {
         run_ms: None,
         cpu_ms: None,
         load: None,
+        machine_busy: None,
         signal: None,
         exit_code: None,
         started: None,
         ok: None,
+        granted: None,
         uses: task.uses.clone(),
     };
     // Set once this run's line is written: a place that gave up logs before
@@ -299,6 +302,11 @@ fn run(args: RunArgs) -> Result<i32> {
             record.exit_code = Some(*code);
             if record.outcome == Outcome::Exited && record.signal.is_none() {
                 record.ok = Some(task.ok_exit_codes.contains(code));
+            }
+            if record.outcome == Outcome::Exited
+                && let Some(note) = saturated_note(&record)
+            {
+                say!("{note}");
             }
         }
         Err(_) => {
@@ -427,9 +435,21 @@ fn run_admitted(
         record.outcome = Outcome::Interrupted;
         return Ok(128 + cancel_signal(kill));
     }
+    // Fewer cores than its weight while CPU is busy outside the queue: the
+    // task can size its parallelism by them.
+    let granted = ticket.granted()?;
+    if granted < task.weight {
+        say!(
+            "loadmaster: starting `{}` with {granted} of its {} cores, since CPU is busy \
+             outside the queue ({WEIGHT_ENV}={granted})",
+            task.name,
+            task.weight
+        );
+        record.granted = Some(granted);
+    }
     command
         .env(HELD_ENV, ticket.id().to_string())
-        .env(WEIGHT_ENV, task.weight.to_string())
+        .env(WEIGHT_ENV, granted.to_string())
         // Absolute, so nested runs find the same queue and machine config
         // from any directory: the task runs where .loadmaster.toml is.
         .env(config::STATE_DIR_ENV, state_dir);
@@ -454,6 +474,7 @@ fn run_admitted(
     // `spawn` returns once the task has been registered and exec'd: the
     // wait ends and the run begins here.
     let started = Instant::now();
+    let machine_before = process::cpu_ticks();
     record.wait_ms = millis(started.duration_since(wait_started));
     // A request to kill always goes through; one to stop only if the task
     // has had no SIGTERM yet (see `runner::wait`).
@@ -480,6 +501,7 @@ fn run_admitted(
         .and_then(|(after, before)| after.checked_sub(before))
         .map(millis);
     record.load = process::load_average();
+    record.machine_busy = machine_busy(machine_before);
     record.signal = status.signal();
     let handed_over = if child.group.is_alive() {
         say!(
@@ -510,6 +532,32 @@ fn run_admitted(
         );
     }
     Ok(runner::exit_code(status))
+}
+
+/// The machine's CPUs busy since `before`, on average, in cores (one
+/// decimal), whether inside the queue or not.
+fn machine_busy(before: Option<process::CpuTicks>) -> Option<f64> {
+    let share = process::cpu_ticks()?.busy_since(before?)?;
+    let cores = process::online_cpus()? as f64;
+    Some((share * cores * 10.0).round() / 10.0)
+}
+
+/// A note for a task that failed or was killed while the machine's CPUs were
+/// nearly all busy: loadmaster cannot tell why it failed, but a check slowed
+/// that much can run into a timeout of its own or of the caller.
+fn saturated_note(record: &Record) -> Option<String> {
+    let failed = record.signal.is_some() || record.ok == Some(false);
+    let busy = record.machine_busy?;
+    let cores = process::online_cpus()? as f64;
+    (failed && busy >= report::SATURATED * cores).then(|| {
+        format!(
+            "loadmaster: note: the machine's CPUs were {:.0}% busy while `{}` ran ({busy:.1} \
+             of {cores} cores, inside and outside the queue): a check slowed that much can run \
+             into a timeout, so a failure may come from the load rather than the code",
+            100.0 * busy / cores,
+            record.task
+        )
+    })
 }
 
 /// A `loadmaster run` inside a task that already holds a slot: it runs
@@ -656,6 +704,18 @@ fn status() -> Result<i32> {
     let machine = MachineConfig::load()?;
     let (_, queue) = open_queue()?;
     let snapshot = queue.snapshot()?;
+    // Each job adapts as the machine config it got in line with said.
+    let adapting = machine.adapt_to_outside_cpu && !machine.measure_only;
+    let outside = if adapting
+        || snapshot
+            .jobs
+            .iter()
+            .any(|job| job.state == JobState::Waiting && job.adapt_cpu)
+    {
+        queue.outside(&snapshot.jobs)?
+    } else {
+        None
+    };
     let mut out = format!(
         "{}/{} in use (capacity {})\n",
         snapshot.used(),
@@ -664,6 +724,17 @@ fn status() -> Result<i32> {
     );
     out += &resources_in_use(&snapshot.jobs, &machine);
     out += &load_line();
+    if let Some(outside) = outside.filter(|_| adapting) {
+        out += &format!(
+            "CPU busy outside the queue: {:.1} of {} cores",
+            outside.busy, outside.cores
+        );
+        let limit = outside.cpu_limit(machine.capacity);
+        if limit < machine.capacity {
+            out += &format!(", so jobs start with at most {limit} cores");
+        }
+        out += "\n";
+    }
     if machine.measure_only {
         out += "measure-only: jobs start at once and are only recorded (see `loadmaster report`)\n";
     }
@@ -678,7 +749,7 @@ fn status() -> Result<i32> {
     } else {
         out += "\n";
         out += &jobs_table(&snapshot.jobs);
-        out += &why_jobs_wait(&snapshot.jobs);
+        out += &why_jobs_wait(&snapshot.jobs, outside);
     }
     print(&out);
     Ok(0)
@@ -702,8 +773,8 @@ fn load_line() -> String {
 }
 
 /// One line per waiting job: what the admission rule says it waits for.
-fn why_jobs_wait(jobs: &[Job]) -> String {
-    let lines: Vec<String> = queue::explain(jobs)
+fn why_jobs_wait(jobs: &[Job], outside: Option<queue::Outside>) -> String {
+    let lines: Vec<String> = queue::explain(jobs, outside)
         .into_iter()
         .filter_map(|(id, admission)| {
             let job = jobs.iter().find(|job| job.id == id)?;
@@ -786,7 +857,11 @@ fn jobs_table(jobs: &[Job]) -> String {
             job.id.to_string(),
             state.to_owned(),
             job.task.clone(),
-            job.weight.to_string(),
+            // "6 of 8": it started with fewer cores, for CPU busy outside.
+            match job.granted.filter(|&granted| granted < job.weight) {
+                Some(granted) => format!("{granted} of {}", job.weight),
+                None => job.weight.to_string(),
+            },
             if job.uses.is_empty() {
                 "-".to_owned()
             } else {

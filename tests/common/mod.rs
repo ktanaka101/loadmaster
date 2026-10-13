@@ -14,6 +14,10 @@ use loadmaster::queue::{Job, QUEUE_DB_FILE, Queue, Snapshot};
 pub const BIN: &str = env!("CARGO_BIN_EXE_loadmaster");
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// For machine configs of tests: whatever else keeps the CPU busy, jobs
+/// start with their weight.
+pub const STATIC_CPU: &str = "adapt_to_outside_cpu = false\n";
+
 pub struct Sandbox {
     pub root: tempfile::TempDir,
     pub repo: PathBuf,
@@ -30,7 +34,13 @@ impl Sandbox {
         let machine_config = root.path().join("machine.toml");
         fs::create_dir_all(&repo).unwrap();
         fs::create_dir_all(&state).unwrap();
-        fs::write(&machine_config, format!("capacity = {capacity}\n")).unwrap();
+        // Other tests load the machine meanwhile; tests/outside.rs checks the
+        // adapting with CPU it keeps busy itself.
+        fs::write(
+            &machine_config,
+            format!("capacity = {capacity}\n{STATIC_CPU}"),
+        )
+        .unwrap();
         fs::write(repo.join(".loadmaster.toml"), tasks).unwrap();
         Sandbox {
             root,

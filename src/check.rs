@@ -17,6 +17,14 @@ pub fn render(repo: &RepoConfig, machine: &MachineConfig) -> String {
     );
     if machine.measure_only {
         out += "measure-only: jobs start at once and are only recorded\n";
+    } else if !machine.adapt_to_outside_cpu {
+        out += "CPU busy outside the queue: ignored (adapt_to_outside_cpu = false)\n";
+    } else if let Some(cores) = crate::process::online_cpus() {
+        let spare = (cores as u64).saturating_sub(u64::from(capacity));
+        out += &format!(
+            "CPU busy outside the queue: beyond the {spare} of {cores} cores the capacity leaves \
+             free, it lowers what jobs start with\n"
+        );
     }
 
     let mut rows = vec![["TASK", "WEIGHT", "USES", "OK EXIT CODES"].map(String::from)];
@@ -305,6 +313,7 @@ mod tests {
             capacity,
             capacity_source: CapacitySource::Default { cores: capacity },
             measure_only: false,
+            adapt_to_outside_cpu: true,
             resources: Default::default(),
         }
     }
@@ -448,16 +457,28 @@ mod tests {
             + "[tasks.ui]\nweight = 2\nok_exit_codes = [0, 2]\ncmd = [\"true\"]\n";
         let repo = repo(&text);
         let out = render(&repo, &machine(8));
+        let cores = crate::process::online_cpus().unwrap();
         let expected = format!(
-            "{}: valid\ncapacity: 8 (default: 8 cores minus 2)\n\n\
+            "{}: valid\ncapacity: 8 (default: 8 cores minus 2)\n\
+             CPU busy outside the queue: beyond the {} of {cores} cores the capacity leaves \
+             free, it lowers what jobs start with\n\n\
              TASK  WEIGHT           USES  OK EXIT CODES\n\
              e2e   9 (counts as 8)  db=1  0\n\
              ui    2                -     0, 2\n\n\
              RESOURCE  CAPACITY  PER CHECKOUT\n\
              db        2         1\n\n\
              warning: `e2e` has weight 9",
-            repo.path().display()
+            repo.path().display(),
+            cores.saturating_sub(8)
         );
         assert!(out.starts_with(&expected), "{out}");
+        let fixed = MachineConfig {
+            adapt_to_outside_cpu: false,
+            ..machine(8)
+        };
+        assert!(
+            render(&repo, &fixed)
+                .contains("\nCPU busy outside the queue: ignored (adapt_to_outside_cpu = false)\n")
+        );
     }
 }

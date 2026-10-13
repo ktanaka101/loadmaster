@@ -2,12 +2,15 @@
 //!
 //! **Admission rule.** Jobs are considered in line order, on every dimension
 //! at once: CPU (the weight), each machine-wide resource and each per-checkout
-//! resource. A job starts if it fits in what running jobs use plus what is set
-//! aside for the jobs ahead of it. A job that does not fit sets aside its
-//! amount where it fits and holds back entirely the dimensions it is short
-//! of, so no job is ever delayed by jobs that got in line after it. Every job
-//! uses CPU, so with CPU alone this is a strictly FIFO line: a small job never
-//! overtakes a big one waiting at the head, and big jobs cannot starve.
+//! resource. A job starts if it fits in what the running jobs ahead of it use
+//! (and measure-only jobs anywhere, which started without the rule) plus
+//! what is set aside for the jobs ahead of it. A job that does not fit
+//! sets aside its amount where it fits and holds back entirely the dimensions
+//! it is short of, so no job is ever delayed by jobs that got in line after
+//! it, even when CPU busy outside the queue lowers its CPU limit (see
+//! [`Outside`]). Every job uses CPU, so with CPU alone this is a strictly
+//! FIFO line: a small job never overtakes a big one waiting at the head, and
+//! big jobs cannot starve.
 //!
 //! **Ordering.** Arrival order is the `INTEGER PRIMARY KEY` assigned inside a
 //! `BEGIN IMMEDIATE` transaction, so it always matches the order in which the
@@ -37,20 +40,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::history::{self, Outcome, Record};
-use crate::process::{ProcessGroup, ProcessId};
+use crate::process::{self, ProcessGroup, ProcessId};
 
 pub type JobId = i64;
 
 /// File name of the queue database inside the state directory. The number
 /// is the version of its layout: a loadmaster that changes the layout uses
 /// a new file, never one another version made.
-pub const QUEUE_DB_FILE: &str = "queue-v1.db";
+pub const QUEUE_DB_FILE: &str = "queue-v2.db";
 
 /// How long to wait for another process's lock on the database.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a parked job keeps its place in line without an owner.
 pub const PARK_TTL: Duration = Duration::from_secs(120);
+
+/// How long a measurement of the CPU busy outside the queue stands before
+/// it is measured again.
+const CPU_FRESH: Duration = Duration::from_secs(3);
+/// How long the CPU is measured over.
+const CPU_SAMPLE: Duration = Duration::from_millis(250);
 
 // AUTOINCREMENT: IDs are never reused, so a stale LOADMASTER_HELD can never
 // point at an unrelated newer job.
@@ -62,6 +71,9 @@ pub const PARK_TTL: Duration = Duration::from_secs(120);
 // the job's loadmaster and by a `cancel` that signalled the task of a job
 // whose loadmaster is gone (0 SIGTERM, 1 SIGKILL, -1 none): a later cancel
 // that asks for no more than was done does nothing.
+//
+// `cpu` holds the last measurement of the cores busy outside the queue (see
+// [`Queue::outside`]), so that the processes that wait take turns measuring.
 const SCHEMA: &str = "
 CREATE TABLE jobs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,13 +93,21 @@ CREATE TABLE jobs (
     capacity     INTEGER NOT NULL,
     measure_only INTEGER NOT NULL,
     checkout     BLOB    NOT NULL,
-    uses         TEXT    NOT NULL
+    uses         TEXT    NOT NULL,
+    adapt_cpu    INTEGER NOT NULL,
+    granted      INTEGER
 );
 CREATE TABLE cancel_requests (
     job          INTEGER PRIMARY KEY,
     kill         INTEGER NOT NULL,
     owner_done   INTEGER NOT NULL DEFAULT -1,
     signal_done  INTEGER NOT NULL DEFAULT -1
+);
+CREATE TABLE cpu (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    at           INTEGER NOT NULL,
+    cores        INTEGER NOT NULL,
+    outside      REAL
 );
 PRAGMA user_version = 1;
 ";
@@ -142,6 +162,53 @@ pub struct Job {
     /// The resolved directory of the `.loadmaster.toml` the job was started
     /// from.
     pub checkout: PathBuf,
+    /// Whether it starts with fewer cores while CPU is busy outside the
+    /// queue (see [`Outside`]): the machine setting it got in line with.
+    pub adapt_cpu: bool,
+    /// The cores it started with: its weight, or fewer while CPU was busy
+    /// outside the queue. `None` until it starts.
+    pub granted: Option<u32>,
+}
+
+/// The CPU busy outside the queue, in cores: all the machine's busy CPU time
+/// but what the running jobs were granted. A job that uses more than that
+/// counts too: as far as the line goes, those cores are busy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Outside {
+    pub busy: f64,
+    /// The machine's CPUs.
+    pub cores: u32,
+}
+
+impl Outside {
+    /// The most cores a job that got in line with `capacity` may start
+    /// with: the capacity, less the CPU busy outside the queue beyond the
+    /// cores the capacity leaves free, and at least one. A weight above it
+    /// counts as all of it, as a weight above the capacity counts as the
+    /// capacity, so the job at the head of the line still starts once the
+    /// queue's own jobs ahead of it are done.
+    pub fn cpu_limit(&self, capacity: u32) -> u32 {
+        let spare = f64::from(self.cores.saturating_sub(capacity));
+        // NaN takes nothing.
+        let taken = (self.busy - spare).max(0.0);
+        // A float above u32::MAX saturates.
+        ((f64::from(capacity) - taken).round().max(1.0) as u32).min(capacity)
+    }
+
+    fn lowered(&self) -> OutsideBusy {
+        OutsideBusy {
+            busy: self.busy.round() as u64,
+            cores: u64::from(self.cores),
+        }
+    }
+}
+
+/// CPU busy outside the queue that lowered a job's CPU limit, rounded, for
+/// explanations: `busy` of the machine's `cores`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutsideBusy {
+    pub busy: u64,
+    pub cores: u64,
 }
 
 /// A resource a job uses, and the limits it got in line with: every process
@@ -207,6 +274,8 @@ pub struct JobRequest<'a> {
     pub uses: &'a [Use],
     /// The resolved directory of the `.loadmaster.toml` in use.
     pub checkout: &'a Path,
+    /// The machine setting `adapt_to_outside_cpu`.
+    pub adapt_cpu: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,10 +318,13 @@ pub enum Need {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cause {
     /// Running jobs use too much of it: `used` of `limit`, by the jobs listed.
+    /// For cores, `outside` is the CPU busy outside the queue if that lowered
+    /// the limit.
     InUse {
         used: u64,
         limit: u64,
         by: Vec<JobRef>,
+        outside: Option<OutsideBusy>,
     },
     /// It would fit in the `free` amount next to the running jobs, but
     /// `reserved` of that is set aside for jobs ahead.
@@ -314,11 +386,16 @@ impl Wait {
 
 impl fmt::Display for Shortage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let whole = matches!(self.cause, Cause::InUse { limit, .. }
+        let whole = matches!(self.cause, Cause::InUse { limit, outside: None, .. }
             if self.need == Need::Cores && self.amount == limit && limit > 1);
         write!(f, "{}", quantity(&self.need, self.amount, whole))?;
         match &self.cause {
-            Cause::InUse { used, limit, by } => {
+            Cause::InUse {
+                used,
+                limit,
+                by,
+                outside,
+            } => {
                 if whole {
                     write!(f, " ({used} in use")?;
                 } else {
@@ -327,6 +404,9 @@ impl fmt::Display for Shortage {
                 // Every running job uses cores: naming them says nothing.
                 if self.need != Need::Cores && !by.is_empty() {
                     write!(f, " by {}", list_jobs(by))?;
+                }
+                if let Some(OutsideBusy { busy, cores }) = outside {
+                    write!(f, "; {busy} of {cores} cores are busy outside the queue")?;
                 }
                 write!(f, ")")
             }
@@ -398,12 +478,13 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Weight currently running. A sum of `u32` weights cannot overflow `u64`.
+    /// Cores held by running jobs: what each started with. A sum of `u32`
+    /// amounts cannot overflow `u64`.
     pub fn used(&self) -> u64 {
         self.jobs
             .iter()
             .filter(|j| j.state == JobState::Running)
-            .map(|j| u64::from(j.weight))
+            .map(|j| u64::from(cpu_demand(j, None).0))
             .sum()
     }
 }
@@ -559,6 +640,7 @@ impl Queue {
                     "SELECT id FROM jobs
                  WHERE state = 'parked' AND dir = ?1 AND task = ?2 AND args = ?3
                    AND weight = ?4 AND capacity = ?5 AND uses = ?6 AND checkout = ?7
+                   AND adapt_cpu = ?8
                  ORDER BY id LIMIT 1",
                     params![
                         dir,
@@ -567,7 +649,8 @@ impl Queue {
                         request.weight,
                         request.capacity,
                         uses,
-                        checkout
+                        checkout,
+                        request.adapt_cpu
                     ],
                     |r| r.get(0),
                 )
@@ -597,8 +680,8 @@ impl Queue {
                     tx.execute(
                         "INSERT INTO jobs (task, weight, state, dir, args, command,
                                        owner_pid, owner_start, enqueued_at,
-                                       capacity, measure_only, checkout, uses)
-                     VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                       capacity, measure_only, checkout, uses, adapt_cpu)
+                     VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                         params![
                             request.task,
                             request.weight,
@@ -611,7 +694,8 @@ impl Queue {
                             request.capacity,
                             request.measure_only,
                             checkout,
-                            uses
+                            uses,
+                            request.adapt_cpu
                         ],
                     )?;
                     (tx.last_insert_rowid(), false)
@@ -624,6 +708,61 @@ impl Queue {
             resumed,
             armed: true,
         })
+    }
+
+    /// The CPU busy outside the queue (see [`Outside`]), as last measured, or
+    /// measured again over [`CPU_SAMPLE`] if that is older than
+    /// [`CPU_FRESH`]; `jobs` are the queue's jobs now. `None` if the OS does
+    /// not report CPU time.
+    pub fn outside(&self, jobs: &[Job]) -> Result<Option<Outside>> {
+        // A measurement from the future (the clock went back) is as good as
+        // none.
+        let fresh = |cpu: &CpuRow| {
+            SystemTime::now()
+                .duration_since(cpu.at)
+                .is_ok_and(|age| age < CPU_FRESH)
+        };
+        if let Some(cpu) = read_cpu(&self.conn)?.filter(fresh) {
+            return Ok(cpu.outside());
+        }
+        let Some(cores) = process::online_cpus().and_then(|n| u32::try_from(n).ok()) else {
+            return Ok(None);
+        };
+        // Over a short time of its own, not since the last measurement: a job
+        // that started and ended in between would count as outside.
+        let Some(from) = process::cpu_ticks() else {
+            return Ok(None);
+        };
+        std::thread::sleep(CPU_SAMPLE);
+        let Some(to) = process::cpu_ticks() else {
+            return Ok(None);
+        };
+        // The jobs' own CPU is what they were granted: a job that uses more
+        // counts as outside, which those cores are, as far as the line goes.
+        // Before or after the measurement, whichever is more: a job that ended
+        // meanwhile counts as the queue's.
+        let in_queue = |jobs: &[Job]| -> u64 {
+            jobs.iter()
+                .filter(|job| job.state == JobState::Running)
+                .map(|job| u64::from(cpu_demand(job, None).0))
+                .sum()
+        };
+        let in_queue = in_queue(jobs).max(in_queue(&load_jobs(&self.conn)?));
+        let at = unix_ms(SystemTime::now());
+        let busy = to
+            .busy_since(from)
+            .map(|share| (share * f64::from(cores) - in_queue as f64).clamp(0.0, f64::from(cores)));
+        // Another process may have stored a later measurement meanwhile; that
+        // one stands.
+        let tx = self.begin()?;
+        tx.execute(
+            "INSERT INTO cpu (id, at, cores, outside) VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT (id) DO UPDATE SET at = ?1, cores = ?2, outside = ?3
+             WHERE cpu.at < ?1",
+            params![at, cores, busy],
+        )?;
+        tx.commit()?;
+        Ok(busy.map(|busy| Outside { busy, cores }))
     }
 
     /// Reaps dead jobs and returns everything left.
@@ -756,10 +895,12 @@ fn record(job: &Job, outcome: Outcome, waited_until: SystemTime) -> Record<'_> {
         run_ms: None,
         cpu_ms: None,
         load: None,
+        machine_busy: None,
         signal: None,
         exit_code: None,
         started: None,
         ok: None,
+        granted: job.granted.filter(|&granted| granted < job.weight),
         uses: job
             .uses
             .iter()
@@ -824,24 +965,36 @@ impl Ticket<'_> {
         // Only running jobs and those ahead can change this job's decision;
         // dead jobs further back are reaped by whoever they are ahead of.
         let jobs = load_jobs(&self.queue.conn)?;
+        let adapts = jobs
+            .iter()
+            .any(|job| job.state != JobState::Running && job.adapt_cpu);
+        let outside = if adapts {
+            self.queue.outside(&jobs)?
+        } else {
+            None
+        };
         let now = SystemTime::now();
         let relevant_alive = jobs
             .iter()
             .filter(|job| job.state == JobState::Running || job.id < self.id)
             .all(|job| job.is_live(now));
-        if relevant_alive && let Ok(waiting @ Admission::Waiting(_)) = decide(&jobs, self.id) {
+        if relevant_alive
+            && let Ok(waiting @ Admission::Waiting(_)) = decide(&jobs, self.id, outside)
+        {
             return Ok(waiting);
         }
         let (admission, _) = self.queue.write(|tx| {
             let jobs = load_jobs(tx)?;
-            let admission = decide(&jobs, self.id)?;
-            let running = jobs
+            let admission = decide(&jobs, self.id, outside)?;
+            let me = jobs
                 .iter()
-                .any(|job| job.id == self.id && job.state == JobState::Running);
-            if admission == Admission::Admitted && !running {
+                .find(|job| job.id == self.id)
+                .ok_or(Error::JobVanished(self.id))?;
+            if admission == Admission::Admitted && me.state != JobState::Running {
+                let (granted, _) = cpu_demand(me, outside);
                 tx.execute(
-                    "UPDATE jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
-                    params![self.id, unix_ms(SystemTime::now())],
+                    "UPDATE jobs SET state = 'running', started_at = ?2, granted = ?3 WHERE id = ?1",
+                    params![self.id, unix_ms(SystemTime::now()), granted],
                 )?;
             }
             Ok(admission)
@@ -851,10 +1004,23 @@ impl Ticket<'_> {
 
     /// Starts the job at once, whatever its place in line and the capacity:
     /// measure-only mode.
+    /// The cores this job started with (see [`Job::granted`]).
+    pub fn granted(&self) -> Result<u32> {
+        self.queue
+            .conn
+            .query_row(
+                "SELECT granted FROM jobs WHERE id = ?1 AND granted IS NOT NULL",
+                [self.id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(Error::JobVanished(self.id))
+    }
+
     pub fn admit_now(&self) -> Result<()> {
         let (started, _) = self.queue.write(|tx| {
             Ok(tx.execute(
-                "UPDATE jobs SET state = 'running', started_at = ?2
+                "UPDATE jobs SET state = 'running', started_at = ?2, granted = weight
                  WHERE id = ?1 AND state = 'waiting'",
                 params![self.id, unix_ms(SystemTime::now())],
             )?)
@@ -958,9 +1124,9 @@ enum Dim<'a> {
 
 /// What `job` needs on each dimension, and the limit it got in line with.
 /// Amounts above a limit count as the whole limit.
-fn demands(job: &Job) -> Vec<(Dim<'_>, u64, u64)> {
-    let cpu = job.capacity;
-    let mut demands = vec![(Dim::Cpu, u64::from(job.weight.min(cpu)), u64::from(cpu))];
+fn demands(job: &Job, outside: Option<Outside>) -> Vec<(Dim<'_>, u64, u64)> {
+    let (cpu, limit) = cpu_demand(job, outside);
+    let mut demands = vec![(Dim::Cpu, u64::from(cpu), u64::from(limit))];
     for u in &job.uses {
         // Without a capacity of its own, the job is still counted: resource
         // names are shared, and other jobs may have one.
@@ -981,6 +1147,20 @@ fn demands(job: &Job) -> Vec<(Dim<'_>, u64, u64)> {
     demands
 }
 
+/// The cores `job` holds, or would start with, and the CPU limit it is
+/// judged by: a running job keeps what it was granted, whatever the CPU
+/// outside the queue has done since; a waiting one is judged by its
+/// capacity lowered by the CPU busy outside the queue now.
+fn cpu_demand(job: &Job, outside: Option<Outside>) -> (u32, u32) {
+    if job.state == JobState::Running {
+        return (job.granted.unwrap_or(job.weight), job.capacity);
+    }
+    let limit = outside
+        .filter(|_| job.adapt_cpu)
+        .map_or(job.capacity, |o| o.cpu_limit(job.capacity));
+    (job.weight.min(limit), limit)
+}
+
 impl Dim<'_> {
     fn need(self) -> Need {
         match self {
@@ -991,8 +1171,9 @@ impl Dim<'_> {
     }
 }
 
-/// The admission rule (see the module docs): whether job `id` may start.
-fn decide(jobs: &[Job], id: JobId) -> Result<Admission> {
+/// The admission rule (see the module docs): whether job `id` may start,
+/// with `outside` the CPU busy outside the queue.
+fn decide(jobs: &[Job], id: JobId, outside: Option<Outside>) -> Result<Admission> {
     let me = jobs
         .iter()
         .find(|job| job.id == id)
@@ -1000,7 +1181,7 @@ fn decide(jobs: &[Job], id: JobId) -> Result<Admission> {
     if me.state == JobState::Running {
         return Ok(Admission::Admitted);
     }
-    assess(jobs, Some(id))
+    assess(jobs, outside, Some(id))
         .pop()
         .map(|(_, admission)| admission)
         .ok_or(Error::JobVanished(id))
@@ -1009,8 +1190,8 @@ fn decide(jobs: &[Job], id: JobId) -> Result<Admission> {
 /// The admission rule for every job that is not running, in line order:
 /// whether it may start and, if not, why. For `loadmaster status`, which
 /// thereby says exactly what the rule decides.
-pub fn explain(jobs: &[Job]) -> Vec<(JobId, Admission)> {
-    assess(jobs, None)
+pub fn explain(jobs: &[Job], outside: Option<Outside>) -> Vec<(JobId, Admission)> {
+    assess(jobs, outside, None)
 }
 
 /// What the jobs ahead set aside on one dimension.
@@ -1025,25 +1206,48 @@ struct Reserved<'a> {
 
 /// The admission rule for the jobs not running, up to job `only` if given
 /// (which is then the last one returned).
-fn assess(jobs: &[Job], only: Option<JobId>) -> Vec<(JobId, Admission)> {
-    // Sums of u32 amounts cannot overflow u64.
-    let mut used: BTreeMap<Dim, (u64, Vec<&Job>)> = BTreeMap::new();
-    for job in jobs.iter().filter(|job| job.state == JobState::Running) {
-        for (dim, amount, _) in demands(job) {
+fn assess(jobs: &[Job], outside: Option<Outside>, only: Option<JobId>) -> Vec<(JobId, Admission)> {
+    // What the running jobs ahead use: a job is judged by those alone. The
+    // ones behind it only started in room it did not need then; but CPU
+    // taken outside the queue since can shrink the room, and they must not
+    // delay it then either. Measure-only jobs did not start by the rule, so
+    // wherever they are in line, they count for everyone. Sums of u32
+    // amounts cannot overflow u64.
+    fn count<'a>(
+        used: &mut BTreeMap<Dim<'a>, (u64, Vec<&'a Job>)>,
+        job: &'a Job,
+        outside: Option<Outside>,
+    ) {
+        for (dim, amount, _) in demands(job, outside) {
             let entry = used.entry(dim).or_default();
             entry.0 += amount;
             entry.1.push(job);
         }
     }
-    let used_of = |dim: &Dim| used.get(dim).map_or(0, |(amount, _)| *amount);
+    let mut used: BTreeMap<Dim, (u64, Vec<&Job>)> = BTreeMap::new();
+    for job in jobs
+        .iter()
+        .filter(|job| job.state == JobState::Running && job.measure_only)
+    {
+        count(&mut used, job, outside);
+    }
+    let used_of = |used: &BTreeMap<Dim, (u64, Vec<&Job>)>, dim: &Dim| {
+        used.get(dim).map_or(0, |(amount, _)| *amount)
+    };
     // For the jobs ahead: what they set aside, and what they are short of
     // (with the first job that was).
     let mut set_aside: BTreeMap<Dim, Reserved> = BTreeMap::new();
     let mut short: BTreeMap<Dim, &Job> = BTreeMap::new();
     let mut ahead = 0u32;
     let mut assessed = Vec::new();
-    for job in jobs.iter().filter(|job| job.state != JobState::Running) {
-        let demands = demands(job);
+    for job in jobs {
+        if job.state == JobState::Running {
+            if !job.measure_only {
+                count(&mut used, job, outside);
+            }
+            continue;
+        }
+        let demands = demands(job, outside);
         // Per dimension: whether it fits, and the limit it is judged by.
         let fits: Vec<(bool, u64)> = demands
             .iter()
@@ -1051,7 +1255,8 @@ fn assess(jobs: &[Job], only: Option<JobId>) -> Vec<(JobId, Admission)> {
                 let (reserved, limit) = set_aside
                     .get(&dim)
                     .map_or((0, limit), |r| (r.amount, limit.min(r.limit)));
-                let fits = !short.contains_key(&dim) && used_of(&dim) + reserved + amount <= limit;
+                let fits =
+                    !short.contains_key(&dim) && used_of(&used, &dim) + reserved + amount <= limit;
                 (fits, limit)
             })
             .collect();
@@ -1072,7 +1277,7 @@ fn assess(jobs: &[Job], only: Option<JobId>) -> Vec<(JobId, Admission)> {
                         wait.reserves.push((dim.need(), amount));
                         continue;
                     }
-                    let in_use = used_of(&dim);
+                    let in_use = used_of(&used, &dim);
                     let reserved = set_aside.get(&dim);
                     let cause = if let Some(first) = short.get(&dim) {
                         Cause::Behind(JobRef::of(first))
@@ -1086,6 +1291,9 @@ fn assess(jobs: &[Job], only: Option<JobId>) -> Vec<(JobId, Admission)> {
                                 .iter()
                                 .map(|job| JobRef::of(job))
                                 .collect(),
+                            outside: outside
+                                .filter(|_| dim == Dim::Cpu && own_limit < u64::from(job.capacity))
+                                .map(|o| o.lowered()),
                         }
                     } else if let Some(r) = reserved.filter(|_| in_use + amount > limit) {
                         // Within its own limit, but a job ahead got in line
@@ -1155,6 +1363,36 @@ fn reap(tx: &Transaction) -> Result<Vec<Job>> {
     Ok(dead)
 }
 
+/// The last measurement of the CPU busy outside the queue (see
+/// [`Queue::outside`]).
+struct CpuRow {
+    at: SystemTime,
+    cores: u32,
+    /// `None` if no tick passed, or a count went back.
+    outside: Option<f64>,
+}
+
+impl CpuRow {
+    fn outside(&self) -> Option<Outside> {
+        self.outside.map(|busy| Outside {
+            busy,
+            cores: self.cores,
+        })
+    }
+}
+
+fn read_cpu(conn: &Connection) -> Result<Option<CpuRow>> {
+    Ok(conn
+        .query_row("SELECT at, cores, outside FROM cpu WHERE id = 1", [], |r| {
+            Ok(CpuRow {
+                at: from_unix_ms(r.get(0)?),
+                cores: r.get(1)?,
+                outside: r.get(2)?,
+            })
+        })
+        .optional()?)
+}
+
 /// Whether the schema has been made: the last statement of [`SCHEMA`] marks
 /// it.
 fn created(conn: &Connection) -> rusqlite::Result<bool> {
@@ -1166,7 +1404,7 @@ fn load_jobs(conn: &Connection) -> Result<Vec<Job>> {
     let mut stmt = conn.prepare(
         "SELECT id, task, weight, state, dir, args, command, owner_pid, owner_start,
                 child_pgid, child_start, enqueued_at, parked_at, started_at,
-                capacity, measure_only, checkout, uses
+                capacity, measure_only, checkout, uses, adapt_cpu, granted
          FROM jobs ORDER BY id",
     )?;
     let jobs = stmt
@@ -1209,6 +1447,8 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         measure_only: row.get(15)?,
         checkout: PathBuf::from(OsString::from_vec(row.get(16)?)),
         uses: json(17, row.get(17)?)?,
+        adapt_cpu: row.get(18)?,
+        granted: row.get(19)?,
     })
 }
 
