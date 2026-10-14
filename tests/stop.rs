@@ -192,3 +192,51 @@ fn a_process_that_ends_with_the_task_is_not_named() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!stderr(&output).contains("warning"), "{}", stderr(&output));
 }
+
+/// Stops, with `stop` (given the sandbox and the PID of `loadmaster`), a
+/// task that starts a process in a session of its own after the first look
+/// at its processes and before the next, and dies with what it waits for:
+/// once it is gone, nothing leads to that process. Its loadmaster still
+/// names it, having looked just before the stop.
+fn stopped_just_after_leaving(stop: impl FnOnce(&Sandbox, u32)) {
+    let probe = Sandbox::new(4, "");
+    let pid = q(&probe.path("pid"));
+    let script = format!(
+        "sleep 0.3; perl -MPOSIX -e 'POSIX::setsid(); open(my $f, \">\", $ARGV[0]) or die; \
+         print $f $$; close $f; sleep 30' {pid} & wait"
+    );
+    std::fs::write(
+        probe.repo.join(".loadmaster.toml"),
+        sh_task("serve", 1, &script),
+    )
+    .unwrap();
+    let sandbox = probe;
+    let mut cmd = sandbox.cmd(&["run", "serve"]);
+    cmd.stdout(Stdio::null())
+        .stderr(std::fs::File::create(sandbox.path("serve.err")).unwrap());
+    let mut runner = cmd.spawn().unwrap();
+    wait_until("the process to start", || !sandbox.read("pid").is_empty());
+    let pid: u32 = sandbox.read("pid").trim().parse().unwrap();
+    stop(&sandbox, runner.id());
+    wait(&mut runner);
+    signal(pid, libc::SIGKILL);
+    let err = sandbox.read("serve.err");
+    assert!(
+        err.contains("outside its process group are still running (")
+            && err.contains(&format!("({pid} `")),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_process_started_just_before_a_cancel_is_named() {
+    stopped_just_after_leaving(|sandbox, _| {
+        let output = sandbox.run(&["cancel", "1"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+    });
+}
+
+#[test]
+fn a_process_started_just_before_a_sigterm_is_named() {
+    stopped_just_after_leaving(|_, loadmaster| signal(loadmaster, libc::SIGTERM));
+}

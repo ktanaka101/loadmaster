@@ -18,12 +18,12 @@ pub fn render(repo: &RepoConfig, machine: &MachineConfig) -> String {
     if machine.measure_only {
         out += "measure-only: jobs start at once and are only recorded\n";
     } else if !machine.adapt_to_outside_cpu {
-        out += "CPU busy outside the queue: ignored (adapt_to_outside_cpu = false)\n";
+        out += "CPU busy beyond what running jobs got: ignored (adapt_to_outside_cpu = false)\n";
     } else if let Some(cores) = crate::process::online_cpus() {
         let spare = (cores as u64).saturating_sub(u64::from(capacity));
         out += &format!(
-            "CPU busy outside the queue: beyond the {spare} of {cores} cores the capacity leaves \
-             free, it lowers what jobs start with\n"
+            "CPU busy beyond what running jobs got: lowers what jobs start with once it is more \
+             than the {spare} of {cores} cores the capacity leaves free\n"
         );
     }
 
@@ -463,8 +463,8 @@ mod tests {
         let cores = crate::process::online_cpus().unwrap();
         let expected = format!(
             "{}: valid\ncapacity: 8 (default: 8 cores minus 2)\n\
-             CPU busy outside the queue: beyond the {} of {cores} cores the capacity leaves \
-             free, it lowers what jobs start with\n\n\
+             CPU busy beyond what running jobs got: lowers what jobs start with once it is more \
+             than the {} of {cores} cores the capacity leaves free\n\n\
              TASK  WEIGHT           USES  OK EXIT CODES  STOP SIGNAL\n\
              e2e   9 (counts as 8)  db=1  0              SIGTERM\n\
              ui    2                -     0, 2           SIGINT\n\n\
@@ -479,9 +479,8 @@ mod tests {
             adapt_to_outside_cpu: false,
             ..machine(8)
         };
-        assert!(
-            render(&repo, &fixed)
-                .contains("\nCPU busy outside the queue: ignored (adapt_to_outside_cpu = false)\n")
-        );
+        assert!(render(&repo, &fixed).contains(
+            "\nCPU busy beyond what running jobs got: ignored (adapt_to_outside_cpu = false)\n"
+        ));
     }
 }

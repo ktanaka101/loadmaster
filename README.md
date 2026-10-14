@@ -497,9 +497,11 @@ that reads it with `min_version`, for a file shared across machines.
 
 The queue lives in `~/.local/state/loadmaster/queue-v3.db` (`$XDG_STATE_HOME`,
 `LOADMASTER_STATE_DIR`). The number is the version of its layout: loadmaster
-versions with different layouts keep separate queues and do not see each
+versions with different layouts keep separate queues and do not count each
 other's jobs, so give every agent on a machine the same version (as one
-`mise use -g` does). Next to it, `history.jsonl` gets one line per job
+`mise use -g` does). `loadmaster status` and `loadmaster run` say when jobs
+run in the queue of another version (0.7 or later) and are not counted.
+Next to it, `history.jsonl` gets one line per job
 (task, weight and the cores it got if fewer, resources, capacity, wait and run
 time, CPU time, load average, the machine's CPU busy while it ran, signal,
 whether loadmaster asked it to stop, exit code and whether it counts as
@@ -554,7 +556,11 @@ line, the process that later reclaims the job writes one with outcome `lost`.
   that start. loadmaster measures how busy the machine's CPUs are, over a
   quarter of a second at most every 3 seconds, averaged with the measurement
   before (from the kernel's CPU time, not the load average), and
-  counts what its running jobs were granted as the queue's own. When the rest
+  counts what its running jobs were granted as the queue's own. The rest
+  includes what a job uses beyond what it got, which the measurement cannot
+  tell from load outside the queue: `loadmaster status` shows the CPU busy
+  beyond what running jobs got, and the CORES column of `loadmaster report`
+  shows which tasks use more than their weight. When the rest
   is more than the cores the capacity leaves free, a job starts with that many
   fewer cores, but at least one: a weight above that counts as all of it, so
   the first job in line still starts once the jobs ahead of it are done. The
@@ -622,8 +628,9 @@ loadmaster held [--uses RESOURCE]
 
 - `run`: run a task once its weight and resources fit.
 - `status`: show used/total capacity, resources in use, the load average,
-  the CPU busy outside the queue, every running, waiting or parked job, and
-  what each waiting job waits for.
+  the CPU busy beyond what running jobs got, jobs running in another
+  version's queue, every running, waiting or parked job, and what each
+  waiting job waits for.
 - `cancel`: stop jobs, by ID or (`--here`) every job started from this
   checkout except the one `cancel` itself runs in, and wait until they have
   left the queue. It leaves a request in the queue, and the job's own
@@ -1087,10 +1094,11 @@ loadmaster is deliberately small:
   server the command starts, and otherwise reuses the old one without a
   word. A `webServer` command that exits when its stdin closes, as Vite's dev
   server does, also goes when Playwright does. loadmaster looks for such
-  processes about once a second while the task runs, and when the task exits,
-  warns of those it found still running, with their PIDs; it does not stop
-  them, since some are meant to stay (a build tool's daemon). One whose
-  parent exits between two looks is not found.
+  processes about once a second while the task runs, and just before it
+  sends the task a signal, and when the task exits, warns of those it found
+  still running, with their PIDs; it does not stop them, since some are
+  meant to stay (a build tool's daemon). One whose parent exits on its own
+  between two looks is not found.
 - `history.jsonl` is never rotated.
 
 ## Development

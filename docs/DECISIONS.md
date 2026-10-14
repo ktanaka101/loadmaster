@@ -60,14 +60,19 @@ slot. Some are meant to (a daemon); others are left behind by accident, as
 the `webServer` a Playwright run leaves when it ends on SIGTERM, which keeps
 its port and may serve the next run stale code without an error. loadmaster
 warns of them: it walks the task's process tree about once a second while
-the task runs (and from the processes found before, since an orphan belongs
-to PID 1), and when the task exits, names those still running outside its
-group, after half a second for them to go with it. A look over 100 processes
+the task runs, and just before each signal it sends the task (and from the
+processes found before, since an orphan belongs to PID 1), and when the task
+exits, names those still running outside its group, after half a second for
+them to go with it. The look before a signal is for the process started
+since the last look, which only its parent leads to, when the signal ends
+that parent: a Playwright run canceled a moment after it started its
+`webServer` exited on SIGTERM before the next look, and the server it left
+was not named (clew, 0.9.0). A look over 100 processes
 takes about a millisecond (macOS and Linux, measured), during which signals
 wait. Each process is checked by its start time and each child by its
 parent, so a PID handed out again meanwhile is not taken for one of them. It does not stop them or
 hold a slot for them, which would break the daemons. One whose parent exits
-between two looks is missed: neither OS keeps a record of where a process
+on its own between two looks is missed: neither OS keeps a record of where a process
 came from, and macOS does not show another process's environment, which
 would carry the job's `LOADMASTER_HELD` (measured). Linux's child subreaper
 would catch every one, but makes loadmaster reap every orphan, and a macOS
@@ -239,12 +244,26 @@ same moment on a fresh state directory occasionally got "database is locked"
 up to the busy timeout; everything else relies on SQLite's busy handler.
 
 The version of the database's layout is in its file name (`queue-v3.db`): a
-`loadmaster` that changes the layout uses a new file, and never opens, reads
-or upgrades one of another layout. Versions with different layouts keep
-separate queues, and do not see each other's jobs; while both run, as for
-the few minutes of an upgrade, the machine can be loaded beyond its capacity.
-That is the price of having no code for other layouts: a queue only holds
-the jobs that run now, so nothing in it is worth carrying over. The schema
+`loadmaster` that changes the layout uses a new file, and never changes the
+schema or the rows of one of another layout: a queue only holds the jobs that
+run now, so nothing in it is worth carrying over. Versions with different layouts keep
+separate queues and do not count each other's jobs, so while both run, the
+machine and its resources can be used beyond their capacity: for the minutes
+of an upgrade, or for as long as an agent runs an older version (pinned by a
+project's tool versions, say). Beyond a resource's capacity is not only
+slower: two at a time for their ports, clew's end-to-end tests would have
+started a third and a fourth during an upgrade. So every layout keeps six
+columns of `jobs` as they are (the task, its state, and the processes of its
+loadmaster and of its task), and `status` and `run` read them from the other
+`queue-v<N>.db` files beside their own, to say how many jobs run there and
+for which tasks. They are not counted: two files cannot be changed in one
+transaction, so jobs in both would still race to start, and the other
+version would not count this one's anyway. A file is opened as its own
+version opens it, so that the last connection to close it folds its
+write-ahead log into it and removes it, as that version's would (read-only,
+SQLite leaves the log behind); but it is never created, and its rows are
+only read. Every layout from 0.7 on has the columns;
+the `state.db` of 0.5 and 0.6 is not looked at. The schema
 is made once, in a write transaction, by the first process to open the file;
 `PRAGMA user_version` marks it as made.
 
@@ -488,7 +507,16 @@ limit, was not taken, for three reasons this design answers:
   or Linux's iowait did) measures nothing. Waiting processes take turns
   measuring, through a row in the queue database that stands for 3 seconds. What the running jobs were granted counts as the
   queue's own; the rest is outside, including what a job uses beyond its
-  grant, since those cores are busy too.
+  grant, since those cores are busy too. `status` therefore calls it the CPU
+  busy beyond what running jobs got. Telling the two apart was asked for
+  (clew), to see whether to raise a weight or bring the outside work into
+  the queue; that would take each job's process tree measured over the same
+  quarter second, with what its finished processes used (the children's
+  times in `/proc` on Linux, from `proc_pid_rusage` on macOS), for a number
+  that is only shown. The live processes' times alone would miss the
+  compilers and test workers that come and go, and count what they used as
+  outside. `report` shows each task's cores busy against its weight, which
+  answers the question.
 - A limit on it lets work outside the line delay every job indefinitely.
   Instead the outside load beyond the cores the capacity leaves free lowers
   the CPU limit of the jobs that start, to at least one core, and a weight

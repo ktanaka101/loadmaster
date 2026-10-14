@@ -833,9 +833,12 @@ mod tests {
     #[test]
     fn cpu_time_of_children_is_counted_once_waited_for() {
         let before = children_cpu_time().unwrap();
-        // A fixed amount of work in grandchildren: about 0.25 s of CPU.
+        // A fixed amount of work in grandchildren: well above the 50 ms
+        // asked for even on a fast machine (100 MB took 40 ms in a Linux
+        // container on an M-series Mac, and once fell short with other tests
+        // running).
         let status = Command::new("sh")
-            .args(["-c", "sh -c 'head -c 100000000 /dev/zero | cksum'"])
+            .args(["-c", "sh -c 'head -c 400000000 /dev/zero | cksum'"])
             .stdout(Stdio::null())
             .status()
             .unwrap();

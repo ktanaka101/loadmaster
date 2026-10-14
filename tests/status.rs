@@ -112,3 +112,49 @@ fn fresh_queue_survives_a_stampede() {
         }
     }
 }
+
+#[test]
+fn jobs_running_in_another_versions_queue_are_told_of() {
+    let sandbox = Sandbox::new(4, &sh_task("lint", 1, "true"));
+    // The queue of another layout, holding a job for a live loadmaster.
+    let mut owner = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = owner.id();
+    let start = loadmaster::process::ProcessId::of(pid)
+        .unwrap()
+        .unwrap()
+        .start_time;
+    std::fs::create_dir_all(&sandbox.state).unwrap();
+    let other = rusqlite::Connection::open(sandbox.state.join("queue-v2.db")).unwrap();
+    other
+        .execute_batch(&format!(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY, task TEXT, state TEXT,
+                 owner_pid INTEGER, owner_start INTEGER, child_pgid INTEGER,
+                 child_start INTEGER);
+             INSERT INTO jobs (task, state, owner_pid, owner_start)
+                 VALUES ('e2e', 'running', {pid}, {start}), ('e2e', 'waiting', {pid}, {start});"
+        ))
+        .unwrap();
+    drop(other);
+    let told = "1 job(s) run in the queue of another loadmaster version, which this one does \
+                not count (queue-v2.db: `e2e`)";
+
+    let out = stdout(&sandbox.run(&["status"]));
+    assert!(out.contains(&format!("\n{told}\n")), "{out}");
+    let output = sandbox.run(&["run", "lint"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(&format!(
+            "loadmaster: warning: {told}; give every agent on this machine the same version\n"
+        )),
+        "{}",
+        stderr(&output)
+    );
+
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    let out = stdout(&sandbox.run(&["status"]));
+    assert!(!out.contains("another loadmaster version"), "{out}");
+}

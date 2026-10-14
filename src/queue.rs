@@ -46,7 +46,8 @@ pub type JobId = i64;
 
 /// File name of the queue database inside the state directory. The number
 /// is the version of its layout: a loadmaster that changes the layout uses
-/// a new file, never one another version made.
+/// a new file, never one another version made (but to tell of the jobs that
+/// run there, see [`running_in_other_queues`]).
 pub const QUEUE_DB_FILE: &str = "queue-v3.db";
 
 /// How long to wait for another process's lock on the database.
@@ -66,6 +67,12 @@ const CPU_SMOOTH: Duration = Duration::from_secs(10);
 
 // AUTOINCREMENT: IDs are never reused, so a stale LOADMASTER_HELD can never
 // point at an unrelated newer job.
+//
+// Every layout keeps `jobs.task`, `state` (with 'running' for a job that
+// holds its slot), `owner_pid` and `owner_start` (its loadmaster), and
+// `child_pgid` and `child_start` (its task's process group), as they are
+// here: loadmaster reads them from the queues of other layouts, to tell of
+// the jobs that run there (see [`running_in_other_queues`]).
 //
 // `cancel_requests` holds the requests from `loadmaster cancel`, for the
 // job's own loadmaster to act on: in an agent's sandbox, a process may not
@@ -415,7 +422,10 @@ impl fmt::Display for Shortage {
                     write!(f, " by {}", list_jobs(by))?;
                 }
                 if let Some(OutsideBusy { busy, cores }) = outside {
-                    write!(f, "; {busy} of {cores} cores are busy outside the queue")?;
+                    write!(
+                        f,
+                        "; {busy} of {cores} cores are busy beyond what running jobs got"
+                    )?;
                 }
                 write!(f, ")")
             }
@@ -1497,6 +1507,9 @@ fn millis(d: Duration) -> u64 {
 fn from_unix_ms(ms: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64)
 }
+
+mod other_queues;
+pub use other_queues::{OtherQueue, running_in_other_queues};
 
 #[cfg(test)]
 mod tests;

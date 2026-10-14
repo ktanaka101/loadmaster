@@ -1025,8 +1025,8 @@ fn cpu_busy_outside_lowers_what_jobs_start_with() {
     ];
     assert_eq!(
         said(decide(&jobs, 2, outside).unwrap()),
-        "0 ahead; waits for 2 cores (4 of 4 in use; 10 of 14 cores are busy outside the \
-         queue)"
+        "0 ahead; waits for 2 cores (4 of 4 in use; 10 of 14 cores are busy beyond what \
+         running jobs got)"
     );
     assert!(
         admitted(&jobs, 2),
@@ -1162,4 +1162,71 @@ fn with_cpu_alone_jobs_start_in_line_order() {
             "round {round}: {started:?}"
         );
     }
+}
+
+#[test]
+fn running_jobs_of_other_layouts_are_found_by_the_columns_every_layout_keeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let me = ProcessId::current().unwrap();
+    let gone = ProcessId {
+        start_time: me.start_time + 1,
+        ..me
+    };
+    // Another layout, with only the columns every layout keeps and one more.
+    let other = Connection::open(dir.path().join("queue-v2.db")).unwrap();
+    other
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE jobs (id INTEGER PRIMARY KEY, task TEXT, state TEXT,
+                 owner_pid INTEGER, owner_start INTEGER, child_pgid INTEGER,
+                 child_start INTEGER, extra TEXT)",
+        )
+        .unwrap();
+    let insert = |task: &str, state: &str, owner: Option<ProcessId>, child: Option<ProcessId>| {
+        other
+            .execute(
+                "INSERT INTO jobs (task, state, owner_pid, owner_start, child_pgid, child_start)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    task,
+                    state,
+                    owner.map(|o| o.pid),
+                    owner.map(|o| o.start_time as i64),
+                    child.map(|c| c.pid),
+                    child.map(|c| c.start_time as i64),
+                ],
+            )
+            .unwrap();
+    };
+    insert("e2e", "running", Some(me), None);
+    insert("lost", "running", Some(gone), None);
+    insert("orphaned", "running", None, Some(me));
+    insert("waits", "waiting", Some(me), None);
+    insert("e2e", "running", Some(me), None);
+    drop(other);
+    // Not another layout's queue, or not readable: nothing is said of them.
+    std::fs::write(dir.path().join("queue-v9.db"), "not a database").unwrap();
+    std::fs::write(dir.path().join("queue-vx.db"), "").unwrap();
+    std::fs::write(dir.path().join("history.jsonl"), "").unwrap();
+    // This layout's own queue is not another.
+    let own = Queue::open(&dir.path().join(QUEUE_DB_FILE)).unwrap();
+    let running = own.enqueue(&request("own", 1, &[]), me).unwrap();
+    running.admit_now().unwrap();
+
+    assert_eq!(
+        running_in_other_queues(dir.path()),
+        [OtherQueue {
+            file: "queue-v2.db".to_owned(),
+            running: vec!["e2e".to_owned(), "orphaned".to_owned(), "e2e".to_owned()],
+        }]
+    );
+    // Read as another loadmaster would, nothing is left beside it.
+    let mut files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("queue-v2"))
+        .collect();
+    files.sort();
+    assert_eq!(files, ["queue-v2.db"]);
+    drop(running);
 }

@@ -61,14 +61,17 @@ fn jobs_start_with_fewer_cores_while_cpu_is_busy_outside_the_queue() {
     assert!(granted < cores, "LOADMASTER_WEIGHT={granted} of {cores}");
     assert!(
         stderr(&output).contains(&format!(
-            "starting `show` with {granted} of its {cores} cores, since CPU is busy outside \
-             the queue"
+            "starting `show` with {granted} of its {cores} cores, since CPU is busy beyond \
+             what running jobs got"
         )),
         "{}",
         stderr(&output)
     );
     let status = stdout(&sandbox.run(&["status"]));
-    assert!(status.contains("CPU busy outside the queue: "), "{status}");
+    assert!(
+        status.contains("CPU busy beyond what running jobs got: "),
+        "{status}"
+    );
     assert!(status.contains(", so jobs start with at most "), "{status}");
 
     // A failure while the CPUs are all busy says so.

@@ -194,6 +194,11 @@ fn run(args: RunArgs) -> Result<i32> {
 
     let signals = Signals::install().map_err(|e| Error::io("cannot install signal handlers", e))?;
     let (state_dir, queue) = open_queue()?;
+    if !machine.measure_only
+        && let Some(others) = other_queues(&state_dir)
+    {
+        say!("loadmaster: warning: {others}; give every agent on this machine the same version");
+    }
     let owner = ProcessId::current().map_err(|e| Error::io("cannot identify this process", e))?;
     let display = display_command(&task.cmd, &args.args);
     let request = JobRequest {
@@ -443,7 +448,7 @@ fn run_admitted(
     if granted < task.weight {
         say!(
             "loadmaster: starting `{}` with {granted} of its {} cores, since CPU is busy \
-             outside the queue ({WEIGHT_ENV}={granted})",
+             beyond what running jobs got ({WEIGHT_ENV}={granted})",
             task.name,
             task.weight
         );
@@ -779,7 +784,7 @@ fn spawn_failure_code(err: &io::Error) -> i32 {
 
 fn status() -> Result<i32> {
     let machine = MachineConfig::load()?;
-    let (_, queue) = open_queue()?;
+    let (state_dir, queue) = open_queue()?;
     let snapshot = queue.snapshot()?;
     // Each job adapts as the machine config it got in line with said.
     let adapting = machine.adapt_to_outside_cpu && !machine.measure_only;
@@ -803,14 +808,27 @@ fn status() -> Result<i32> {
     out += &load_line();
     if let Some(outside) = outside.filter(|_| adapting) {
         out += &format!(
-            "CPU busy outside the queue: {:.1} of {} cores",
+            "CPU busy beyond what running jobs got: {:.1} of {} cores",
             outside.busy, outside.cores
         );
         let limit = outside.cpu_limit(machine.capacity);
         if limit < machine.capacity {
             out += &format!(", so jobs start with at most {limit} cores");
         }
+        // The measurement cannot tell a job that uses more than it got from
+        // load outside the queue; the history can, per task.
+        if snapshot
+            .jobs
+            .iter()
+            .any(|job| job.state == JobState::Running)
+        {
+            out += " (load outside the queue, or jobs using more than they got: see CORES in \
+                    `loadmaster report`)";
+        }
         out += "\n";
+    }
+    if let Some(others) = other_queues(&state_dir) {
+        out += &format!("{others}\n");
     }
     if machine.measure_only {
         out += "measure-only: jobs start at once and are only recorded (see `loadmaster report`)\n";
@@ -830,6 +848,28 @@ fn status() -> Result<i32> {
     }
     print(&out);
     Ok(0)
+}
+
+/// The jobs that run in the queues of other loadmaster versions, which this
+/// one does not count, if any.
+fn other_queues(state_dir: &Path) -> Option<String> {
+    let others = queue::running_in_other_queues(state_dir);
+    let count: usize = others.iter().map(|other| other.running.len()).sum();
+    if count == 0 {
+        return None;
+    }
+    let list: Vec<String> = others
+        .iter()
+        .map(|other| {
+            let tasks: Vec<String> = other.running.iter().map(|t| format!("`{t}`")).collect();
+            format!("{}: {}", other.file, tasks.join(", "))
+        })
+        .collect();
+    Some(format!(
+        "{count} job(s) run in the queue of another loadmaster version, which this one does \
+         not count ({})",
+        list.join("; ")
+    ))
 }
 
 /// The machine's load, which also counts work outside the queue.

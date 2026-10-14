@@ -306,10 +306,6 @@ impl Forwarder {
         self.stop_sent
     }
 
-    fn send(&mut self, group: &ProcessGroup, received: i32) {
-        self.send_with(received, |signal| signal_group(group, signal));
-    }
-
     fn send_with(&mut self, received: i32, kill: impl FnOnce(i32) -> bool) {
         let request = received == libc::SIGTERM;
         if request && self.stop_sent {
@@ -334,12 +330,24 @@ fn signal_group(group: &ProcessGroup, signal: i32) -> bool {
     sent
 }
 
+/// [`signal_group`], if the group still has running members, after a look
+/// at the task's processes: one it started since the last look, in a session
+/// of its own, is found only through its parent, which the signal may end
+/// (as Playwright exits on SIGTERM, leaving its `webServer`). Checked after
+/// the look, which takes a while, so a group ID the OS has reused meanwhile
+/// is never hit.
+fn signal_looked(group: &ProcessGroup, descendants: &mut Descendants, signal: i32) -> bool {
+    descendants.look(group);
+    group.is_alive() && signal_group(group, signal)
+}
+
 /// Waits for the task's leader to exit, forwarding intercepted signals to the
 /// whole process group in the meantime, and the signal `canceled` asks for
 /// (SIGTERM to stop it, SIGKILL to kill it), which it is asked every few
 /// polls; it is told whether the task has had its stop signal already, and
 /// the forwarder sends none twice. Meanwhile it looks for the processes the
-/// task starts (see [`Descendants`]). Returns the leader's exit status, and
+/// task starts (see [`Descendants`]), and again before each signal it
+/// sends (see [`signal_looked`]). Returns the leader's exit status, and
 /// whether it had had its stop signal by then.
 pub fn wait(
     task: &mut Task,
@@ -354,7 +362,12 @@ pub fn wait(
         let stopped = forwarder.stop_sent();
         // Forward even if the leader just exited: others in its group may
         // still be running.
-        forwarder.forward_pending(&task.group, signals);
+        let pending = signals.take();
+        if !pending.is_empty() {
+            forwarder.forward(pending, |signal| {
+                signal_looked(&task.group, descendants, signal)
+            });
+        }
         if let Some(status) = exited {
             return Ok((status, stopped));
         }
@@ -364,9 +377,10 @@ pub fn wait(
         }
         if polls.is_multiple_of(CANCEL_CHECK_EVERY)
             && let Some(signal) = canceled(forwarder.stop_sent())
-            && task.group.is_alive()
         {
-            forwarder.send(&task.group, signal);
+            forwarder.send_with(signal, |signal| {
+                signal_looked(&task.group, descendants, signal)
+            });
         }
         thread::sleep(CHILD_POLL_INTERVAL);
     }
