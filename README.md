@@ -388,14 +388,17 @@ no database can start while an e2e run waits for one, as long as it leaves the
 e2e run the CPU it will need. A job waiting for CPU still holds back everyone
 behind it. See [How it works](#how-it-works).
 
-That share is set aside for as long as the job waits, so keep the weights of
-tasks that share a resource with a long-running task low: while one of them
-waits, both its weight and the long-running task's are out of the capacity,
-and only the rest is left for everything else. A weight above the capacity
-minus the long-running task's is worse still: the waiting job is then short
-of CPU too and holds back everyone behind it. `loadmaster check` points out
-the tasks whose weights do that on this machine, and `loadmaster status`
-shows what each waiting job sets aside.
+While the job waits, it sets that share aside, less what it is sure to get
+back by the time it can start: a job waiting for what a running task holds
+can only start once that task ends, which frees the task's cores too. So a
+unit run waiting for the browser that a long UI capture holds counts on the
+cores the capture frees, as far as jobs ahead of it do not count on them
+already, and sets aside only the rest: checks behind it run in the cores
+left. A weight above the capacity minus the long-running task's
+still keeps them out: the waiting job is then short of CPU too and holds back
+everyone behind it. `loadmaster check` points out the tasks whose weights do
+that on this machine, and `loadmaster status` shows what each waiting job
+sets aside and what it counts on getting back.
 
 Make manual operations on a resource tasks too, such as resetting the e2e
 database by hand: `uses = { e2e-db = 1 }` then makes them wait for the runs
@@ -514,8 +517,10 @@ line, the process that later reclaims the job writes one with outcome `lost`.
 
 - **Admission**: jobs are considered in line order. A job starts when its
   weight and each resource it uses fit in what the running jobs ahead of it
-  leave free and in what the jobs ahead of it set aside: a job waiting in line sets aside what
-  it needs wherever that fits, and holds back entirely what it is short of.
+  leave free and in what the jobs ahead of it set aside: a job waiting in
+  line sets aside what it needs wherever that fits, less what is sure to be
+  freed by the time it can start (what the job whose end it waits for frees),
+  and holds back entirely what it is short of.
   No job is ever delayed by jobs that got in line after it. Every task uses
   CPU, so a small job never overtakes a big job waiting for CPU, and the big
   job starts as soon as enough running jobs finish; the price is that a quick
@@ -575,7 +580,8 @@ line, the process that later reclaims the job writes one with outcome `lost`.
 - **Why a job waits** is worked out by the admission rule itself, which
   `loadmaster status` and the waiting messages report: a dimension in use by
   running jobs, one set aside for jobs ahead, or one a job ahead waits for
-  too, with the jobs that cause it.
+  too, with the jobs that cause it, and what the waiting job sets aside and
+  counts on getting back meanwhile.
 
 ### Nested runs
 
@@ -667,24 +673,25 @@ loadmaster held [--uses RESOURCE]
 
 ```text
 $ loadmaster status
-6/8 in use (capacity set in /Users/you/.config/loadmaster/config.toml)
+5/8 in use (capacity set in /Users/you/.config/loadmaster/config.toml)
 e2e-db: 1/2 in use
 load average 22.9 over the last minute, on 14 cores: more than the cores, often from work outside the queue or tasks that use more cores than their weight (see `loadmaster report`); on Linux, processes waiting for disks count too
 
-ID  STATE    TASK  WEIGHT  USES      PID    PGID   FOR   DIR
-41  running  test  4       -         10687  10689  3.0s  /Users/you/src/app-wt1
-42  running  e2e   2       e2e-db=1  10700  10702  2.5s  /Users/you/src/app-wt2
-43  waiting  e2e   2       e2e-db=1  10753  -      2.0s  /Users/you/src/app-wt2
-44  waiting  lint  1       -         10772  -      1.4s  /Users/you/src/app-wt3
+ID  STATE    TASK       WEIGHT  USES      PID    PGID   FOR   DIR
+41  running  test       4       -         10687  10689  3.0s  /Users/you/src/app-wt1
+42  running  e2e-smoke  1       e2e-db=1  10700  10702  2.5s  /Users/you/src/app-wt2
+43  waiting  e2e        2       e2e-db=1  10753  -      2.0s  /Users/you/src/app-wt2
+44  waiting  lint       3       -         10772  -      1.4s  /Users/you/src/app-wt3
 
 why jobs wait:
-  #43 `e2e` waits for `e2e-db` in its checkout (1 of 1 in use by #42 `e2e`); sets aside 2 cores and `e2e-db` meanwhile
-  #44 `lint` waits for 1 core (2 free, but 2 set aside for #43 `e2e`)
+  #43 `e2e` waits for `e2e-db` in its checkout (1 of 1 in use by #42 `e2e-smoke`); sets aside 1 core meanwhile; counts on 1 core and `e2e-db` that #42 `e2e-smoke` frees when it ends
+  #44 `lint` waits for 3 cores (3 free, but 1 set aside for #43 `e2e`)
 ```
 
-Job 43 waits because `app-wt2` already has its one `e2e-db`. Job 44 waits
-although 2 cores are free: they are set aside for job 43, which needs them as
-soon as `app-wt2`'s database is free. `FOR` is the time spent in the current
+Job 43 waits because `app-wt2` already has its one `e2e-db`. It can only
+start once job 42 ends, which frees a core and an `e2e-db`, so of the 2 cores
+it needs it sets aside only 1 meanwhile. Job 44 waits although 3 cores are
+free: one of them is set aside for job 43. `FOR` is the time spent in the current
 state. The load average counts everything on the machine; well above the
 capacity in use, it points to work outside the queue, here a build run
 directly.
@@ -1083,7 +1090,8 @@ loadmaster is deliberately small:
   terminal). A task that opens the terminal itself, for a password prompt or a
   pager, is stopped by the OS; Ctrl-C still ends it.
 - A task that leaves a daemon running in its own process group holds its slot
-  until the daemon exits (loadmaster warns about it).
+  until the daemon exits: loadmaster warns about it, and `loadmaster status`
+  lists the job as lingering, with the processes in its group.
 - Processes a task starts in a session of their own (as Playwright starts its
   `webServer`) leave the task's process group: they get no signals from
   loadmaster and hold no slot, and do not always exit with the task. When a

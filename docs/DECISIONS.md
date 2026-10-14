@@ -51,7 +51,11 @@ to the group: the owner is cleared and the slot is freed once the group has no
 running member. This matches the rule "held while loadmaster or the task's
 process group is alive". The cost is that a task that deliberately leaves a
 daemon in its own group holds its slot until the daemon exits; `loadmaster`
-says so on stderr, and `status` lists the job as orphaned. Most daemons
+says so on stderr, naming the processes in the group, and `status` lists the
+job as lingering, with them. A job is orphaned only while its task's command
+still runs without its loadmaster: the two used to share that name, and with
+it the explanation that loadmaster was gone, which did not say what held the
+slot of a job whose command had exited (clew, 0.10.0). Most daemons
 (Gradle, sccache, ...) start their own session and are not affected.
 
 Processes that start a session of their own leave the group, and with it
@@ -321,15 +325,17 @@ resource of each checkout):
   that fits may start.
 - A job that does not fit is short of some dimensions: no job behind it may
   use those at all. On the dimensions where it fits, its amount is set aside,
-  so jobs behind it can only use what is left.
+  less what it is sure to get back by the time it can start (see below), so
+  jobs behind it can only use what is left.
 - A job ahead that fits but has not started yet (its own poll comes later)
   has its whole amount set aside.
 
 A job behind can therefore start first only by using nothing the waiting job
 is short of and leaving it its share everywhere else, so no job is ever
 delayed by jobs that got in line after it. Running jobs behind a job do not
-count against it: they only started in room it did not need then, and while
-the limits stay put that changes nothing. CPU busy outside the queue can
+count against it: they only started in room it did not need then, or that
+the end it waits for gives back, and while the limits stay put that changes
+nothing. CPU busy outside the queue can
 lower the CPU limit after they started, though (see
 [Load outside the queue](#load-outside-the-queue)), and counting them would
 then make the job wait for them. Not counting them can take the machine past
@@ -345,19 +351,53 @@ weight.) Without the rule, a third e2e run waiting
 for a database stack would hold up every lint behind it, though no lint needs
 a stack.
 
-The rule does not know which running job will free what, so where in doubt it
-sets aside. A job waiting for its checkout's limit still sets aside its
-machine-wide amount, so a job from another checkout may wait for a stack that
-is free. That takes two jobs of one checkout in line for the same resource,
-which one agent per worktree rarely causes. Skipping that set-aside when the
-release the job waits for would free enough anyway was considered; it breaks
-the guarantee when a waiting job leaves the line instead.
+**What a waiting job sets aside.** A set-aside is there so that a waiting job
+finds what it needs free at the moment it can start; so it sets aside its
+amount less what is sure to be freed by then. Each event that can let a job
+in frees a known amount: a running job ahead ending frees what it holds; a
+job ahead leaving the line, a kept place expiring, or CPU outside the queue
+going down frees nothing. When, on every dimension a job is short of, the
+running jobs ahead leave it no room by its own limit (whatever becomes of
+the jobs ahead that have not started), and that limit cannot rise, only the
+end of a job ahead that holds such a dimension can let it in: one running
+now, or one ahead that has not started yet and may start first. Whichever it
+is frees at least what it holds: a job that has not started, what it will
+start with, and on CPU one core while CPU outside the queue can lower that.
+So on each dimension where the waiting job fits, it sets aside only what the
+least of them frees falls short of, and each of them keeps that much for it:
+what one end frees is counted on once, in line order. Otherwise an event
+that frees nothing may let it in, and it sets aside its whole amount. Jobs
+behind may use what it counts on meanwhile; the end that lets it in gives
+that back, and the job then fits, which sets its whole amount aside before a
+job behind can take it.
 
-A unit test simulates random workloads with several resources, with and
-without CPU outside the queue that changes on its own, and checks that each
-job starts at the same time whether or not the jobs that got in line after it
-exist, and that every job starts. The soak test adds resources and a second checkout and checks
-every limit from inside the tasks.
+The first real user's UI capture held the one browser for minutes. A unit run
+waiting for it set aside 2 cores, and a lint behind it, short of those, held
+back every check behind it (clew, 0.9.0); clew got its checks in line in an
+order of its own to get around it. The unit run can only start once the
+capture ends, which frees 8 cores: it now sets none aside, and the lint
+starts. Likewise a job waiting for its checkout's limit no longer sets aside
+the machine-wide stack that the run ahead in its checkout frees, so a job
+from another checkout takes the one that is free. Skipping set-asides there
+had been considered before, and left out because a job ahead may leave the
+line instead of releasing anything: the rule counts only on ends, and on
+none while something else could let the job in. Run times are not used: a
+backfill that lets a job behind start when it is expected to end in time
+breaks the guarantee whenever the estimate is wrong. The layout did not
+change with the rule, so a loadmaster of 0.10 shares the queue with one of
+0.11: each job is admitted by its own loadmaster, and the earlier rule only
+sets aside more, which starts its job no earlier than this one would.
+
+A unit test simulates random workloads with several resources (one with room
+for a single job, as for a browser), with and without CPU outside the queue
+that changes on its own, and checks that each job starts at the same time
+whether or not the jobs that got in line after it exist, that the order in
+which jobs poll changes nothing, that every limit holds, that every job
+starts, and that some waiting job counted on an end. Leaving out the jobs
+ahead that have not started makes the poll order matter, and counting one
+end twice takes a limit past what it allows (both found by it). The soak
+test adds resources and a second checkout and checks every limit from
+inside the tasks.
 
 A nested run takes no part in admission: it has to fit in its holder's
 slot (see [Nested runs](#nested-runs)).
@@ -374,8 +414,9 @@ whether it would fit but is set aside for jobs ahead (naming them), whether
 a job ahead waits for it too (naming the first), or whether a job ahead got
 in line with a smaller limit, which the jobs behind it respect (naming that
 job). It also lists what the waiting job sets aside meanwhile, which is the
-cost it puts on the jobs behind it, including resources it has no limit for:
-other jobs may have one. `status` shows this for every waiting job and the waiting
+cost it puts on the jobs behind it, including resources it has no limit for
+(other jobs may have one), and what it counts on getting back instead, from
+which jobs' ends. `status` shows this for every waiting job and the waiting
 messages for their own; both use the same words. The simulation checks, at
 every step, that the explanation agrees with the decision each job gets and
 that every waiting job has a reason.

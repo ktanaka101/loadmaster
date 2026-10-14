@@ -82,7 +82,8 @@ fn a_lint_passes_an_e2e_run_waiting_for_a_database() {
     wait_until("the reason on stderr", || {
         sandbox.read("e2e.err").contains(
             "loadmaster: waiting to run `e2e` (weight 2, next in line) for `db` \
-             (1 of 1 in use by #1 `e2e-hold`); 2 cores set aside for it meanwhile",
+             (1 of 1 in use by #1 `e2e-hold`); it counts on 2 cores that #1 `e2e-hold` \
+             frees when it ends",
         )
     });
 
@@ -120,7 +121,8 @@ fn one_e2e_run_per_checkout() {
     assert!(
         status.contains(
             "why jobs wait:\n  #3 `e2e` waits for `db` in its checkout \
-             (1 of 1 in use by #1 `e2e-hold`); sets aside 2 cores and `db` meanwhile\n"
+             (1 of 1 in use by #1 `e2e-hold`); counts on 2 cores and `db` that \
+             #1 `e2e-hold` frees when it ends\n"
         ),
         "{status}"
     );
@@ -244,4 +246,48 @@ fn a_series_takes_turns_with_checks_that_arrive_meanwhile() {
     assert!(wait(&mut e2e).success());
     let order = std::fs::read_to_string(log.path()).unwrap();
     assert_eq!(order, "step1\ne2e\nstep2\n");
+}
+
+#[test]
+fn a_check_starts_beside_one_waiting_for_what_a_long_run_holds() {
+    // A UI capture holds the one browser, and a unit run waits for it: the
+    // unit run can only start once the capture ends, which frees its 5 cores,
+    // so it sets none aside meanwhile, and the lint behind it starts at once
+    // in the 3 left of 8 (clew, 0.9.0: the lint used to wait for the capture).
+    let probe = Sandbox::new(8, "");
+    let tasks = "[resources.browser]\ncapacity = 1\n\n".to_owned()
+        + &sh_task("ui", 5, &probe.hold_script("ui"))
+        + &sh_task("unit", 2, "true")
+        + &sh_task("lint", 3, "true");
+    let tasks = tasks
+        .replace(
+            "[tasks.ui]\nweight = 5\n",
+            "[tasks.ui]\nweight = 5\nuses = { browser = 1 }\n",
+        )
+        .replace(
+            "[tasks.unit]\nweight = 2\n",
+            "[tasks.unit]\nweight = 2\nuses = { browser = 1 }\n",
+        );
+    std::fs::write(probe.repo.join(".loadmaster.toml"), tasks).unwrap();
+    let sandbox = probe;
+    let mut ui = sandbox.spawn(&["run", "ui"]);
+    wait_until("the capture to start", || sandbox.started("ui"));
+    let mut unit = sandbox.spawn(&["run", "unit"]);
+    wait_for_waiting(&sandbox, "unit");
+
+    let status = stdout(&sandbox.run(&["status"]));
+    assert!(
+        status.contains(
+            "#2 `unit` waits for `browser` (1 of 1 in use by #1 `ui`); counts on 2 cores that \
+             #1 `ui` frees when it ends\n"
+        ),
+        "{status}"
+    );
+    let lint = sandbox.run(&["run", "lint", "--max-wait", "0"]);
+    assert!(lint.status.success(), "{}", stderr(&lint));
+    assert_eq!(sandbox.job("unit").unwrap().state, JobState::Waiting);
+
+    sandbox.release("ui");
+    assert!(wait(&mut ui).success());
+    assert!(wait(&mut unit).success());
 }

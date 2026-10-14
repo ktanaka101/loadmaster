@@ -5,10 +5,11 @@
 //! resource. A job starts if it fits in what the running jobs ahead of it use
 //! (and measure-only jobs anywhere, which started without the rule) plus
 //! what is set aside for the jobs ahead of it. A job that does not fit
-//! sets aside its amount where it fits and holds back entirely the dimensions
-//! it is short of, so no job is ever delayed by jobs that got in line after
-//! it, even when CPU busy outside the queue lowers its CPU limit (see
-//! [`Outside`]). Every job uses CPU, so with CPU alone this is a strictly
+//! sets aside its amount where it fits, less what is sure to be freed by the
+//! time it can start (see [`releasers`]), and holds back entirely the
+//! dimensions it is short of, so no job is ever delayed by jobs that got in
+//! line after it, even when CPU busy outside the queue lowers its CPU limit
+//! (see [`Outside`]). Every job uses CPU, so with CPU alone this is a strictly
 //! FIFO line: a small job never overtakes a big one waiting at the head, and
 //! big jobs cannot starve.
 //!
@@ -310,6 +311,18 @@ pub struct Wait {
     /// What it sets aside meanwhile, where it fits: the jobs behind it cannot
     /// use that.
     pub reserves: Vec<(Need, u64)>,
+    /// What it does not set aside, where it fits, since that is sure to be
+    /// freed by the time it can start.
+    pub counts_on: Option<CountsOn>,
+}
+
+/// What a waiting job counts on being freed instead of setting it aside:
+/// `amounts`, which each of the jobs `from` frees when it ends, and one of
+/// whose ends has to let it in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountsOn {
+    pub amounts: Vec<(Need, u64)>,
+    pub from: Vec<JobRef>,
 }
 
 /// Something a waiting job is short of.
@@ -397,6 +410,26 @@ impl Wait {
                 .map(|(need, amount)| quantity(need, *amount, false))
                 .collect(),
         ))
+    }
+
+    /// What it counts on being freed instead, e.g. "2 cores that #41 `ui`
+    /// frees when it ends", if anything.
+    pub fn counts_on_text(&self) -> Option<String> {
+        let counts = self.counts_on.as_ref()?;
+        let amounts = join_and(
+            counts
+                .amounts
+                .iter()
+                .map(|(need, amount)| quantity(need, *amount, false))
+                .collect(),
+        );
+        Some(match counts.from.as_slice() {
+            [one] => format!("{amounts} that {one} frees when it ends"),
+            many => format!(
+                "{amounts} that each of {} frees when it ends",
+                list_jobs(many)
+            ),
+        })
     }
 }
 
@@ -1237,10 +1270,11 @@ struct Reserved<'a> {
 /// (which is then the last one returned).
 fn assess(jobs: &[Job], outside: Option<Outside>, only: Option<JobId>) -> Vec<(JobId, Admission)> {
     // What the running jobs ahead use: a job is judged by those alone. The
-    // ones behind it only started in room it did not need then; but CPU
-    // taken outside the queue since can shrink the room, and they must not
-    // delay it then either. Measure-only jobs did not start by the rule, so
-    // wherever they are in line, they count for everyone. Sums of u32
+    // ones behind it only started in room it did not need then, or that it
+    // counts on getting back by the time it can start (see `releasers`); but
+    // CPU taken outside the queue since can shrink the room, and they must
+    // not delay it then either. Measure-only jobs did not start by the rule,
+    // so wherever they are in line, they count for everyone. Sums of u32
     // amounts cannot overflow u64.
     fn count<'a>(
         used: &mut BTreeMap<Dim<'a>, (u64, Vec<&'a Job>)>,
@@ -1253,12 +1287,28 @@ fn assess(jobs: &[Job], outside: Option<Outside>, only: Option<JobId>) -> Vec<(J
             entry.1.push(job);
         }
     }
+    // Per dimension, the jobs whose end may let a job behind them in: the
+    // running ones ahead of it, the measure-only ones, and the ones ahead
+    // that have not started, which may start before it. By index in `jobs`.
+    fn hold<'a>(
+        holding: &mut BTreeMap<Dim<'a>, Vec<usize>>,
+        frees: &BTreeMap<Dim<'a>, u64>,
+        i: usize,
+    ) {
+        for &dim in frees.keys() {
+            holding.entry(dim).or_default().push(i);
+        }
+    }
+    // What each job frees on each dimension when it ends, less what the
+    // waiting jobs judged so far count on getting from it.
+    let mut frees: Vec<BTreeMap<Dim, u64>> = jobs.iter().map(|job| freed(job, outside)).collect();
+    let mut holding: BTreeMap<Dim, Vec<usize>> = BTreeMap::new();
     let mut used: BTreeMap<Dim, (u64, Vec<&Job>)> = BTreeMap::new();
-    for job in jobs
-        .iter()
-        .filter(|job| job.state == JobState::Running && job.measure_only)
-    {
-        count(&mut used, job, outside);
+    for (i, job) in jobs.iter().enumerate() {
+        if job.state == JobState::Running && job.measure_only {
+            count(&mut used, job, outside);
+            hold(&mut holding, &frees[i], i);
+        }
     }
     let used_of = |used: &BTreeMap<Dim, (u64, Vec<&Job>)>, dim: &Dim| {
         used.get(dim).map_or(0, |(amount, _)| *amount)
@@ -1269,10 +1319,11 @@ fn assess(jobs: &[Job], outside: Option<Outside>, only: Option<JobId>) -> Vec<(J
     let mut short: BTreeMap<Dim, &Job> = BTreeMap::new();
     let mut ahead = 0u32;
     let mut assessed = Vec::new();
-    for job in jobs {
+    for (i, job) in jobs.iter().enumerate() {
         if job.state == JobState::Running {
             if !job.measure_only {
                 count(&mut used, job, outside);
+                hold(&mut holding, &frees[i], i);
             }
             continue;
         }
@@ -1290,6 +1341,27 @@ fn assess(jobs: &[Job], outside: Option<Outside>, only: Option<JobId>) -> Vec<(J
             })
             .collect();
         let fits_all = fits.iter().all(|&(fits, _)| fits);
+        // A job that fits is about to start, and counts on nothing.
+        let releasers = if fits_all {
+            None
+        } else {
+            releasers(job, &demands, &fits, |dim| used_of(&used, dim), &holding)
+        };
+        // Per dimension where it fits: how much of it is sure to be freed by
+        // the time it can start, which it need not set aside meanwhile.
+        let sure: Vec<u64> = demands
+            .iter()
+            .zip(&fits)
+            .map(|(&(dim, amount, _), &(fits, _))| match &releasers {
+                Some(by) if fits => by
+                    .iter()
+                    .map(|&k| frees[k].get(&dim).copied().unwrap_or(0))
+                    .min()
+                    .unwrap_or(0)
+                    .min(amount),
+                _ => 0,
+            })
+            .collect();
         if only.is_none_or(|id| id == job.id) {
             let admission = if fits_all {
                 Admission::Admitted
@@ -1298,12 +1370,21 @@ fn assess(jobs: &[Job], outside: Option<Outside>, only: Option<JobId>) -> Vec<(J
                     ahead,
                     short: Vec::new(),
                     reserves: Vec::new(),
+                    counts_on: None,
                 };
-                for (&(dim, amount, own_limit), &(fits, limit)) in demands.iter().zip(&fits) {
+                let mut counted = Vec::new();
+                for ((&(dim, amount, own_limit), &(fits, limit)), &sure) in
+                    demands.iter().zip(&fits).zip(&sure)
+                {
                     if fits {
                         // Even a resource unlimited for this job: others
                         // may have a limit for it.
-                        wait.reserves.push((dim.need(), amount));
+                        if amount > sure {
+                            wait.reserves.push((dim.need(), amount - sure));
+                        }
+                        if sure > 0 {
+                            counted.push((dim.need(), sure));
+                        }
                         continue;
                     }
                     let in_use = used_of(&used, &dim);
@@ -1350,6 +1431,12 @@ fn assess(jobs: &[Job], outside: Option<Outside>, only: Option<JobId>) -> Vec<(J
                         cause,
                     });
                 }
+                if let Some(by) = releasers.as_ref().filter(|_| !counted.is_empty()) {
+                    wait.counts_on = Some(CountsOn {
+                        amounts: counted,
+                        from: by.iter().map(|&k| JobRef::of(&jobs[k])).collect(),
+                    });
+                }
                 Admission::Waiting(wait)
             };
             assessed.push((job.id, admission));
@@ -1358,8 +1445,10 @@ fn assess(jobs: &[Job], outside: Option<Outside>, only: Option<JobId>) -> Vec<(J
             }
         }
         ahead = ahead.saturating_add(1);
-        for (&(dim, amount, limit), &(fits, _)) in demands.iter().zip(&fits) {
+        for ((&(dim, amount, limit), &(fits, _)), &sure) in demands.iter().zip(&fits).zip(&sure) {
             // A job that fits is about to start: it sets aside everything.
+            // One that waits sets aside what it is not sure to get back,
+            // and each job it counts on keeps that much for it.
             if fits_all || fits {
                 let entry = set_aside.entry(dim).or_insert(Reserved {
                     amount: 0,
@@ -1367,17 +1456,74 @@ fn assess(jobs: &[Job], outside: Option<Outside>, only: Option<JobId>) -> Vec<(J
                     limited_by: job,
                     for_jobs: Vec::new(),
                 });
-                entry.amount += amount;
+                entry.amount += amount - sure;
                 if limit < entry.limit {
                     (entry.limit, entry.limited_by) = (limit, job);
                 }
-                entry.for_jobs.push(job);
+                if amount > sure {
+                    entry.for_jobs.push(job);
+                }
+                for &k in releasers.iter().flatten().filter(|_| sure > 0) {
+                    if let Some(left) = frees[k].get_mut(&dim) {
+                        *left -= sure;
+                    }
+                }
             } else {
                 short.entry(dim).or_insert(job);
             }
         }
+        // It may start before the jobs behind it, and end before they can.
+        hold(&mut holding, &frees[i], i);
     }
     assessed
+}
+
+/// What `job` frees on each dimension when it ends, at least: what it
+/// holds, if it runs; if not, what it will start with, but on CPU only one
+/// core if CPU busy outside the queue may lower that by then.
+fn freed<'a>(job: &'a Job, outside: Option<Outside>) -> BTreeMap<Dim<'a>, u64> {
+    demands(job, outside)
+        .into_iter()
+        .map(|(dim, amount, _)| {
+            let lowered = dim == Dim::Cpu && job.state != JobState::Running && job.adapt_cpu;
+            (dim, if lowered { amount.min(1) } else { amount })
+        })
+        .collect()
+}
+
+/// The jobs ahead of waiting `job`, one of which must end before it can
+/// start, if nothing else can let it in: on every dimension it is short
+/// of, the running jobs ahead (with the measure-only ones) leave it no room
+/// by its own limit, whatever becomes of the jobs ahead that have not
+/// started, and that limit cannot rise, as a CPU limit lowered by CPU busy
+/// outside the queue may. The jobs that may hold such a dimension by then
+/// are the running ones and those ahead that have not started yet. `None`
+/// if something else may let it in: a job ahead leaving the line, or the
+/// load outside the queue going down, frees nothing.
+///
+/// Whichever of them lets it in frees, when it ends, what it holds; so on
+/// the dimensions where it fits, the job need not set aside what each of
+/// them is sure to free, beyond what jobs ahead count on. Jobs behind may
+/// use that meanwhile, and the end that lets the job in gives it back.
+fn releasers<'a>(
+    job: &Job,
+    demands: &[(Dim<'a>, u64, u64)],
+    fits: &[(bool, u64)],
+    used: impl Fn(&Dim<'a>) -> u64,
+    holding: &BTreeMap<Dim<'a>, Vec<usize>>,
+) -> Option<std::collections::BTreeSet<usize>> {
+    let mut by = std::collections::BTreeSet::new();
+    for (&(dim, amount, own_limit), &(fits, _)) in demands.iter().zip(fits) {
+        if fits {
+            continue;
+        }
+        let may_rise = dim == Dim::Cpu && job.adapt_cpu && own_limit < u64::from(job.capacity);
+        if used(&dim) + amount <= own_limit || may_rise {
+            return None;
+        }
+        by.extend(holding.get(&dim).into_iter().flatten().copied());
+    }
+    Some(by)
 }
 
 fn reap(tx: &Transaction) -> Result<Vec<Job>> {

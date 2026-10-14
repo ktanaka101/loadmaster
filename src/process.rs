@@ -93,6 +93,41 @@ impl ProcessGroup {
         }
     }
 
+    /// Whether the group's leader, the task's own command, is known to have
+    /// exited. False if its start time was never read.
+    pub fn leader_exited(&self) -> bool {
+        self.leader_start_time.is_some_and(|start_time| {
+            !ProcessId {
+                pid: self.pgid,
+                start_time,
+            }
+            .is_alive()
+        })
+    }
+
+    /// The group's running members, with their command names, as far as
+    /// they can be seen: what holds a slot once the task's command exited.
+    pub fn members(&self) -> Vec<Descendant> {
+        let Ok(pgid) = libc::pid_t::try_from(self.pgid) else {
+            return Vec::new();
+        };
+        let Ok(listing) = list_group(pgid) else {
+            return Vec::new();
+        };
+        listing
+            .members
+            .into_iter()
+            .filter_map(|pid| {
+                let o = observe(pid).filter(|o| o.pgid == self.pgid)?;
+                Some(Descendant {
+                    pid,
+                    start_time: o.start_time,
+                    name: o.name,
+                })
+            })
+            .collect()
+    }
+
     /// Sends `signal` to every process in the group.
     pub fn signal(&self, signal: i32) -> io::Result<()> {
         // SAFETY: killpg has no memory-safety preconditions.

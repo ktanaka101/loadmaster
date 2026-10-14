@@ -150,11 +150,12 @@ fn unlimited_resources(repo: &RepoConfig, machine: &MachineConfig) -> Vec<String
         .collect()
 }
 
-/// A job waiting for a resource still sets aside its cores, so that later
-/// jobs cannot delay it once the resource is free; if they do not fit beside
-/// the run that holds the resource, it holds back the cores of every job
-/// behind it. Next to a long run, either can keep other tasks out. One
-/// warning per waiting task, since its weight is what can be changed.
+/// A job waiting for a resource sets aside the cores that the run holding
+/// it does not free when it ends, so that later jobs cannot delay it once
+/// the resource is free; if they do not fit beside that run, it holds back
+/// the cores of every job behind it. Next to a long run, either can keep
+/// other tasks out. One warning per waiting task, since its weight is what
+/// can be changed.
 fn set_aside_while_waiting(repo: &RepoConfig, machine: &MachineConfig) -> Vec<String> {
     // In u64: sums of u32 amounts cannot overflow it.
     let capacity = u64::from(machine.capacity);
@@ -205,19 +206,29 @@ fn set_aside_while_waiting(repo: &RepoConfig, machine: &MachineConfig) -> Vec<St
                     }
                     let h = weight(holder);
                     let short_of_cores = h + w > capacity;
-                    let free = if short_of_cores { 0 } else { capacity - h - w };
+                    let set_aside = w.saturating_sub(h);
+                    let free = if short_of_cores {
+                        0
+                    } else {
+                        capacity - h - set_aside
+                    };
                     // Tasks that would run beside the holder but for the
                     // waiting run's cores: not ones that use this resource
                     // (the waiting run, short of it, holds it back from
                     // everyone behind), nor ones that some other resource
-                    // keeps out anyway.
+                    // keeps out anyway: one the waiting run is short of too,
+                    // or one it fits in, where it sets aside only what the
+                    // holder does not free.
                     let fits_beside = |task: &Task, limit: &dyn Fn(&str) -> Option<u64>| {
                         task.uses.keys().all(|other| {
                             limit(other).is_none_or(|l| {
-                                amount(holder, other).min(l)
-                                    + amount(waiter, other).min(l)
-                                    + amount(task, other).min(l)
-                                    <= l
+                                let held = amount(holder, other).min(l);
+                                let wanted = amount(waiter, other).min(l);
+                                held + wanted <= l
+                                    && held
+                                        + wanted.saturating_sub(held)
+                                        + amount(task, other).min(l)
+                                        <= l
                             })
                         })
                     };
@@ -252,7 +263,10 @@ fn set_aside_while_waiting(repo: &RepoConfig, machine: &MachineConfig) -> Vec<St
                              cores of every job behind it"
                         )
                     } else {
-                        format!("its {w} cores are set aside, leaving {free} of {capacity}")
+                        format!(
+                            "it sets aside the {set_aside} of its {w} cores that the holder does \
+                             not free when it ends, leaving {free} of {capacity}"
+                        )
                     };
                     clauses.push(format!(
                         "while {holder} holds it, {effect}, so {} {verb} too",
@@ -349,8 +363,10 @@ mod tests {
 
     #[test]
     fn a_run_waiting_for_a_resource_can_crowd_out_other_tasks() {
-        // clew's case: a long UI capture holds the browser; a unit run that
-        // needs it sets aside 3 cores, and the 2-core checks stop.
+        // clew's case: a long UI capture holds the browser. A unit run that
+        // needs it counts on the capture's cores and sets none aside; a
+        // capture waiting for it beside a unit run sets aside the 5 cores the
+        // unit run does not free, and a 5-core check stops.
         let text = "[resources.browser]\ncapacity = 1\n\n".to_owned()
             + &task("ui", 8, "browser = 1")
             + &task("unit", 3, "browser = 1")
@@ -363,16 +379,19 @@ mod tests {
                 "a `ui` run (weight 8) waiting for `browser` keeps other tasks out: while \
                  another `ui` run holds it, 8 + 8 cores are more than 12: it holds back the \
                  cores of every job behind it, so `lint` (1) and `types` (2) wait too; while \
-                 `unit` (weight 3) holds it, its 8 cores are set aside, leaving 1 of 12, so \
-                 `big` (5) and `types` (2) wait too. A lower weight for `ui` leaves them room",
-                // `big` does not fit beside `ui` anyway, and `lint` still fits.
-                "a `unit` run (weight 3) waiting for `browser` keeps other tasks out: while \
-                 `ui` (weight 8) holds it, its 3 cores are set aside, leaving 1 of 12, so \
-                 `types` (2) waits too. A lower weight for `unit` leaves them room",
+                 `unit` (weight 3) holds it, it sets aside the 5 of its 8 cores that the holder \
+                 does not free when it ends, leaving 4 of 12, so `big` (5) waits too. A lower \
+                 weight for `ui` leaves them room",
             ]
         );
-        let lighter = text.replace("weight = 3", "weight = 1");
-        assert_eq!(warnings_of(&lighter, 12).len(), 1, "only `ui`'s is left");
+        // A heavier unit run frees more, and the capture waiting beside it
+        // sets aside less.
+        let heavier = text.replace("weight = 3", "weight = 4");
+        assert!(
+            warnings_of(&heavier, 12)[0].contains("the 4 of its 8 cores"),
+            "{:?}",
+            warnings_of(&heavier, 12)
+        );
         // Measure-only admits everything at once.
         let mut measuring = machine(12);
         measuring.measure_only = true;
@@ -384,17 +403,59 @@ mod tests {
     }
 
     #[test]
-    fn runs_of_one_task_can_crowd_out_others_in_a_checkout() {
+    fn runs_of_one_task_set_no_cores_aside_for_each_other() {
+        // One `e2e` run waits for the other's db, and gets its cores when
+        // that one ends: `test` fits beside them, unless the two together are
+        // more than the capacity.
         let text = "[resources.db]\nper_checkout = 1\n\n".to_owned()
             + &task("e2e", 4, "db = 1")
-            + &task("test", 4, "");
+            + &task("test", 2, "");
+        assert!(warnings_of(&text, 8).is_empty());
         assert_eq!(
-            warnings_of(&text, 8),
+            warnings_of(&text.replace("weight = 4", "weight = 5"), 8),
             [
-                "a `e2e` run (weight 4) waiting for `db` in its checkout keeps other tasks out: \
-                 while another `e2e` run holds it, its 4 cores are set aside, leaving 0 of 8, \
-                 so `test` (4) waits too. A lower weight for `e2e` leaves them room"
+                "a `e2e` run (weight 5) waiting for `db` in its checkout keeps other tasks out: \
+                 while another `e2e` run holds it, 5 + 5 cores are more than 8: it holds back \
+                 the cores of every job behind it, so `test` (2) waits too. A lower weight for \
+                 `e2e` leaves them room"
             ]
+        );
+    }
+
+    #[test]
+    fn what_the_holder_frees_of_another_resource_is_not_set_aside_either() {
+        // `b` waits for the browser that `a` holds, and counts on the 2 gpus
+        // `a` frees: `c` fits beside them on gpus, and only the 5 cores `b`
+        // sets aside keep it out.
+        let text = "[resources.browser]\ncapacity = 1\n\n[resources.gpu]\ncapacity = 3\n\n"
+            .to_owned()
+            + &task("a", 3, "browser = 1, gpu = 2")
+            + &task("b", 8, "browser = 1, gpu = 1")
+            + &task("c", 5, "gpu = 1");
+        let warnings = warnings_of(&text, 12);
+        assert!(
+            warnings.iter().any(|w| w.starts_with(
+                "a `b` run (weight 8) waiting for `browser` keeps other tasks out: while `a` \
+                 (weight 3) holds it, it sets aside the 5 of its 8 cores that the holder does \
+                 not free when it ends, leaving 4 of 12, so `c` (5) waits too"
+            )),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_task_kept_out_by_what_the_waiting_run_is_short_of_is_not_counted() {
+        // `b` waits for the browser and for gpus too, beside `a`: no job
+        // behind it may use a gpu, whatever its weight.
+        let text = "[resources.browser]\ncapacity = 1\n\n[resources.gpu]\ncapacity = 3\n\n"
+            .to_owned()
+            + &task("a", 3, "browser = 1, gpu = 2")
+            + &task("b", 8, "browser = 1, gpu = 2")
+            + &task("c", 5, "gpu = 1");
+        let warnings = warnings_of(&text, 12);
+        assert!(
+            !warnings.iter().any(|w| w.contains("`c` (5)")),
+            "{warnings:?}"
         );
     }
 
@@ -410,18 +471,21 @@ mod tests {
 
     #[test]
     fn a_task_kept_out_in_the_holders_checkout_counts_from_others() {
-        // `report` needs the gpu, which `e2e` holds within its checkout:
-        // only runs from other checkouts are kept out by cores alone.
+        // `report` needs the gpu, which `smoke` and the waiting `e2e` run
+        // hold within the checkout: only runs from other checkouts are kept
+        // out by cores alone.
         let text = "[resources.db]\ncapacity = 1\n\n[resources.gpu]\nper_checkout = 1\n\n"
             .to_owned()
             + &task("e2e", 4, "db = 1, gpu = 1")
-            + &task("report", 1, "gpu = 1");
+            + &task("smoke", 1, "db = 1, gpu = 1")
+            + &task("report", 5, "gpu = 1");
         assert_eq!(
             warnings_of(&text, 8),
             [
-                "a `e2e` run (weight 4) waiting for `db` keeps other tasks out: while another \
-              `e2e` run holds it, its 4 cores are set aside, leaving 0 of 8, so `report` (1, \
-              from other checkouts) waits too. A lower weight for `e2e` leaves them room"
+                "a `e2e` run (weight 4) waiting for `db` keeps other tasks out: while `smoke` \
+                 (weight 1) holds it, it sets aside the 3 of its 4 cores that the holder does \
+                 not free when it ends, leaving 4 of 8, so `report` (5, from other checkouts) \
+                 waits too. A lower weight for `e2e` leaves them room"
             ]
         );
     }

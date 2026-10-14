@@ -403,7 +403,7 @@ fn wait_turn(
                 }
                 if last_report.is_none_or(|at| at.elapsed() >= REPORT_INTERVAL) {
                     say!(
-                        "loadmaster: waiting to run `{}` (weight {}, {}) for {}{}",
+                        "loadmaster: waiting to run `{}` (weight {}, {}) for {}{}{}",
                         task.name,
                         task.weight,
                         format_ahead(wait.ahead),
@@ -412,6 +412,8 @@ fn wait_turn(
                             .map_or(String::new(), |reserved| format!(
                                 "; {reserved} set aside for it meanwhile"
                             )),
+                        wait.counts_on_text()
+                            .map_or(String::new(), |counted| format!("; it counts on {counted}")),
                     );
                     last_report = Some(Instant::now());
                 }
@@ -525,10 +527,10 @@ fn run_admitted(
     warn_of_processes_left(task, &child.group, &mut descendants);
     let handed_over = if child.group.is_alive() {
         say!(
-            "loadmaster: `{}` exited, but processes it started are still running \
-             (process group {}); its slot stays taken until they exit",
+            "loadmaster: `{}` exited, but processes it started are still running in its \
+             process group ({}); its slot stays taken until they exit",
             task.name,
-            child.group.pgid
+            name_group(&child.group)
         );
         // Signals that arrived meanwhile still go to them, and whether they
         // had the stop signal is recorded, in one step with the handover, so
@@ -578,27 +580,43 @@ fn warn_of_processes_left(
     if left.is_empty() {
         return;
     }
-    const SHOWN: usize = 3;
-    let mut names: Vec<String> = left
-        .iter()
-        .take(SHOWN)
-        .map(|p| format!("{} `{}`", p.pid, p.name))
-        .collect();
-    if left.len() > SHOWN {
-        names.push(format!("{} more", left.len() - SHOWN));
-    }
-    let last = names.pop().unwrap_or_default();
-    let list = if names.is_empty() {
-        last
-    } else {
-        format!("{} and {last}", names.join(", "))
-    };
+    let list = name_processes(&left);
     say!(
         "loadmaster: warning: `{}` exited, but processes it started outside its process group \
          are still running ({list}); nothing holds a slot for them, and they may hold ports or \
          files that a later run needs",
         task.name
     );
+}
+
+/// "12345 `node`, 12346 `node` and 2 more".
+fn name_processes(processes: &[process::Descendant]) -> String {
+    const SHOWN: usize = 3;
+    let mut names: Vec<String> = processes
+        .iter()
+        .take(SHOWN)
+        .map(|p| format!("{} `{}`", p.pid, p.name))
+        .collect();
+    if processes.len() > SHOWN {
+        names.push(format!("{} more", processes.len() - SHOWN));
+    }
+    let last = names.pop().unwrap_or_default();
+    if names.is_empty() {
+        last
+    } else {
+        format!("{} and {last}", names.join(", "))
+    }
+}
+
+/// The processes holding a slot whose task's command exited: its process
+/// group's members, or the group if none can be seen.
+fn name_group(group: &process::ProcessGroup) -> String {
+    let members = group.members();
+    if members.is_empty() {
+        format!("process group {}", group.pgid)
+    } else {
+        format!("process group {}: {}", group.pgid, name_processes(&members))
+    }
 }
 
 /// The machine's CPUs busy since `before`, on average, in cores (one
@@ -902,12 +920,14 @@ fn why_jobs_wait(jobs: &[Job], outside: Option<queue::Outside>) -> String {
             Some(match admission {
                 Admission::Admitted => format!("  {who} is about to start\n"),
                 Admission::Waiting(wait) => format!(
-                    "  {who} waits for {}{}\n",
+                    "  {who} waits for {}{}{}\n",
                     wait.waits_for(),
                     wait.reserves_text()
                         .map_or(String::new(), |reserved| format!(
                             "; sets aside {reserved} meanwhile"
-                        ))
+                        )),
+                    wait.counts_on_text()
+                        .map_or(String::new(), |counted| format!("; counts on {counted}"))
                 ),
             })
         })
@@ -957,12 +977,27 @@ fn jobs_table(jobs: &[Job]) -> String {
         .map(String::from),
     ];
     let (mut orphaned, mut parked) = (false, false);
+    // Jobs whose task's command exited, and what holds their slot.
+    let mut lingering = Vec::new();
     for job in jobs {
         let (state, at) = match job.state {
-            JobState::Running if job.is_orphaned() => {
-                orphaned = true;
-                ("orphaned", job.started_at)
-            }
+            // Its loadmaster is gone, or handed the slot over when the task's
+            // command exited and left processes in its group.
+            JobState::Running if job.is_orphaned() => match job.child {
+                Some(group) if group.leader_exited() => {
+                    lingering.push(format!(
+                        "  #{} `{}`: {}\n",
+                        job.id,
+                        job.task,
+                        name_group(&group)
+                    ));
+                    ("lingering", job.started_at)
+                }
+                _ => {
+                    orphaned = true;
+                    ("orphaned", job.started_at)
+                }
+            },
             JobState::Running => ("running", job.started_at),
             JobState::Waiting => ("waiting", Some(job.enqueued_at)),
             JobState::Parked => {
@@ -1013,8 +1048,14 @@ fn jobs_table(jobs: &[Job]) -> String {
         out += "\n";
     }
     if orphaned {
-        out += "\norphaned: loadmaster is gone but the task's process group is still running; \
-                the slot is held until it exits\n";
+        out += "\norphaned: loadmaster is gone but the task is still running; the slot is held \
+                until its process group exits\n";
+    }
+    if !lingering.is_empty() {
+        out += "\nlingering: the task's command exited, but processes it started in its process \
+                group still run, and hold the slot until they exit (`loadmaster cancel ID` stops \
+                them):\n";
+        out += &lingering.concat();
     }
     if parked {
         out += &format!(

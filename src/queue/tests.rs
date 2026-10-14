@@ -41,6 +41,9 @@ fn said(admission: Admission) -> String {
             if let Some(reserved) = wait.reserves_text() {
                 text += &format!("; sets aside {reserved}");
             }
+            if let Some(counted) = wait.counts_on_text() {
+                text += &format!("; counts on {counted}");
+            }
             text
         }
     }
@@ -641,39 +644,144 @@ fn a_job_short_of_a_resource_holds_back_only_that_resource() {
     assert_eq!(
         said(decide(&jobs, 3, None).unwrap()),
         "0 ahead; waits for `db` (2 of 2 in use by #1 `job1` and #2 `job2`); \
-         sets aside 2 cores and `db` in its checkout"
+         sets aside `db` in its checkout; \
+         counts on 2 cores that each of #1 `job1` and #2 `job2` frees when it ends"
     );
     assert!(admitted(&jobs, 4), "a lint needs no db");
     assert!(!admitted(&jobs, 5), "job 3 is first in line for a db");
 }
 
-#[test]
-fn a_job_waiting_for_a_resource_says_what_it_sets_aside() {
-    // A long UI capture holds the one browser; a unit run that needs it too
-    // sets its cores aside while it waits, and a lint no longer fits.
-    let browser = |amount| Use {
+fn browser(amount: u32) -> Use {
+    Use {
         name: "browser".into(),
         amount,
         capacity: Some(1),
         per_checkout: None,
-    };
+    }
+}
+
+#[test]
+fn a_job_waiting_for_what_a_running_job_holds_counts_on_its_end() {
+    // A long UI capture holds the one browser. A unit run that needs it too
+    // can only start once the capture ends, which frees 5 cores: it need not
+    // set aside its 2 meanwhile, and a lint behind it starts (clew, 0.9.0).
     let mut jobs = vec![
         job(1, Running, 5, vec![browser(1)], "/a"),
         job(2, Waiting, 2, vec![browser(1)], "/b"),
-        job(3, Waiting, 2, vec![], "/c"),
+        job(3, Waiting, 3, vec![], "/c"),
     ];
     jobs[0].task = "ui".into();
     jobs[1].task = "unit".into();
     jobs[2].task = "lint".into();
-    let said_for = |id| said(decide(&jobs, id, None).unwrap());
+    let said_for = |jobs: &[Job], id| said(decide(jobs, id, None).unwrap());
     assert_eq!(
-        said_for(2),
-        "0 ahead; waits for `browser` (1 of 1 in use by #1 `ui`); sets aside 2 cores"
+        said_for(&jobs, 2),
+        "0 ahead; waits for `browser` (1 of 1 in use by #1 `ui`); \
+         counts on 2 cores that #1 `ui` frees when it ends"
     );
+    assert!(admitted(&jobs, 3));
+    // A capture that frees only 1 core leaves the unit run 1 to set aside.
+    jobs[0].weight = 1;
+    jobs[0].granted = Some(1);
     assert_eq!(
-        said_for(3),
-        "1 ahead; waits for 2 cores (3 free, but 2 set aside for #2 `unit`)"
+        said_for(&jobs, 2),
+        "0 ahead; waits for `browser` (1 of 1 in use by #1 `ui`); sets aside 1 core; \
+         counts on 1 core that #1 `ui` frees when it ends"
     );
+}
+
+#[test]
+fn a_job_that_a_waiting_job_ahead_may_let_in_counts_on_nothing() {
+    // The unit run waits for the browser that job 2, ahead of it, waits for
+    // too: job 2 may leave the line instead, freeing nothing, and let it in.
+    let jobs = [
+        job(1, Running, 1, vec![], "/a"),
+        job(2, JobState::Parked, 1, vec![browser(1)], "/a"),
+        job(3, Waiting, 2, vec![browser(1)], "/b"),
+    ];
+    assert_eq!(
+        said(decide(&jobs, 3, None).unwrap()),
+        "1 ahead; waits for `browser` (1 free, but 1 set aside for #2 `job2`); \
+         sets aside 2 cores"
+    );
+}
+
+#[test]
+fn a_job_counts_on_the_end_of_a_job_ahead_that_has_not_started_too() {
+    // The capture holds the browser, and job 2, ahead of the unit run, waits
+    // for it too: job 2 may start first and end last, freeing what it will
+    // start with, at least 1 core while CPU outside the queue can lower that.
+    // Job 2 counts on 2 of the capture's 5 cores itself.
+    let mut jobs = vec![
+        job(1, Running, 5, vec![browser(1)], "/a"),
+        job(2, Waiting, 2, vec![browser(1)], "/b"),
+        job(3, Waiting, 3, vec![browser(1)], "/c"),
+    ];
+    assert_eq!(
+        said(decide(&jobs, 3, None).unwrap()),
+        "1 ahead; waits for `browser` (behind #2 `job2`, which waits for it too); \
+         sets aside 2 cores; counts on 1 core that each of #1 `job1` and #2 `job2` frees \
+         when it ends"
+    );
+    // Without adapting, it starts with its weight, 2 cores, and the capture
+    // has 3 left to free.
+    jobs[1].adapt_cpu = false;
+    assert_eq!(
+        said(decide(&jobs, 3, None).unwrap()),
+        "1 ahead; waits for `browser` (behind #2 `job2`, which waits for it too); \
+         sets aside 1 core; counts on 2 cores that each of #1 `job1` and #2 `job2` frees \
+         when it ends"
+    );
+}
+
+#[test]
+fn a_job_short_of_cpu_that_the_load_outside_may_free_counts_on_nothing() {
+    // The capacity is 8 of 14 cores; 9 busy outside the queue lower the CPU
+    // limit to 5. Job 2 needs 4 cores next to job 1's 2, which the load going
+    // down would let in too: it sets aside its `db`.
+    let outside = Some(Outside {
+        busy: 9.0,
+        cores: 14,
+    });
+    let jobs = [
+        job(1, Running, 2, vec![db(1)], "/a"),
+        job(2, Waiting, 4, vec![db(1)], "/b"),
+    ];
+    let Admission::Waiting(wait) = decide(&jobs, 2, outside).unwrap() else {
+        panic!("job 2 does not fit");
+    };
+    assert_eq!(wait.counts_on, None);
+    assert_eq!(
+        wait.reserves_text().as_deref(),
+        Some("`db` and `db` in its checkout")
+    );
+}
+
+#[test]
+fn what_one_end_frees_is_counted_on_once() {
+    // Job 1 holds the browser and the db's checkout slot, and frees 4 cores.
+    // Job 2 waits for the browser and job 3 for the slot, 3 cores each: job 2
+    // counts on 3 of them, which leaves job 3 only 1.
+    let jobs = [
+        job(1, Running, 4, vec![browser(1), db(1)], "/a"),
+        job(2, Waiting, 3, vec![browser(1)], "/b"),
+        job(3, Waiting, 3, vec![db(1)], "/a"),
+        job(4, Waiting, 2, vec![], "/c"),
+    ];
+    assert_eq!(
+        said(decide(&jobs, 3, None).unwrap()),
+        "1 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
+         sets aside 2 cores; counts on 1 core and `db` that #1 `job1` frees when it ends"
+    );
+    // 4 running and 2 set aside for job 3: job 4 fits in the 2 left of 8.
+    assert!(admitted(&jobs, 4));
+    let jobs = [
+        jobs[0].clone(),
+        jobs[1].clone(),
+        jobs[2].clone(),
+        job(4, Waiting, 3, vec![], "/c"),
+    ];
+    assert!(!admitted(&jobs, 4));
 }
 
 #[test]
@@ -707,7 +815,7 @@ fn what_a_waiting_job_sets_aside_includes_unlimited_resources() {
     assert_eq!(
         said(decide(&jobs, 2, None).unwrap()),
         "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
-         sets aside 1 core, `db` and `gpu`"
+         sets aside `gpu`; counts on 1 core and `db` that #1 `job1` frees when it ends"
     );
     assert_eq!(
         said(decide(&jobs, 3, None).unwrap()),
@@ -728,13 +836,14 @@ fn a_job_short_of_cpu_holds_back_everyone_behind_it() {
 #[test]
 fn jobs_behind_leave_a_waiting_job_its_share() {
     let jobs = [
-        job(1, Running, 2, vec![db(1)], "/a"),
-        job(2, Running, 2, vec![db(1)], "/b"),
-        // Short of a db; it fits on CPU, so 2 cores are set aside for it.
+        job(1, Running, 1, vec![db(1)], "/a"),
+        job(2, Running, 1, vec![db(1)], "/b"),
+        // Short of a db; it fits on CPU, and counts on 1 core from whichever
+        // of jobs 1 and 2 ends, so 1 core is set aside for it.
         job(3, Waiting, 2, vec![db(1)], "/c"),
-        job(4, Waiting, 2, vec![], "/a"),
-        // 4 running + 2 set aside for job 3 + 2 for job 4, about to start.
-        job(5, Waiting, 1, vec![], "/a"),
+        job(4, Waiting, 4, vec![], "/a"),
+        // 2 running + 1 set aside for job 3 + 4 for job 4, about to start.
+        job(5, Waiting, 2, vec![], "/a"),
     ];
     assert!(admitted(&jobs, 4));
     assert!(!admitted(&jobs, 5));
@@ -755,11 +864,11 @@ fn per_checkout_limits_count_only_their_checkout() {
     assert_eq!(
         said(decide(&same_checkout, 2, None).unwrap()),
         "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
-         sets aside 2 cores and `db`"
+         counts on 2 cores and `db` that #1 `job1` frees when it ends"
     );
-    // Job 2 still sets aside a machine-wide db: the rule cannot know that
-    // job 1 will free both, and it never risks delaying a job ahead.
-    assert!(!admitted(&same_checkout, 3));
+    // Job 2 can only start once job 1 ends, which frees a machine-wide db
+    // too: job 3, of another checkout, takes the one free meanwhile.
+    assert!(admitted(&same_checkout, 3));
 }
 
 #[test]
@@ -895,6 +1004,13 @@ fn assert_within_limits(jobs: &[Job]) {
     }
 }
 
+thread_local! {
+    /// How many waiting jobs `assert_explained` found counting on what a job
+    /// ahead frees, rather than setting it aside: the simulations must take
+    /// that path too.
+    static COUNTED_ON: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Once no job can start, `explain` says so for every job, giving reasons,
 /// and agrees with the rule as each job applies it.
 fn assert_explained(jobs: &[Job], outside: Option<Outside>) {
@@ -907,9 +1023,22 @@ fn assert_explained(jobs: &[Job], outside: Option<Outside>) {
         assert_eq!(admission, decide(jobs, id, outside).unwrap());
         match admission {
             Admission::Admitted => panic!("job {id} could start but did not"),
-            Admission::Waiting(wait) => assert!(!wait.short.is_empty(), "job {id}"),
+            Admission::Waiting(wait) => {
+                assert!(!wait.short.is_empty(), "job {id}");
+                if wait.counts_on.is_some() {
+                    COUNTED_ON.set(COUNTED_ON.get() + 1);
+                }
+            }
         }
     }
+}
+
+/// Runs `simulations`, and checks that some waiting job in them counted on
+/// what a job ahead frees.
+fn counting_on_ends(simulations: impl FnOnce()) {
+    COUNTED_ON.set(0);
+    simulations();
+    assert!(COUNTED_ON.get() > 0, "no job counted on an end");
 }
 
 /// xorshift64*: deterministic, no dependency needed.
@@ -941,6 +1070,10 @@ fn random_workload(rng: &mut Rng, jobs: usize, resources: bool) -> Vec<Arrival> 
             if resources && rng.below(3) == 0 {
                 uses.push(mem(1 + rng.below(6)));
             }
+            // One of it, as for a browser that a long UI capture holds.
+            if resources && rng.below(4) == 0 {
+                uses.push(browser(1));
+            }
             Arrival {
                 at,
                 duration: 1 + rng.below(6),
@@ -954,6 +1087,10 @@ fn random_workload(rng: &mut Rng, jobs: usize, resources: bool) -> Vec<Arrival> 
 
 #[test]
 fn no_job_is_delayed_by_jobs_that_got_in_line_after_it() {
+    counting_on_ends(no_job_is_delayed);
+}
+
+fn no_job_is_delayed() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for round in 0..300 {
         let arrivals = random_workload(&mut rng, 12, true);
@@ -979,6 +1116,10 @@ fn no_job_is_delayed_by_jobs_that_got_in_line_after_it() {
 
 #[test]
 fn cpu_busy_outside_delays_no_job_for_jobs_behind_it_and_stalls_none() {
+    counting_on_ends(cpu_busy_outside_delays_no_job);
+}
+
+fn cpu_busy_outside_delays_no_job() {
     // The CPU outside the queue changes on its own, sometimes taking all
     // 14 cores: every job still starts (or `simulate` panics), and still
     // when it would without the jobs that got in line after it.

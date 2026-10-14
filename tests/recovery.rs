@@ -215,6 +215,25 @@ fn slot_stays_taken_while_processes_the_task_left_behind_run() {
     assert_eq!(snapshot.used(), 4);
     assert!(snapshot.jobs[0].is_orphaned());
     let child = snapshot.jobs[0].child.unwrap();
+    // Named, here and in `status`, which tells the job from one whose
+    // loadmaster is gone.
+    let group = format!("process group {}: ", child.pgid);
+    assert!(
+        stderr(&output).contains(&format!("in its process group ({group}")),
+        "{}",
+        stderr(&output)
+    );
+    let status = stdout(&sandbox.run(&["status"]));
+    assert!(status.contains(" lingering "), "{status}");
+    assert!(!status.contains("orphaned"), "{status}");
+    assert!(
+        status.contains(&format!(
+            "\nlingering: the task's command exited, but processes it started in its process \
+             group still run, and hold the slot until they exit (`loadmaster cancel ID` stops \
+             them):\n  #1 `bg`: {group}"
+        )),
+        "{status}"
+    );
 
     sandbox.release("left");
     wait_until("the background job to exit", || !child.is_alive());
