@@ -204,12 +204,13 @@ impl<'a> Start<'a> {
 /// it depends only on the jobs added so far, which are ahead of the job
 /// judged.
 ///
-/// The dimensions that could bind (the jobs could use more than the room)
-/// are tracked, and once one could, every other with little room too: the
-/// most of each is then over the sets that fit, not the sum of jobs that may
-/// not run together. A dimension whose room is large, or beyond the state
-/// budget, is bounded by the sum of the jobs' largest amounts instead, which
-/// only makes the bound larger.
+/// The states are the usage of the dimensions that could bind (the jobs could
+/// use more than the room) and have little room, within a budget. Any other
+/// dimension is bounded by the sum of the jobs' largest amounts and the room,
+/// which only makes the bound larger; where that is not enough, [`most`]
+/// works out the most over the sets that fit on the tracked dimensions.
+///
+/// [`most`]: Beside::most
 struct Beside<'a> {
     x: usize,
     x_amounts: Amounts<'a>,
@@ -297,6 +298,7 @@ impl<'a> Beside<'a> {
     /// Job `i` may be beside X from now on.
     fn add(&mut self, infos: &[Info<'a>], i: usize) {
         let mut rebuild = false;
+        let mut grew = false;
         for (&d, &own) in &infos[i].records {
             if self.x_limits.contains_key(&d) {
                 continue;
@@ -310,9 +312,15 @@ impl<'a> Beside<'a> {
                 // job too big before may fit now: work it out again. Else
                 // only a job that used it now records less than it.
                 Some(before) if before != limit => {
-                    rebuild |= self.tracked.iter().any(|&(t, _, _)| t == d)
-                        || self.unfit.iter().any(|&u| self.fits_alone(infos, u));
+                    let tracked = self.tracked.iter().any(|&(t, _, _)| t == d);
+                    rebuild |= tracked || self.unfit.iter().any(|&u| self.fits_alone(infos, u));
                     self.disagree |= self.sums.contains_key(&d);
+                    // One that could bind, left out for the budget, may fit in
+                    // it now.
+                    grew |= !tracked
+                        && self.room(d).is_some_and(|room| {
+                            room <= TRACKED_ROOM && self.sums.get(&d).is_some_and(|&sum| sum > room)
+                        });
                 }
                 _ => {}
             }
@@ -321,31 +329,32 @@ impl<'a> Beside<'a> {
         if rebuild {
             return self.rebuild(infos);
         }
-        if !self.fits_alone(infos, i) {
+        let fits = self.fits_alone(infos, i);
+        if fits {
+            self.count(infos, i);
+        } else {
             self.unfit.push(i);
-            return;
         }
-        self.count(infos, i);
-        // A dimension with little room that is not tracked yet, or that now
-        // could bind: track it if it, or another, could, and the budget
-        // allows.
-        let changed = infos[i].amounts.iter().any(|(&d, &(_, hi))| {
-            self.room(d).is_some_and(|room| {
-                room <= TRACKED_ROOM
-                    && (!self.tracked.iter().any(|&(t, _, _)| t == d)
-                        || self
-                            .sums
-                            .get(&d)
-                            .is_some_and(|&sum| sum > room && sum - hi <= room))
-            })
-        });
+        // The dimensions to track are worked out from the jobs added alone,
+        // whatever their order: they may change when a room grew, or when a
+        // dimension not tracked now could bind.
+        let changed = grew
+            || fits
+                && infos[i].amounts.keys().any(|&d| {
+                    !self.tracked.iter().any(|&(t, _, _)| t == d)
+                        && self.room(d).is_some_and(|room| {
+                            room <= TRACKED_ROOM && self.sums.get(&d).is_some_and(|&sum| sum > room)
+                        })
+                });
         if changed {
             let tracked: Vec<Dim> = self.tracked.iter().map(|&(d, _, _)| d).collect();
             if self.wanted_tracked() != tracked {
                 return self.rebuild(infos);
             }
         }
-        self.step(infos, i);
+        if fits {
+            self.step(infos, i);
+        }
     }
 
     /// Counts job `i`, which fits beside X on its own, in the sums, the
@@ -367,25 +376,21 @@ impl<'a> Beside<'a> {
         }
     }
 
-    /// The dimensions to track, bounded and with little room: those the jobs
-    /// added could fill, then, if there is one, the others; smallest room
-    /// first, within the state budget.
+    /// The dimensions to track: bounded, with little room, that the jobs
+    /// added could fill, smallest room first, within the state budget.
     fn wanted_tracked(&self) -> Vec<Dim<'a>> {
-        let mut dims: Vec<(bool, u64, Dim)> = self
+        let mut dims: Vec<(u64, Dim)> = self
             .sums
             .iter()
             .filter_map(|(&d, &sum)| {
                 let room = self.room(d)?;
-                (room <= TRACKED_ROOM).then_some((sum <= room, room, d))
+                (room <= TRACKED_ROOM && sum > room).then_some((room, d))
             })
             .collect();
-        if dims.iter().all(|&(fits, _, _)| fits) {
-            return Vec::new();
-        }
         dims.sort();
         let mut size: u64 = 1;
         let mut wanted = Vec::new();
-        for (_, room, d) in dims {
+        for (room, d) in dims {
             let next = size.saturating_mul(room + 1);
             if next <= STATES {
                 wanted.push(d);
@@ -435,57 +440,82 @@ impl<'a> Beside<'a> {
         self.added = added;
     }
 
-    /// Adds job `i` to the sets reached so far. Only CPU can be a range.
-    fn step(&mut self, infos: &[Info], i: usize) {
-        if self.tracked.is_empty() {
-            return;
-        }
-        let amounts = &infos[i].amounts;
-        let mut fixed = Vec::with_capacity(self.tracked.len());
-        let mut range = None;
+    /// How a job with `amounts` moves a state, on the tracked dimensions: by
+    /// its fixed amounts, as (stride, room, amount), and by any amount within
+    /// its range on the one it has one on (only CPU can be a range).
+    fn moves(&self, amounts: &Amounts) -> Moves {
+        let mut moves = Moves {
+            fixed: Vec::with_capacity(self.tracked.len()),
+            range: None,
+        };
         for &(d, room, stride) in &self.tracked {
             let (lo, hi) = amounts.get(&d).copied().unwrap_or((0, 0));
             let room = room as usize;
             if lo == hi {
-                fixed.push((stride, room, lo as usize));
+                moves.fixed.push((stride, room, lo as usize));
             } else {
-                range = Some((stride, room, lo as usize, hi as usize));
+                moves.range = Some((stride, room, lo as usize, hi as usize));
             }
         }
-        let before = self.seen.len();
-        for s in 0..before {
+        moves
+    }
+
+    /// Adds job `i` to the sets reached so far.
+    fn step(&mut self, infos: &[Info], i: usize) {
+        if self.tracked.is_empty() {
+            return;
+        }
+        let moves = self.moves(&infos[i].amounts);
+        let mut next = Vec::new();
+        for s in 0..self.seen.len() {
             let state = self.seen[s];
-            let mut base = state;
-            let fits = fixed.iter().all(|&(stride, room, amount)| {
-                base += amount * stride;
-                state / stride % (room + 1) + amount <= room
-            });
-            if !fits {
-                continue;
-            }
-            let (stride, room, lo, hi) = range.unwrap_or((1, 0, 0, 0));
-            let at = if range.is_some() {
-                state / stride % (room + 1)
-            } else {
-                0
-            };
-            for v in lo..=hi {
-                if range.is_some() && at + v > room {
-                    break;
-                }
-                let next = base + v * stride * usize::from(range.is_some());
-                if self.reached[next].is_none() {
-                    self.reached[next] = Some((state, i));
-                    self.seen.push(next);
+            moves.from(state, &mut next);
+            for &n in &next {
+                if self.reached[n].is_none() {
+                    self.reached[n] = Some((state, i));
+                    self.seen.push(n);
                     for (t, &(_, room, stride)) in self.tracked.iter().enumerate() {
-                        let value = (next / stride % (room as usize + 1)) as u64;
+                        let value = (n / stride % (room as usize + 1)) as u64;
                         if value > self.best[t].0 {
-                            self.best[t] = (value, next);
+                            self.best[t] = (value, n);
                         }
                     }
                 }
             }
         }
+    }
+
+    /// The most of `dim`, which is not tracked, that the jobs added could
+    /// use in a set that fits on the tracked dimensions, worked out from them
+    /// alone: tighter than its sum where they could not all run together.
+    fn most(&self, infos: &[Info], dim: Dim) -> u64 {
+        let mut values: Vec<Option<u64>> = vec![None; self.reached.len()];
+        values[0] = Some(0);
+        let mut seen = vec![0];
+        let mut next = Vec::new();
+        let mut reach: Vec<(usize, u64)> = Vec::new();
+        for &i in self.added.iter().filter(|&&i| self.fits_alone(infos, i)) {
+            let moves = self.moves(&infos[i].amounts);
+            let amount = infos[i].amounts.get(&dim).map_or(0, |&(_, hi)| hi);
+            // From the sets before this job only: it is added to each once.
+            reach.clear();
+            for &state in &seen {
+                let value = values[state].expect("a state reached") + amount;
+                moves.from(state, &mut next);
+                reach.extend(next.iter().map(|&n| (n, value)));
+            }
+            for &(n, value) in &reach {
+                match values[n] {
+                    None => {
+                        values[n] = Some(value);
+                        seen.push(n);
+                    }
+                    Some(kept) if kept < value => values[n] = Some(value),
+                    Some(_) => {}
+                }
+            }
+        }
+        seen.iter().filter_map(|&s| values[s]).max().unwrap_or(0)
     }
 
     /// The dimensions on which the jobs beside X could be too many for the
@@ -497,7 +527,21 @@ impl<'a> Beside<'a> {
             .map(|(&d, _)| d)
     }
 
-    /// The most the jobs added so far could use of `dim` beside X.
+    /// Whether `dim` is bounded by its sum alone while others are tracked,
+    /// so that [`Beside::most`] may find less.
+    fn untracked(&self, dim: Dim) -> bool {
+        !self.tracked.is_empty() && !self.tracked.iter().any(|&(d, _, _)| d == dim)
+    }
+
+    /// The most that could be in use of `dim`, not tracked, when X starts:
+    /// X's amount and [`Beside::most`], within the room.
+    fn used(&self, infos: &[Info], dim: Dim) -> u64 {
+        let most = self.most(infos, dim);
+        self.room(dim).map_or(most, |room| most.min(room)) + self.x_amount(dim)
+    }
+
+    /// The most the jobs added so far could use of `dim` beside X, bounded
+    /// by its sum alone where it is not tracked.
     fn heaviest(&self, dim: Dim) -> u64 {
         if let Some(t) = self.tracked.iter().position(|&(d, _, _)| d == dim) {
             return self.best[t].0;
@@ -539,6 +583,39 @@ impl<'a> Beside<'a> {
             )
         } else {
             None
+        }
+    }
+}
+
+/// How a job moves the states of a [`Beside`] (see [`Beside::moves`]).
+struct Moves {
+    fixed: Vec<(usize, usize, usize)>,
+    range: Option<(usize, usize, usize, usize)>,
+}
+
+impl Moves {
+    /// The states it reaches from `state`, into `out`: none if it does not
+    /// fit there.
+    fn from(&self, state: usize, out: &mut Vec<usize>) {
+        out.clear();
+        let mut base = state;
+        let fits = self.fixed.iter().all(|&(stride, room, amount)| {
+            base += amount * stride;
+            state / stride % (room + 1) + amount <= room
+        });
+        if !fits {
+            return;
+        }
+        match self.range {
+            None => out.push(base),
+            Some((stride, room, lo, hi)) => {
+                let at = state / stride % (room + 1);
+                out.extend(
+                    (lo..=hi)
+                        .take_while(|v| at + v <= room)
+                        .map(|v| base + v * stride),
+                );
+            }
         }
     }
 }
@@ -606,7 +683,10 @@ fn judge(
         }
     }
 
-    // 2. Beside every start ahead.
+    // 2. Beside every start ahead. Where a dimension that is not tracked is
+    // bounded by its sum alone, the most over the sets that fit is worked
+    // out only once nothing else keeps the job waiting, or to explain.
+    let mut unsure: Vec<(&Beside, Dim, u64, u64)> = Vec::new();
     for start in starts {
         let x = &infos[start.at];
         let beside = &start.beside;
@@ -626,7 +706,14 @@ fn judge(
             if limit == u64::MAX {
                 continue;
             }
-            let used = beside.heaviest(dim) + beside.x_amount(dim);
+            let mut used = beside.heaviest(dim) + beside.x_amount(dim);
+            if used + amount > limit && beside.untracked(dim) {
+                if !explain {
+                    unsure.push((beside, dim, amount, limit));
+                    continue;
+                }
+                used = beside.used(infos, dim);
+            }
             if used + amount > limit {
                 if !explain {
                     return waiting(infos, at, Vec::new());
@@ -647,6 +734,12 @@ fn judge(
                 );
             }
         }
+    }
+    if unsure
+        .iter()
+        .any(|&(beside, dim, amount, limit)| beside.used(infos, dim) + amount > limit)
+    {
+        return waiting(infos, at, Vec::new());
     }
 
     if causes.is_empty() {

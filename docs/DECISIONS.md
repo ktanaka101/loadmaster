@@ -417,19 +417,24 @@ With CPU alone, a small job may now start ahead of a big one that waits, but
 only where it cannot be running in the big one's way when that starts.
 
 "The most beside X" is worked out by a small dynamic program over the usage of
-the dimensions that have little room beside X (at most 64 each, and at most
-4,096 usage vectors in all): those the jobs could use more of than the room,
-and once there is one, the others too, so that the most of each is over the
-sets that fit on all of them. Any other dimension is bounded by the sum of the
-jobs' largest amounts, which only makes the bound larger. Two jobs with the
-same amounts and limits have the same jobs beside their starts, but for the
-two swapped, so one start stands for every later one of its kind: a pass costs
-about as many additions as jobs times kinds of job, not pairs of jobs. Its
-cost does not grow with the size of a capacity. The design was reviewed three
-times (Codex); each review found counterexamples to the version before it (a
-measure-only job that may end, a job that may start now and then starts later
-with more, a use without a checkout limit, limits that disagree, poll order
-under a lowered CPU limit), and each is now a unit test.
+the dimensions that the jobs could use more of than the room beside X, and
+that have little room (at most 64 each, and at most 4,096 usage vectors in
+all). Any other dimension is bounded by the sum of the jobs' largest amounts
+and the room, which only makes the bound larger. Where that bound alone keeps
+a job waiting, the most of that dimension over the sets that fit on the others
+is worked out from the jobs beside X, so jobs that cannot run together are not
+counted together. Keeping that most in every usage vector instead, as first
+tried, cost rebuilds whenever a job ahead recorded a larger limit or a second
+job used a dimension, and a rebuild that left no usage vectors lost it,
+letting a job past a limit (Codex). Two jobs with the same amounts and limits
+have the same jobs beside their starts, but for the two swapped, so one start
+stands for every later one of its kind: a pass costs about as many additions
+as jobs times kinds of job, not pairs of jobs. Its cost does not grow with the
+size of a capacity. The design was reviewed three times (Codex); each review
+found counterexamples to the version before it (a measure-only job that may
+end, a job that may start now and then starts later with more, a use without a
+checkout limit, limits that disagree, poll order under a lowered CPU limit),
+and each is now a unit test.
 
 A unit test simulates random workloads with several resources (a browser of
 capacity 1, one that some jobs declare with capacity 1 and others with 2, uses
@@ -791,8 +796,8 @@ counts other connections' commits, `total_changes` this one's) keeps the last
 decision. Whether the jobs are alive and how old the CPU measurement is change
 without a write, so those are looked at on every poll. Judging a job takes a
 pass over the line in which, for each kind of job ahead that has not started,
-what could run beside its start is built up job by job: about 20 microseconds
-for a line of 12 jobs and 0.2 ms for 160 (four kinds of job, two resources, 8
+what could run beside its start is built up job by job: about 30 microseconds
+for a line of 12 jobs and 0.25 ms for 160 (four kinds of job, two resources, 8
 cores; release build, Apple M-series). With 160 jobs waiting behind one that
 held the machine, the waiting processes used 0.1 cores in all, and 4 under
 0.12, which judged every job ahead on every poll and worked out a start per

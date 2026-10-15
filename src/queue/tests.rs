@@ -1042,6 +1042,42 @@ fn the_most_beside_a_start_is_over_the_sets_that_fit_on_every_dimension() {
     assert!(!admitted(&bigger, 5));
 }
 
+#[test]
+fn what_could_run_beside_a_start_counts_once_a_larger_limit_frees_a_dimension() {
+    // Beside job 1's start, jobs 2 and 3 could use 2 of the 3 `d` job 1
+    // recorded. Job 4 makes `r` bind beside it, job 5's larger capacity for
+    // `r` frees it again; job 6 would take `d` to 4 of 3 (Codex).
+    let d = || res("d", 1, 3);
+    let jobs = [
+        sized(job(1, JobState::Parked, 1, vec![d()], "/a"), 8, false),
+        sized(
+            job(2, Running, 1, vec![d(), res("r", 1, 2)], "/a"),
+            8,
+            false,
+        ),
+        sized(
+            job(3, Running, 1, vec![d(), res("r", 1, 2)], "/a"),
+            8,
+            false,
+        ),
+        sized(
+            job(4, JobState::Parked, 1, vec![res("r", 2, 2)], "/a"),
+            8,
+            false,
+        ),
+        sized(
+            job(5, JobState::Parked, 1, vec![res("r", 2, 6)], "/a"),
+            8,
+            false,
+        ),
+        sized(job(6, Waiting, 1, vec![d()], "/a"), 8, false),
+    ];
+    assert!(!admitted(&jobs, 6));
+    let mut swapped = jobs.clone();
+    swapped.swap(3, 4);
+    assert!(!admitted(&swapped, 6));
+}
+
 /// A workload for the simulation: jobs in line order.
 #[derive(Clone)]
 struct Arrival {
