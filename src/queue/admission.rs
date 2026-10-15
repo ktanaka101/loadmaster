@@ -14,9 +14,9 @@
 //!
 //! "The jobs ahead" are the jobs ahead in line plus every running
 //! measure-only job, wherever it is. The jobs are judged in one pass in line
-//! order: for each job not started, what could run beside its start is built
-//! up as the jobs behind it are passed, so a pass costs as many additions as
-//! there are pairs of jobs.
+//! order: for each kind of job not started (its amounts and limits), what
+//! could run beside its start is built up as the jobs behind it are passed,
+//! so a pass costs as many additions as there are jobs times kinds.
 
 use std::collections::BTreeMap;
 
@@ -82,23 +82,47 @@ impl<'a> Info<'a> {
     fn record(&self, dim: Dim) -> Option<u64> {
         self.records.get(&dim).copied().flatten()
     }
+
+    /// Whether the two are jobs of a kind, as far as the rule goes: the same
+    /// amounts and limits.
+    fn like(&self, other: &Info) -> bool {
+        self.amounts == other.amounts && self.records == other.records
+    }
 }
 
 /// The rule for the job at `at` in `jobs` (in line order).
 pub(super) fn decide(jobs: &[Job], at: usize, outside: Option<Outside>) -> Admission {
-    pass(jobs, outside, Some(at))
+    pass(jobs, outside, Some(at), true)
         .pop()
         .map_or(Admission::Admitted, |(_, admission)| admission)
 }
 
 /// The rule for every job that has not started, in line order.
 pub(super) fn explain(jobs: &[Job], outside: Option<Outside>) -> Vec<(JobId, Admission)> {
-    pass(jobs, outside, None)
+    pass(jobs, outside, None, true)
+}
+
+/// [`explain`], working out the start of every job not started, as if no two
+/// were of a kind: what the rule must agree with.
+#[cfg(test)]
+pub(super) fn explain_every_start(
+    jobs: &[Job],
+    outside: Option<Outside>,
+) -> Vec<(JobId, Admission)> {
+    pass(jobs, outside, None, false)
 }
 
 /// Judges the jobs in line order, up to `only` (whose decision is the one
-/// returned, explained) or all (each explained).
-fn pass(jobs: &[Job], outside: Option<Outside>, only: Option<usize>) -> Vec<(JobId, Admission)> {
+/// returned, explained) or all (each explained). With `by_kind`, one start
+/// stands for every later one of its kind (see [`Info::like`]): the jobs
+/// beside the later one are those beside the first, with the two swapped, so
+/// its condition is the same.
+fn pass(
+    jobs: &[Job],
+    outside: Option<Outside>,
+    only: Option<usize>,
+    by_kind: bool,
+) -> Vec<(JobId, Admission)> {
     let infos: Vec<Info> = jobs.iter().map(|job| Info::of(job, outside)).collect();
     let measured: Vec<usize> = (0..jobs.len())
         .filter(|&i| jobs[i].state == JobState::Running && jobs[i].measure_only)
@@ -128,7 +152,9 @@ fn pass(jobs: &[Job], outside: Option<Outside>, only: Option<usize>) -> Vec<(Job
         for start in &mut starts {
             start.add(&infos, i);
         }
-        starts.push(Start::new(&infos, i, &measured));
+        if !(by_kind && starts.iter().any(|s| infos[s.at].like(&infos[i]))) {
+            starts.push(Start::new(&infos, i, &measured));
+        }
     }
     out
 }
@@ -173,10 +199,17 @@ impl<'a> Start<'a> {
 /// records, X's own included, so on a dimension X records a limit for, the
 /// sets are judged within that one. On another, within the largest limit the
 /// jobs added so far record (unbounded once one uses it without one): a
-/// relaxation of each set's own. All of it depends only on the jobs added so
-/// far, which are ahead of the job judged. A dimension whose room is large,
-/// or beyond the state budget, is bounded by the sum of the jobs' largest
-/// amounts instead, which only makes the bound larger.
+/// relaxation of each set's own. A job that does not fit beside X within the
+/// limits either of them records never runs with it, and is left out. All of
+/// it depends only on the jobs added so far, which are ahead of the job
+/// judged.
+///
+/// The dimensions that could bind (the jobs could use more than the room)
+/// are tracked, and once one could, every other with little room too: the
+/// most of each is then over the sets that fit, not the sum of jobs that may
+/// not run together. A dimension whose room is large, or beyond the state
+/// budget, is bounded by the sum of the jobs' largest amounts instead, which
+/// only makes the bound larger.
 struct Beside<'a> {
     x: usize,
     x_amounts: Amounts<'a>,
@@ -250,12 +283,15 @@ impl<'a> Beside<'a> {
         (within != u64::MAX).then(|| within.saturating_sub(self.x_amount(dim)))
     }
 
-    /// Whether job `i` fits beside X on its own.
+    /// Whether job `i` fits beside X on its own, within the limits both
+    /// record.
     fn fits_alone(&self, infos: &[Info], i: usize) -> bool {
-        infos[i]
-            .amounts
-            .iter()
-            .all(|(&d, &(lo, _))| self.room(d).is_none_or(|room| lo <= room))
+        infos[i].amounts.iter().all(|(&d, &(lo, _))| {
+            self.room(d).is_none_or(|room| lo <= room)
+                && infos[i]
+                    .record(d)
+                    .is_none_or(|own| lo + self.x_amount(d) <= own)
+        })
     }
 
     /// Job `i` may be beside X from now on.
@@ -290,15 +326,20 @@ impl<'a> Beside<'a> {
             return;
         }
         self.count(infos, i);
-        // A dimension that now could bind and is not tracked yet: track it,
-        // if the budget allows.
-        let newly_binding = infos[i].amounts.keys().any(|&d| {
-            !self.tracked.iter().any(|&(t, _, _)| t == d)
-                && self.room(d).is_some_and(|room| {
-                    room <= TRACKED_ROOM && self.sums.get(&d).is_some_and(|&sum| sum > room)
-                })
+        // A dimension with little room that is not tracked yet, or that now
+        // could bind: track it if it, or another, could, and the budget
+        // allows.
+        let changed = infos[i].amounts.iter().any(|(&d, &(_, hi))| {
+            self.room(d).is_some_and(|room| {
+                room <= TRACKED_ROOM
+                    && (!self.tracked.iter().any(|&(t, _, _)| t == d)
+                        || self
+                            .sums
+                            .get(&d)
+                            .is_some_and(|&sum| sum > room && sum - hi <= room))
+            })
         });
-        if newly_binding {
+        if changed {
             let tracked: Vec<Dim> = self.tracked.iter().map(|&(d, _, _)| d).collect();
             if self.wanted_tracked() != tracked {
                 return self.rebuild(infos);
@@ -326,21 +367,25 @@ impl<'a> Beside<'a> {
         }
     }
 
-    /// The dimensions to track: bounded, with little room, that the jobs
-    /// added could fill, smallest room first, within the state budget.
+    /// The dimensions to track, bounded and with little room: those the jobs
+    /// added could fill, then, if there is one, the others; smallest room
+    /// first, within the state budget.
     fn wanted_tracked(&self) -> Vec<Dim<'a>> {
-        let mut dims: Vec<(u64, Dim)> = self
+        let mut dims: Vec<(bool, u64, Dim)> = self
             .sums
             .iter()
             .filter_map(|(&d, &sum)| {
                 let room = self.room(d)?;
-                (room <= TRACKED_ROOM && sum > room).then_some((room, d))
+                (room <= TRACKED_ROOM).then_some((sum <= room, room, d))
             })
             .collect();
+        if dims.iter().all(|&(fits, _, _)| fits) {
+            return Vec::new();
+        }
         dims.sort();
         let mut size: u64 = 1;
         let mut wanted = Vec::new();
-        for (room, d) in dims {
+        for (_, room, d) in dims {
             let next = size.saturating_mul(room + 1);
             if next <= STATES {
                 wanted.push(d);

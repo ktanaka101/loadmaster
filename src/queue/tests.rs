@@ -1011,6 +1011,37 @@ fn a_job_behind_respects_the_smallest_capacity_of_a_start_ahead() {
     assert!(!admitted(&jobs, 4));
 }
 
+#[test]
+fn a_job_that_cannot_run_beside_a_start_by_its_own_limit_is_not_beside_it() {
+    // Job 1 recorded a capacity of 4, so job 2 (2 cores) can only start once
+    // it ended: job 3 fits beside both (Codex).
+    let jobs = [
+        sized(job(1, Running, 3, vec![], "/a"), 4, false),
+        sized(job(2, Waiting, 2, vec![], "/a"), 10, false),
+        sized(job(3, Waiting, 1, vec![], "/a"), 10, false),
+    ];
+    assert!(admitted(&jobs, 3));
+}
+
+#[test]
+fn the_most_beside_a_start_is_over_the_sets_that_fit_on_every_dimension() {
+    // Beside job 3's start (it waits for the browser) jobs 2 and 4 could
+    // use 3 cores, but not together: they need 7 of 6 `mem`. So at most 6
+    // of the 8 cores are in use then, and job 5 (2 cores) fits.
+    let jobs = [
+        sized(job(1, Running, 1, vec![browser(1)], "/a"), 8, false),
+        sized(job(2, Running, 2, vec![mem(6)], "/a"), 8, false),
+        sized(job(3, Waiting, 4, vec![browser(1)], "/a"), 8, false),
+        sized(job(4, Waiting, 1, vec![mem(1)], "/a"), 8, false),
+        sized(job(5, Waiting, 2, vec![], "/a"), 8, false),
+    ];
+    assert!(admitted(&jobs, 5));
+    // With 3 cores it would not fit beside job 3 and job 2.
+    let mut bigger = jobs.clone();
+    bigger[4].weight = 3;
+    assert!(!admitted(&bigger, 5));
+}
+
 /// A workload for the simulation: jobs in line order.
 #[derive(Clone)]
 struct Arrival {
@@ -1045,6 +1076,16 @@ thread_local! {
 /// until nothing changes, and returns when each job started (`LEFT` if it
 /// left the line). Checks every limit, and the explanations, after each step.
 fn simulate(arrivals: &[Arrival], reverse: bool, outside: Load) -> Vec<u32> {
+    simulate_with(arrivals, reverse, outside, &mut |_| {})
+}
+
+/// [`simulate`], showing `look` the line after each step.
+fn simulate_with(
+    arrivals: &[Arrival],
+    reverse: bool,
+    outside: Load,
+    look: &mut dyn FnMut(&[Job]),
+) -> Vec<u32> {
     let mut jobs: Vec<Job> = Vec::new();
     let mut started = vec![None; arrivals.len()];
     for t in 0..10_000 {
@@ -1118,6 +1159,7 @@ fn simulate(arrivals: &[Arrival], reverse: bool, outside: Load) -> Vec<u32> {
         }
         assert_within_limits(&jobs);
         assert_explained(&jobs, outside(t));
+        look(&jobs);
         if started.iter().all(Option::is_some) && jobs.is_empty() {
             return started.into_iter().map(Option::unwrap).collect();
         }
@@ -1584,4 +1626,202 @@ fn limits_that_keep_growing_do_not_make_the_rule_start_over() {
     let _ = decide(&jobs, 200, None).unwrap();
     let took = started.elapsed();
     assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+}
+
+/// A random line: the arrivals of `random_workload`, each running (with a
+/// grant), waiting or parked, of kinds as many as jobs or a few.
+fn random_line(rng: &mut Rng, n: usize, kinds: Option<usize>) -> Vec<Job> {
+    let made: Vec<Job> = random_workload(rng, kinds.unwrap_or(n), true)
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| {
+            sized(
+                job(
+                    i as JobId + 1,
+                    Waiting,
+                    a.weight.min(a.capacity),
+                    a.uses,
+                    a.checkout,
+                ),
+                a.capacity,
+                a.adapt,
+            )
+        })
+        .collect();
+    (0..n)
+        .map(|i| {
+            let pick = if kinds.is_some() {
+                rng.below(made.len() as u32) as usize
+            } else {
+                i
+            };
+            let mut j = made[pick].clone();
+            j.id = i as JobId + 1;
+            j.task = format!("job{}", j.id);
+            j.state = match rng.below(4) {
+                0 => Running,
+                1 => JobState::Parked,
+                _ => Waiting,
+            };
+            j.granted = (j.state == Running).then(|| 1 + rng.below(j.weight));
+            j.measure_only = j.state == Running && rng.below(15) == 0;
+            j
+        })
+        .collect()
+}
+
+#[test]
+fn one_start_stands_for_its_kind() {
+    let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+    for round in 0..3_000 {
+        let n = 2 + rng.below(20) as usize;
+        let kinds = (rng.below(2) == 0).then(|| 1 + rng.below(5) as usize);
+        let jobs = random_line(&mut rng, n, kinds);
+        let outside = (rng.below(2) == 0).then(|| Outside {
+            busy: f64::from(rng.below(140)) / 10.0,
+            cores: 14,
+        });
+        assert_eq!(
+            explain(&jobs, outside),
+            super::admission::explain_every_start(&jobs, outside),
+            "round {round}: {jobs:#?}"
+        );
+        assert_explained_agrees(&jobs, outside);
+    }
+}
+
+/// `explain` and `decide` agree on every job not started.
+fn assert_explained_agrees(jobs: &[Job], outside: Option<Outside>) {
+    for (id, admission) in explain(jobs, outside) {
+        assert_eq!(admission, decide(jobs, id, outside).unwrap(), "job {id}");
+    }
+}
+
+// ---- The most any rule could start, by brute force. ----
+
+/// Whether `set` could all run at once: on each dimension, within the
+/// smallest limit any of them records (CPU: capacity). Jobs not started count
+/// at their weight.
+fn fits_together(set: &[&Job]) -> bool {
+    let mut used: BTreeMap<Dim, u64> = BTreeMap::new();
+    let mut limits: BTreeMap<Dim, u64> = BTreeMap::new();
+    for job in set {
+        for (dim, amount, limit) in demands(job, None) {
+            let (amount, limit) = if dim == Dim::Cpu {
+                (
+                    u64::from(job.granted.unwrap_or(job.weight)),
+                    u64::from(job.capacity),
+                )
+            } else {
+                (amount, limit)
+            };
+            *used.entry(dim).or_default() += amount;
+            let entry = limits.entry(dim).or_insert(u64::MAX);
+            *entry = (*entry).min(limit);
+        }
+    }
+    used.iter().all(|(d, u)| *u <= limits[d])
+}
+
+/// The most permissive decision for the job at `at` that keeps every limit
+/// whatever the jobs ahead do: it fits beside the running jobs ahead, and
+/// beside every job X ahead not started together with any set of the others
+/// that fits with X. Jobs may end and leave at any time, so every such set
+/// may be what runs when X starts.
+fn most_permissive(jobs: &[Job], at: usize) -> bool {
+    let k = &jobs[at];
+    let ahead: Vec<&Job> = jobs[..at].iter().collect();
+    let running: Vec<&Job> = ahead
+        .iter()
+        .copied()
+        .filter(|j| j.state == Running)
+        .chain([k])
+        .collect();
+    if !fits_together(&running) {
+        return false;
+    }
+    for (xi, x) in ahead.iter().enumerate().filter(|(_, j)| j.state != Running) {
+        let others: Vec<&Job> = (0..ahead.len())
+            .filter(|&i| i != xi)
+            .map(|i| ahead[i])
+            .collect();
+        for mask in 0u32..(1 << others.len()) {
+            let mut set: Vec<&Job> = vec![x];
+            set.extend(
+                (0..others.len())
+                    .filter(|i| mask >> i & 1 == 1)
+                    .map(|i| others[i]),
+            );
+            if fits_together(&set) {
+                set.push(k);
+                if !fits_together(&set) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+#[test]
+fn with_limits_all_jobs_agree_on_the_rule_starts_all_it_safely_could() {
+    // CPU capacity 8, the browser 1, `db` 2 and 1 per checkout, `mem` 6 for
+    // every job; no CPU outside the queue, no job that adapts to it. Every
+    // job that waits after a step would, if it started, risk a limit.
+    let mut rng = Rng(0x5EED_1234_0000_0002);
+    let mut checked = 0;
+    for round in 0..150 {
+        let mut at = 0;
+        let arrivals: Vec<Arrival> = (0..12)
+            .map(|_| {
+                at += rng.below(3);
+                let mut uses = vec![];
+                if rng.below(3) == 0 {
+                    uses.push(db(1));
+                }
+                if rng.below(3) == 0 {
+                    uses.push(mem(1 + rng.below(6)));
+                }
+                if rng.below(4) == 0 {
+                    uses.push(browser(1));
+                }
+                Arrival {
+                    at,
+                    duration: 1 + rng.below(8),
+                    weight: [1, 1, 2, 3, 4, 5, 8][rng.below(7) as usize],
+                    uses,
+                    checkout: ["/a", "/b"][rng.below(2) as usize],
+                    leaves: (rng.below(5) == 0).then(|| at + 1 + rng.below(8)),
+                    adapt: false,
+                    capacity: 8,
+                    parks: (rng.below(8) == 0).then(|| (at + rng.below(3), Some(at + 4))),
+                }
+            })
+            .collect();
+        simulate_with(&arrivals, false, &|_| None, &mut |jobs| {
+            for at in (0..jobs.len()).filter(|&at| jobs[at].state == Waiting) {
+                checked += 1;
+                assert!(
+                    !most_permissive(jobs, at),
+                    "round {round}: job {} waits, but could start: {jobs:#?}",
+                    jobs[at].id
+                );
+            }
+        });
+    }
+    assert!(checked > 1_000, "{checked}");
+}
+
+#[test]
+fn a_poll_sees_what_other_processes_changed() {
+    let f = fixture();
+    let other = Queue::open(&f._dir.path().join(QUEUE_DB_FILE)).unwrap();
+    let holder = other.enqueue(&request("test", 8, &[]), f.me).unwrap();
+    assert_eq!(holder.try_admit().unwrap(), Admission::Admitted);
+    let next = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
+    for _ in 0..3 {
+        assert!(matches!(next.try_admit().unwrap(), Admission::Waiting(_)));
+    }
+    drop(holder);
+    assert_eq!(next.try_admit().unwrap(), Admission::Admitted);
 }

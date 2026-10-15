@@ -247,33 +247,37 @@ same moment on a fresh state directory occasionally got "database is locked"
 (found in the real-tools demo, about 1 run in 300). The switch is retried for
 up to the busy timeout; everything else relies on SQLite's busy handler.
 
-The version of the database's layout and of the admission rule is in its
-file name (`queue-v4.db`): the rule is the protocol between the processes
-that share a queue, so a `loadmaster` that changes either uses a new file,
-and never changes the schema or the rows of one of another layout. 0.12
-moved to `queue-v4.db` with the rule of [Resources](#resources), although
-the schema stayed: 0.11's rule does not keep the smaller capacity of a
-running job ahead, so the promises are for the new queue only. a queue only holds the jobs that
-run now, so nothing in it is worth carrying over. Versions with different layouts keep
-separate queues and do not count each other's jobs, so while both run, the
-machine and its resources can be used beyond their capacity: for the minutes
-of an upgrade, or for as long as an agent runs an older version (pinned by a
-project's tool versions, say). Beyond a resource's capacity is not only
-slower: two at a time for their ports, clew's end-to-end tests would have
-started a third and a fourth during an upgrade. So every layout keeps six
-columns of `jobs` as they are (the task, its state, and the processes of its
-loadmaster and of its task), and `status` and `run` read them from the other
-`queue-v<N>.db` files beside their own, to say how many jobs run there and
-for which tasks. They are not counted: two files cannot be changed in one
-transaction, so jobs in both would still race to start, and the other
-version would not count this one's anyway. A file is opened as its own
+The version of the database's layout and of the admission rule is in its file
+name (`queue-v4.db`): the rule is the protocol between the processes that
+share a queue, so a `loadmaster` that changes the layout, or a rule in a way
+that breaks the promises beside the old one, uses a new file, and never
+changes the schema or the rows of one of another layout. 0.12 moved to
+`queue-v4.db` with the rule of [Resources](#resources), although the schema
+stayed: 0.11's rule does not keep the smaller capacity of a running job ahead,
+so the promises are for the new queue only. 0.13 works the rule out
+differently and starts a few more jobs, but keeps the file: the promises need
+of a job only that it fit beside every start ahead next to every set of the
+jobs ahead that fits within the limits its members record (see
+[Resources](#resources)), and both versions check that. A queue only holds the
+jobs that run now, so nothing in it is worth carrying over. Versions with
+different layouts keep separate queues and do not count each other's jobs, so
+while both run, the machine and its resources can be used beyond their
+capacity: for the minutes of an upgrade, or for as long as an agent runs an
+older version (pinned by a project's tool versions, say). Beyond a resource's
+capacity is not only slower: two at a time for their ports, clew's end-to-end
+tests would have started a third and a fourth during an upgrade. So every
+layout keeps six columns of `jobs` as they are (the task, its state, and the
+processes of its loadmaster and of its task), and `status` and `run` read them
+from the other `queue-v<N>.db` files beside their own, to say how many jobs
+run there and for which tasks. They are not counted: two files cannot be
+changed in one transaction, so jobs in both would still race to start, and the
+other version would not count this one's anyway. A file is opened as its own
 version opens it, so that the last connection to close it folds its
 write-ahead log into it and removes it, as that version's would (read-only,
-SQLite leaves the log behind); but it is never created, and its rows are
-only read. Every layout from 0.7 on has the columns;
-the `state.db` of 0.5 and 0.6 is not looked at. The schema
-is made once, in a write transaction, by the first process to open the file;
-`PRAGMA user_version` marks it as made.
+SQLite leaves the log behind); but it is never created, and its rows are only
+read. Every layout from 0.7 on has the columns; the `state.db` of 0.5 and 0.6
+is not looked at. The schema is made once, in a write transaction, by the
+first process to open the file; `PRAGMA user_version` marks it as made.
 
 ## Job IDs are never reused
 
@@ -353,8 +357,10 @@ separately; taking that check out failed no test, and the argument above is
 why.) Which sets fit is judged within X's own limit where it records one,
 since everything running when X starts fits within it, and elsewhere within
 the largest limit the jobs ahead record; what the job must keep, within the
-smallest limit it or any of them records. All of that comes from the jobs
-ahead of the job judged, never from the jobs behind it.
+smallest limit it or any of them records. A job that does not fit beside X
+within the limits either of them records never runs with it, and is left
+out. All of that comes from the jobs ahead of the job judged, never from the
+jobs behind it.
 
 When a job Z starts, every job W running behind it started while Z waited,
 and checked that it fits beside Z's start next to any set of the jobs ahead
@@ -371,6 +377,31 @@ a measure-only job that came later (found in review). A queue that mixes
 them, from processes with different machine configs, is a measurement
 setup, not one to rely on.
 
+Condition 2 asks no more than it must. Jobs may end and leave the line at any
+time, so any set of the jobs ahead that fits within the limits all its members
+record may be what runs when X starts: the others end or leave, the set's jobs
+that have not started start in line order (each passes the rule, since the
+whole set fits beside X), and X starts last. A job that condition 2 holds back
+could therefore, in some future, be running when a job ahead of it takes the
+machine past a limit; only knowing how long jobs run would rule that out.
+Where the jobs record the same limits and start with their weights, the rule
+thus starts every job that can start without that risk, as far as its
+computation is exact (below); a test compares it with a search of every set,
+on the lines the rule itself reaches. (A job that starts with fewer cores than
+its weight does so with nothing running ahead of it, so fewer sets can run
+then than the rule assumes.) Where limits disagree it is more careful than
+that: the most the jobs beside X could use and the smallest limit among them
+may come from different sets, and keeping the smallest limit of each set as
+well would make the computation much larger. Codex (GPT-6-Astra) worked out
+the same result independently. Before 0.13, two approximations held back jobs
+that could have started: a dimension that could not bind on its own was
+bounded by its sum even where the sets that fit on another one could not use
+all of it (found against the search; 0.1% of the decisions in a random
+simulation, 1.3 to 2.5% of the mean wait in a simulated day of agents'
+checks), and a job that could not run beside X by its own smaller limit was
+still counted beside it (Codex; 0.9% of the decisions with disagreeing limits,
+0.08% now).
+
 Before 0.12 a waiting job set aside its amount where it fit, less what it
 was sure to get back by the time it could start (0.11), and held back from
 everyone behind it what it was short of. That estimate was refined three
@@ -385,30 +416,37 @@ expected to end in time breaks the guarantee whenever the estimate is wrong.
 With CPU alone, a small job may now start ahead of a big one that waits, but
 only where it cannot be running in the big one's way when that starts.
 
-"The most beside X" is worked out by a small dynamic program over the usage
-of the dimensions that have little room beside X (at most 64 each, and at
-most 4,096 usage vectors in all); any other dimension is bounded by the sum
-of the jobs' largest amounts, which only makes the bound larger. A waiting
-`loadmaster` works it out for every job ahead of it on every poll, so its
+"The most beside X" is worked out by a small dynamic program over the usage of
+the dimensions that have little room beside X (at most 64 each, and at most
+4,096 usage vectors in all): those the jobs could use more of than the room,
+and once there is one, the others too, so that the most of each is over the
+sets that fit on all of them. Any other dimension is bounded by the sum of the
+jobs' largest amounts, which only makes the bound larger. Two jobs with the
+same amounts and limits have the same jobs beside their starts, but for the
+two swapped, so one start stands for every later one of its kind: a pass costs
+about as many additions as jobs times kinds of job, not pairs of jobs. Its
 cost does not grow with the size of a capacity. The design was reviewed three
 times (Codex); each review found counterexamples to the version before it (a
-measure-only job that may end, a job that may start now and then starts
-later with more, a use without a checkout limit, limits that disagree, poll
-order under a lowered CPU limit), and each is now a unit test.
+measure-only job that may end, a job that may start now and then starts later
+with more, a use without a checkout limit, limits that disagree, poll order
+under a lowered CPU limit), and each is now a unit test.
 
 A unit test simulates random workloads with several resources (a browser of
-capacity 1, one that some jobs declare with capacity 1 and others with 2,
-uses with and without per-checkout limits), departures from the line, parks
-that resume or expire, jobs that adapt to CPU outside the queue or not,
-capacities of 6 and 8 cores (and ten times as many), with and without CPU
-outside the queue that changes on its own, polling in line order, in reverse
-and at random. It checks that each job starts at the same time whatever the
-order of polls and whether or not the jobs that got in line after it exist,
-that every job starts, and that the running jobs never use more than the
-smallest limit any of them records. Leaving out any part of the rule (jobs
-not started beside X, their range of cores, the smallest limit, a job that
-may start now in either condition) fails it. The soak test adds resources
-and a second checkout and checks every limit from inside the tasks.
+capacity 1, one that some jobs declare with capacity 1 and others with 2, uses
+with and without per-checkout limits), departures from the line, parks that
+resume or expire, jobs that adapt to CPU outside the queue or not, capacities
+of 6 and 8 cores (and ten times as many), with and without CPU outside the
+queue that changes on its own, polling in line order, in reverse and at
+random. It checks that each job starts at the same time whatever the order of
+polls and whether or not the jobs that got in line after it exist, that every
+job starts, and that the running jobs never use more than the smallest limit
+any of them records. Leaving out any part of the rule (jobs not started beside
+X, their range of cores, the smallest limit, a job that may start now in
+either condition) fails it. Other tests check that one start per kind decides
+and explains every job as a start per job does, on random lines of many kinds
+and of few, and that no job waits that the search of every set would start.
+The soak test adds resources and a second checkout and checks every limit from
+inside the tasks.
 
 A nested run takes no part in admission: it has to fit in its holder's
 slot (see [Nested runs](#nested-runs)).
@@ -738,15 +776,27 @@ rarely enough not to flood an agent's context.
 Each waiting job notices on its own next poll that it may start. A job that
 may start counts as running for the jobs behind it, so jobs that fit together
 start in the same round of polls; one that fits only once a job ahead of it
-has started waits for that job's next poll, and a backlog of such jobs drains
-at about one start per poll. That is negligible for tasks that run for seconds
-or minutes, but visible with tiny ones: 200 simultaneous 50 ms jobs took 16 s
-on a 14-core Mac under 0.11's rule (zero capacity violations). Admitting every
-job that may start in one transaction would remove this cost; it is left out
-until it matters. Judging a job takes a pass over the line in which, for each
-job ahead that waits, what could run beside its start is built up job by job:
-about 50 microseconds for a line of 12 jobs, and 3 ms for 40 jobs sharing
-several resources on 32 cores (release build, Apple M-series).
+has started (as once a job that adapts to CPU outside the queue has fixed its
+cores) waits for that job's next poll. That is negligible for tasks that run
+for seconds or minutes, but visible with tiny ones: 200 simultaneous one-core
+50 ms jobs took 2.8 s at capacity 8, where starting each the moment cores were
+free would take 1.25 s (under 0.11's rule, 16 s on a 14-core Mac; zero
+capacity violations). Admitting every job that may start in one transaction
+would remove the waits for a job ahead to start; it is left out until it
+matters.
+
+The rule depends on nothing but the jobs and the CPU outside the queue, so a
+poll that finds the database as the last one left it (`PRAGMA data_version`
+counts other connections' commits, `total_changes` this one's) keeps the last
+decision. Whether the jobs are alive and how old the CPU measurement is change
+without a write, so those are looked at on every poll. Judging a job takes a
+pass over the line in which, for each kind of job ahead that has not started,
+what could run beside its start is built up job by job: about 20 microseconds
+for a line of 12 jobs and 0.2 ms for 160 (four kinds of job, two resources, 8
+cores; release build, Apple M-series). With 160 jobs waiting behind one that
+held the machine, the waiting processes used 0.1 cores in all, and 4 under
+0.12, which judged every job ahead on every poll and worked out a start per
+job.
 
 ## Configuration details
 

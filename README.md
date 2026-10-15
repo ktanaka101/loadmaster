@@ -97,7 +97,9 @@ loadmaster is new (0.12). What has been verified:
 - A simulation checks, on random workloads with several resources and with
   CPU busy outside the queue that changes on its own, that no job is ever
   delayed by jobs that got in line after it and that every job starts; rules
-  broken on purpose are caught.
+  broken on purpose are caught. Against a search of every set of jobs that
+  could run at once, it checks that where the jobs record the same limits, no
+  job waits that could start without the risk of taking the machine past one.
 - Five real Claude Code sessions (Sonnet, headless) in five git worktrees of a
   demo repository, set up as described in
   [Using it with AI coding tools](#using-it-with-ai-coding-tools), ran lint, test and

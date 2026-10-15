@@ -26,6 +26,7 @@
 //! A reaped job whose loadmaster process was killed never wrote its history
 //! record, so the reaper writes one for it (outcome `lost`).
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::Write;
@@ -537,6 +538,16 @@ impl Queue {
         Ok(())
     }
 
+    /// What changes whenever the database does: `PRAGMA data_version`
+    /// counts the commits of other connections, `total_changes` the rows
+    /// this one changed.
+    fn version(&self) -> Result<(i64, u64)> {
+        let data: i64 = self
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        Ok((data, self.conn.total_changes()))
+    }
+
     fn begin(&self) -> rusqlite::Result<Transaction<'_>> {
         Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
     }
@@ -718,6 +729,7 @@ impl Queue {
             id,
             resumed,
             armed: true,
+            last: RefCell::new(None),
         })
     }
 
@@ -932,6 +944,18 @@ pub struct Ticket<'q> {
     id: JobId,
     resumed: bool,
     armed: bool,
+    /// The queue as this job's last poll read it (see [`Ticket::try_admit`]).
+    last: RefCell<Option<Poll>>,
+}
+
+/// What a poll read, and what the rule made of it.
+struct Poll {
+    /// The version of the database it was read at (see [`Queue::version`]).
+    version: (i64, u64),
+    jobs: Vec<Job>,
+    /// The decision, once worked out, and the CPU outside the queue it was
+    /// worked out with.
+    decided: Option<(Option<Outside>, Admission)>,
 }
 
 impl Ticket<'_> {
@@ -980,25 +1004,49 @@ impl Ticket<'_> {
         // few writes that matter (admitting the head, recording a task).
         // Only running jobs and those ahead can change this job's decision;
         // dead jobs further back are reaped by whoever they are ahead of.
-        let jobs = load_jobs(&self.queue.conn)?;
-        let adapts = jobs
+        //
+        // The rule is a function of the jobs and the CPU outside the queue:
+        // while neither changed, the last decision stands. Whether the jobs
+        // are alive, and how old the CPU measurement is, change without a
+        // write, so those are looked at on every poll.
+        let version = self.queue.version()?;
+        let mut last = self.last.borrow_mut();
+        if last.as_ref().is_none_or(|poll| poll.version != version) {
+            *last = Some(Poll {
+                version,
+                jobs: load_jobs(&self.queue.conn)?,
+                decided: None,
+            });
+        }
+        let poll = last.as_mut().expect("read above");
+        let adapts = poll
+            .jobs
             .iter()
             .any(|job| job.state != JobState::Running && job.adapt_cpu);
         let outside = if adapts {
-            self.queue.outside(&jobs)?
+            self.queue.outside(&poll.jobs)?
         } else {
             None
         };
+        // Measuring the CPU outside the queue writes only its own row.
+        poll.version.1 = self.queue.conn.total_changes();
         let now = SystemTime::now();
-        let relevant_alive = jobs
+        let relevant_alive = poll
+            .jobs
             .iter()
             .filter(|job| job.state == JobState::Running || job.id < self.id)
             .all(|job| job.is_live(now));
-        if relevant_alive
-            && let Ok(waiting @ Admission::Waiting(_)) = decide(&jobs, self.id, outside)
-        {
-            return Ok(waiting);
+        if relevant_alive {
+            if poll.decided.as_ref().is_none_or(|(o, _)| *o != outside) {
+                poll.decided = decide(&poll.jobs, self.id, outside)
+                    .ok()
+                    .map(|admission| (outside, admission));
+            }
+            if let Some((_, waiting @ Admission::Waiting(_))) = &poll.decided {
+                return Ok(waiting.clone());
+            }
         }
+        drop(last);
         let (admission, _) = self.queue.write(|tx| {
             let jobs = load_jobs(tx)?;
             let admission = decide(&jobs, self.id, outside)?;
