@@ -18,6 +18,7 @@
 //! could run beside its start is built up as the jobs behind it are passed,
 //! so a pass costs as many additions as there are jobs times kinds.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use super::{
@@ -239,6 +240,21 @@ struct Beside<'a> {
     /// Whether some job beside X, or X, records a limit other than the one a
     /// dimension is judged within (a set found may not run then).
     disagree: bool,
+    /// How many times the states were worked out again, and what
+    /// [`Beside::most`] found since.
+    generation: u64,
+    most: RefCell<BTreeMap<Dim<'a>, Most>>,
+}
+
+/// The most of a dimension not tracked that the sets reaching each state
+/// could use, through the first `through` jobs added, in `generation` of the
+/// states.
+struct Most {
+    generation: u64,
+    through: usize,
+    values: Vec<Option<u64>>,
+    seen: Vec<usize>,
+    best: u64,
 }
 
 impl<'a> Beside<'a> {
@@ -267,6 +283,8 @@ impl<'a> Beside<'a> {
             seen: vec![0],
             best: Vec::new(),
             disagree: false,
+            generation: 0,
+            most: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -403,6 +421,7 @@ impl<'a> Beside<'a> {
 
     /// Works everything out again from the jobs added.
     fn rebuild(&mut self, infos: &[Info<'a>]) {
+        self.generation += 1;
         let added = std::mem::take(&mut self.added);
         self.sums.clear();
         self.smallest = self
@@ -488,34 +507,58 @@ impl<'a> Beside<'a> {
     /// The most of `dim`, which is not tracked, that the jobs added could
     /// use in a set that fits on the tracked dimensions, worked out from them
     /// alone: tighter than its sum where they could not all run together.
-    fn most(&self, infos: &[Info], dim: Dim) -> u64 {
-        let mut values: Vec<Option<u64>> = vec![None; self.reached.len()];
-        values[0] = Some(0);
-        let mut seen = vec![0];
+    fn most(&self, infos: &[Info], dim: Dim<'a>) -> u64 {
+        let mut cache = self.most.borrow_mut();
+        let most = cache.entry(dim).or_insert_with(|| Most {
+            generation: u64::MAX,
+            through: 0,
+            values: Vec::new(),
+            seen: Vec::new(),
+            best: 0,
+        });
+        // Since the states were worked out again, start over; else go on
+        // from the jobs added since the last time.
+        if most.generation != self.generation {
+            *most = Most {
+                generation: self.generation,
+                through: 0,
+                values: vec![None; self.reached.len()],
+                seen: vec![0],
+                best: 0,
+            };
+            most.values[0] = Some(0);
+        }
         let mut next = Vec::new();
         let mut reach: Vec<(usize, u64)> = Vec::new();
-        for &i in self.added.iter().filter(|&&i| self.fits_alone(infos, i)) {
+        for &i in &self.added[most.through..] {
+            // One too big on its own now would start the states over when it
+            // fit, as the bound it is too big for can only grow.
+            if !self.fits_alone(infos, i) {
+                continue;
+            }
             let moves = self.moves(&infos[i].amounts);
             let amount = infos[i].amounts.get(&dim).map_or(0, |&(_, hi)| hi);
             // From the sets before this job only: it is added to each once.
             reach.clear();
-            for &state in &seen {
-                let value = values[state].expect("a state reached") + amount;
+            for &state in &most.seen {
+                let value = most.values[state].expect("a state reached") + amount;
                 moves.from(state, &mut next);
                 reach.extend(next.iter().map(|&n| (n, value)));
             }
             for &(n, value) in &reach {
-                match values[n] {
+                match most.values[n] {
                     None => {
-                        values[n] = Some(value);
-                        seen.push(n);
+                        most.values[n] = Some(value);
+                        most.seen.push(n);
                     }
-                    Some(kept) if kept < value => values[n] = Some(value),
+                    Some(kept) if kept < value => most.values[n] = Some(value),
                     Some(_) => {}
                 }
+                most.best = most.best.max(value);
             }
         }
-        seen.iter().filter_map(|&s| values[s]).max().unwrap_or(0)
+        most.through = self.added.len();
+        most.best
     }
 
     /// The dimensions on which the jobs beside X could be too many for the
@@ -535,7 +578,7 @@ impl<'a> Beside<'a> {
 
     /// The most that could be in use of `dim`, not tracked, when X starts:
     /// X's amount and [`Beside::most`], within the room.
-    fn used(&self, infos: &[Info], dim: Dim) -> u64 {
+    fn used(&self, infos: &[Info], dim: Dim<'a>) -> u64 {
         let most = self.most(infos, dim);
         self.room(dim).map_or(most, |room| most.min(room)) + self.x_amount(dim)
     }
@@ -623,12 +666,12 @@ impl Moves {
 /// The rule for the job at `at`, given which jobs before it may start now
 /// and what could run beside each start ahead of it. With `explain`, every
 /// shortage is worked out; without, the first ends it.
-fn judge(
-    infos: &[Info],
+fn judge<'a>(
+    infos: &[Info<'a>],
     at: usize,
     may_start: &[bool],
     measured: &[usize],
-    starts: &[Start],
+    starts: &[Start<'a>],
     outside: Option<Outside>,
     explain: bool,
 ) -> Admission {

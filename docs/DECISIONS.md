@@ -422,7 +422,8 @@ that have little room (at most 64 each, and at most 4,096 usage vectors in
 all). Any other dimension is bounded by the sum of the jobs' largest amounts
 and the room, which only makes the bound larger. Where that bound alone keeps
 a job waiting, the most of that dimension over the sets that fit on the others
-is worked out from the jobs beside X, so jobs that cannot run together are not
+is worked out from the jobs beside X, and kept as more jobs are passed until
+the states are worked out again, so jobs that cannot run together are not
 counted together. Keeping that most in every usage vector instead, as first
 tried, cost rebuilds whenever a job ahead recorded a larger limit or a second
 job used a dimension, and a rebuild that left no usage vectors lost it,
