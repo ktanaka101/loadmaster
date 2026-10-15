@@ -158,3 +158,46 @@ fn jobs_running_in_another_versions_queue_are_told_of() {
     let out = stdout(&sandbox.run(&["status"]));
     assert!(!out.contains("another loadmaster version"), "{out}");
 }
+
+#[test]
+fn status_as_json_says_what_the_table_says() {
+    let probe = Sandbox::new(4, "");
+    let tasks = sh_task("hold", 3, &probe.hold_script("hold")) + &sh_task("e2e", 4, "true");
+    std::fs::write(probe.repo.join(".loadmaster.toml"), tasks).unwrap();
+    let sandbox = probe;
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let mut waiter = sandbox.spawn(&["run", "e2e"]);
+    wait_until("e2e to wait", || {
+        sandbox
+            .job("e2e")
+            .is_some_and(|j| j.state == JobState::Waiting)
+    });
+
+    let output = sandbox.run(&["status", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["format"], 1);
+    assert_eq!(status["capacity"], 4);
+    assert_eq!(status["cores_in_use"], 3);
+    let jobs = status["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0]["state"], "running");
+    assert_eq!(jobs[0]["task"], "hold");
+    assert_eq!(jobs[0]["cores"], 3);
+    assert_eq!(jobs[0]["wait"], serde_json::Value::Null);
+    assert_eq!(jobs[1]["state"], "waiting");
+    let why = &jobs[1]["wait"];
+    assert_eq!(why["starts_now"], false);
+    assert_eq!(why["ahead"], 0);
+    assert_eq!(why["for"][0]["need"], "cores");
+    assert_eq!(why["for"][0]["reason"], "in_use");
+    assert_eq!(why["for"][0]["used"], 3);
+    assert_eq!(why["for"][0]["limit"], 4);
+    assert_eq!(why["for"][0]["held_by"], serde_json::json!([1]));
+    assert_eq!(why["text"], "all 4 cores (3 in use)");
+
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+    assert!(wait(&mut waiter).success());
+}

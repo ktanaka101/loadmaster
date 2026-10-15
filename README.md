@@ -21,8 +21,9 @@ With capacity 8, lint = 1, test = 4 and e2e = 8:
 A count-based limit can't express this: set it low and the machine idles while
 lints wait; set it high and three e2e runs at once bring the machine down.
 
-The line is first come, first served, so a big job is never starved by a
-stream of small ones. CPU is not the only limit: tasks can also use named
+The line is first come, first served: a small job passes a big one only where
+it cannot be in its way when the big one starts, so a big job is never starved
+by a stream of small ones. CPU is not the only limit: tasks can also use named
 resources, such as a few local database stacks, memory, or the one dev server
 port a checkout has.
 
@@ -80,8 +81,8 @@ Not sure? Record a baseline first and compare; see
 loadmaster is new (0.11). What has been verified:
 
 - Integration tests that start real `loadmaster` processes check that the
-  capacity is never exceeded (from the tasks' own records), that big jobs are
-  not overtaken, that `kill -9` of waiting and running jobs is recovered from,
+  capacity is never exceeded (from the tasks' own records), that no job is
+  delayed by the jobs behind it, that `kill -9` of waiting and running jobs is recovered from,
   nested runs, exit codes and config errors. They run on macOS and Linux, also
   in a container without an init process.
 - A soak test simulates five agents with Claude Code-style timeouts (SIGTERM,
@@ -383,22 +384,21 @@ cmd = ["npx", "eslint", "."]
   every other check off the machine, and while it waits, every job behind it
   waits too.
 
-A job waiting for a resource holds back only that resource: a lint that needs
-no database can start while an e2e run waits for one, as long as it leaves the
-e2e run the CPU it will need. A job waiting for CPU still holds back everyone
-behind it. See [How it works](#how-it-works).
+A job waiting for a resource keeps out only what would be in its way when it
+starts: a lint that needs no database can start while an e2e run waits for
+one, as long as it will still fit beside the e2e run then. See
+[How it works](#how-it-works).
 
-While the job waits, it sets that share aside, less what it is sure to get
-back by the time it can start: a job waiting for what a running task holds
-can only start once that task ends, which frees the task's cores too. So a
-unit run waiting for the browser that a long UI capture holds counts on the
-cores the capture frees, as far as jobs ahead of it do not count on them
-already, and sets aside only the rest: checks behind it run in the cores
-left. A weight above the capacity minus the long-running task's
-still keeps them out: the waiting job is then short of CPU too and holds back
-everyone behind it. `loadmaster check` points out the tasks whose weights do
-that on this machine, and `loadmaster status` shows what each waiting job
-sets aside and what it counts on getting back.
+A job that waits for what a running task holds can only start once that task
+ends, so the checks behind it need only fit beside the task now and beside
+the waiting job at its start, without the task. A unit run waiting for the
+browser a long UI capture holds keeps nothing from the checks behind it that
+fit beside the capture, and a second capture waiting for the first keeps
+nothing either. A waiting run with more cores than the task it waits for
+keeps out the checks that fit beside that task but not beside it:
+`loadmaster check` points out the tasks whose weights do that on this
+machine, and `loadmaster status` shows what each waiting job would not fit
+beside.
 
 Make manual operations on a resource tasks too, such as resetting the e2e
 database by hand: `uses = { e2e-db = 1 }` then makes them wait for the runs
@@ -459,9 +459,10 @@ above, and give the script itself a timeout that covers the waits. An agent
 that needs to keep its place across tool timeouts can run the checks one
 command at a time instead.
 
-Not every check has to be a task. A job waiting for CPU holds back every job
-behind it, so a quick check queued behind a heavy one waits for it, even with
-cores free; that is what keeps heavy jobs from starving. A check that keeps a
+Not every check has to be a task. A quick check queued behind a heavy one
+that waits for cores waits too, even with cores free, unless it will fit
+beside the heavy one when that starts; that is what keeps heavy jobs from
+starving. A check that keeps a
 core busy for a few seconds, such as a single test file, can instead run
 outside the queue and never wait. Leave room for such checks in the capacity
 (the default keeps 2 cores out of it).
@@ -498,7 +499,7 @@ file it names must exist, while a missing file in the default place means all
 defaults. Like `.loadmaster.toml`, the file can name the oldest loadmaster
 that reads it with `min_version`, for a file shared across machines.
 
-The queue lives in `~/.local/state/loadmaster/queue-v3.db` (`$XDG_STATE_HOME`,
+The queue lives in `~/.local/state/loadmaster/queue-v4.db` (`$XDG_STATE_HOME`,
 `LOADMASTER_STATE_DIR`). The number is the version of its layout: loadmaster
 versions with different layouts keep separate queues and do not count each
 other's jobs, so give every agent on a machine the same version (as one
@@ -515,18 +516,17 @@ line, the process that later reclaims the job writes one with outcome `lost`.
 
 ## How it works
 
-- **Admission**: jobs are considered in line order. A job starts when its
-  weight and each resource it uses fit in what the running jobs ahead of it
-  leave free and in what the jobs ahead of it set aside: a job waiting in
-  line sets aside what it needs wherever that fits, less what is sure to be
-  freed by the time it can start (what the job whose end it waits for frees),
-  and holds back entirely what it is short of.
-  No job is ever delayed by jobs that got in line after it. Every task uses
-  CPU, so a small job never overtakes a big job waiting for CPU, and the big
-  job starts as soon as enough running jobs finish; the price is that a quick
-  lint can wait behind an e2e run even while some cores are free. A job
-  waiting only for a resource, such as a database stack, lets jobs that don't
-  need it pass, as long as they leave it the CPU it needs.
+- **Admission**: jobs are judged in line order. A job starts when its weight
+  and each resource it uses fit beside the running jobs ahead of it now, and
+  will still fit beside every job ahead of it that waits, when that one
+  starts, next to whatever else could be running then. A job decides from the
+  jobs ahead of it alone, so no job is ever delayed by jobs that got in line
+  after it, and the jobs that start never take the machine past a limit. A
+  small job can start ahead of a big one that waits for cores only where it
+  cannot be in its way; when the big one needs the whole machine, a quick
+  lint waits behind it even while some cores are free. A job waiting for a
+  resource, such as a database stack, lets jobs that don't need it pass, as
+  long as they fit beside it when it starts.
 - **Crashes**: state is a per-user SQLite database. Every update first checks
   that the processes holding places and slots are still alive (comparing PID
   and process start time, so a reused PID can't fool it):
@@ -579,9 +579,8 @@ line, the process that later reclaims the job writes one with outcome `lost`.
   cannot tell why a check failed, so it does not retry it or change weights.
 - **Why a job waits** is worked out by the admission rule itself, which
   `loadmaster status` and the waiting messages report: a dimension in use by
-  running jobs, one set aside for jobs ahead, or one a job ahead waits for
-  too, with the jobs that cause it, and what the waiting job sets aside and
-  counts on getting back meanwhile.
+  the running jobs ahead (or those about to start), or one it would not fit
+  beside a job ahead when that one starts, with the jobs that cause it.
 
 ### Nested runs
 
@@ -612,8 +611,8 @@ but keeps the job's place in line for 120 seconds. Running the same command
 again from the same directory resumes that place instead of joining the back of
 the line. "The same command" means the same caller directory, task name and
 extra arguments; if the task's weight or resources changed in the meantime,
-the re-run gets in line again instead. A kept place still holds back jobs
-behind it, as if it were waiting, until it is resumed or expires. The 120
+the re-run gets in line again instead. Jobs behind a kept place still leave
+room for it, as if it were waiting, until it is resumed or expires. The 120
 seconds are fixed, and each resumed run may again wait up to `--max-wait`.
 
 `LOADMASTER_MAX_WAIT` sets the default for `--max-wait`; set to an empty
@@ -636,7 +635,8 @@ loadmaster held [--uses RESOURCE]
 - `status`: show used/total capacity, resources in use, the load average,
   the CPU busy beyond what running jobs got, jobs running in another
   version's queue, every running, waiting or parked job, and what each
-  waiting job waits for.
+  waiting job waits for. `--json` prints it for tools; see
+  [Status as JSON](#status-as-json).
 - `cancel`: stop jobs, by ID or (`--here`) every job started from this
   checkout except the one `cancel` itself runs in, and wait until they have
   left the queue. It leaves a request in the queue, and the job's own
@@ -684,17 +684,67 @@ ID  STATE    TASK       WEIGHT  USES      PID    PGID   FOR   DIR
 44  waiting  lint       3       -         10772  -      1.4s  /Users/you/src/app-wt3
 
 why jobs wait:
-  #43 `e2e` waits for `e2e-db` in its checkout (1 of 1 in use by #42 `e2e-smoke`); sets aside 1 core meanwhile; counts on 1 core and `e2e-db` that #42 `e2e-smoke` frees when it ends
-  #44 `lint` waits for 3 cores (3 free, but 1 set aside for #43 `e2e`)
+  #43 `e2e` waits for `e2e-db` in its checkout (1 of 1 in use by #42 `e2e-smoke`)
+  #44 `lint` waits for 3 cores (6 of 8 could be in use when #43 `e2e` starts, beside #41 `test`)
 ```
 
-Job 43 waits because `app-wt2` already has its one `e2e-db`. It can only
-start once job 42 ends, which frees a core and an `e2e-db`, so of the 2 cores
-it needs it sets aside only 1 meanwhile. Job 44 waits although 3 cores are
-free: one of them is set aside for job 43. `FOR` is the time spent in the current
+Job 43 waits because `app-wt2` already has its one `e2e-db`. Job 44 would fit
+in the 3 cores free now, but job 43 starts once job 42 ends, maybe while job
+41 still runs, and then 6 of the 8 cores are in use: the lint would take the
+machine past its capacity, so it waits. `FOR` is the time spent in the current
 state. The load average counts everything on the machine; well above the
 capacity in use, it points to work outside the queue, here a build run
 directly.
+
+### Status as JSON
+
+`loadmaster status --json` prints the same as one JSON object, for tools. Its
+format is versioned, and any change to it is listed as a breaking change of a
+release; the table above may change in any release.
+
+- `format`: 1.
+- `capacity`, `capacity_source`, `measure_only`, and `cores_in_use` by
+  running jobs.
+- `cpu`: if jobs adapt to CPU outside the queue, `{cores,
+  busy_beyond_running_jobs, start_limit}`, `start_limit` being the most cores
+  a job starts with now; else `null`.
+- `load_average` over the last minute, or `null`.
+- `resources`: `{name, in_use, capacity}` for each machine-wide resource a job
+  uses (`capacity` is `null` if nothing limits it).
+- `other_queues`: `{file, running}` for each queue of another loadmaster
+  version with jobs running, `running` being their tasks.
+- `reclaimed`: how many jobs whose processes were gone were reclaimed.
+- `jobs`, in line order, each with:
+  - `id`, `task`, `weight`, `cores` (what it started with, once it runs, else
+    `null`), `uses` (for each resource, `{amount, capacity, per_checkout}` as
+    the job got in line with them, the limits `null` where it had none),
+    `dir` and `checkout` (bytes that are not UTF-8 replaced), `args`, `pid`
+    (of its `loadmaster`) and `pgid` (of its task), or `null`;
+    `enqueued_at_ms`, `started_at_ms` and `parked_at_ms` (milliseconds since
+    the Unix epoch, or `null`); `capacity`, `adapts_to_outside_cpu`,
+    `measure_only`;
+  - `state`: `running`; `waiting`; `parked` (gave up waiting, keeps its place
+    for a re-run); `orphaned` (its `loadmaster` is gone, its task still runs);
+    or `lingering` (its task's command exited, and processes it left in its
+    process group hold the slot);
+  - `processes`: for a lingering job, `{pid, name}` of each process in its
+    group; else `null`;
+  - `wait`: `null` for a job that runs. For one that waits or is parked,
+    `{starts_now, ahead, for, text}`: `starts_now` is true if the rule lets it
+    start now (it does on its next poll, unless parked), `ahead` is the number
+    of jobs ahead of it that have not started (`null` with `starts_now`),
+    `text` the reason as the table words it, and `for` what it waits for,
+    each with:
+    - `need` (`cores`, `resource` or `checkout_resource`), `resource` (its
+      name, or `null`) and `amount`;
+    - `reason`: `in_use`, if the jobs ahead that run or are about to start,
+      `held_by` (IDs), use `used` of `limit` (`cpu_outside` is `{busy, cores}`
+      if CPU outside the queue lowered the limit, else `null`); or
+      `beside_start`, if `used` of `limit` could be in use when job `start`
+      starts, `beside` being IDs of jobs that could run beside it then, or
+      `null` when the amount is only a bound;
+    - `limit_set_by`: the ID of the job ahead whose record set a limit
+      smaller than this job's own, or `null`.
 
 ### Exit codes
 

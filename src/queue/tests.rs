@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -37,14 +38,7 @@ fn said(admission: Admission) -> String {
     match admission {
         Admission::Admitted => "admitted".to_owned(),
         Admission::Waiting(wait) => {
-            let mut text = format!("{} ahead; waits for {}", wait.ahead, wait.waits_for());
-            if let Some(reserved) = wait.reserves_text() {
-                text += &format!("; sets aside {reserved}");
-            }
-            if let Some(counted) = wait.counts_on_text() {
-                text += &format!("; counts on {counted}");
-            }
-            text
+            format!("{} ahead; waits for {}", wait.ahead, wait.waits_for())
         }
     }
 }
@@ -83,16 +77,17 @@ fn admits_jobs_up_to_capacity() {
 }
 
 #[test]
-fn small_jobs_never_overtake_the_head() {
+fn small_jobs_do_not_overtake_a_head_they_would_delay() {
     let f = fixture();
     let running = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
     assert_eq!(running.try_admit().unwrap(), Admission::Admitted);
     let big = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
     let small = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
-    // The small job would fit, but the big one is ahead of it.
+    // The small job would fit now, but the big one ahead of it needs the
+    // whole machine when it starts.
     assert_eq!(
         said(small.try_admit().unwrap()),
-        "1 ahead; waits for 1 core (behind #2 `e2e`, which waits for them too)"
+        "1 ahead; waits for 1 core (8 of 8 could be in use when #2 `e2e` starts)"
     );
     assert_eq!(
         said(big.try_admit().unwrap()),
@@ -274,7 +269,7 @@ fn parked_head_blocks_until_it_expires() {
     let next = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
     assert_eq!(
         said(next.try_admit().unwrap()),
-        "1 ahead; waits for 1 core (8 free, but 8 set aside for #1 `e2e`)"
+        "1 ahead; waits for 1 core (8 of 8 could be in use when #1 `e2e` starts)"
     );
     let expired = unix_ms(SystemTime::now() - PARK_TTL - Duration::from_secs(1));
     f.queue
@@ -632,8 +627,38 @@ fn admitted(jobs: &[Job], id: JobId) -> bool {
     decide(jobs, id, None).unwrap() == Admission::Admitted
 }
 
+fn browser(amount: u32) -> Use {
+    res("browser", amount, 1)
+}
+
+fn res(name: &str, amount: u32, capacity: u32) -> Use {
+    Use {
+        name: name.into(),
+        amount,
+        capacity: Some(capacity),
+        per_checkout: None,
+    }
+}
+
+/// `job` with a CPU capacity of its own, adapting to CPU outside or not.
+fn sized(job: Job, capacity: u32, adapt_cpu: bool) -> Job {
+    Job {
+        capacity,
+        adapt_cpu,
+        ..job
+    }
+}
+
+/// Jobs with tasks named.
+fn named(mut jobs: Vec<Job>, names: &[&str]) -> Vec<Job> {
+    for (job, name) in jobs.iter_mut().zip(names) {
+        job.task = (*name).to_owned();
+    }
+    jobs
+}
+
 #[test]
-fn a_job_short_of_a_resource_holds_back_only_that_resource() {
+fn a_job_short_of_a_resource_waits_for_it_alone() {
     let jobs = [
         job(1, Running, 2, vec![db(1)], "/a"),
         job(2, Running, 2, vec![db(1)], "/b"),
@@ -643,164 +668,211 @@ fn a_job_short_of_a_resource_holds_back_only_that_resource() {
     ];
     assert_eq!(
         said(decide(&jobs, 3, None).unwrap()),
-        "0 ahead; waits for `db` (2 of 2 in use by #1 `job1` and #2 `job2`); \
-         sets aside `db` in its checkout; \
-         counts on 2 cores that each of #1 `job1` and #2 `job2` frees when it ends"
+        "0 ahead; waits for `db` (2 of 2 in use by #1 `job1` and #2 `job2`)"
     );
-    assert!(admitted(&jobs, 4), "a lint needs no db");
-    assert!(!admitted(&jobs, 5), "job 3 is first in line for a db");
-}
-
-fn browser(amount: u32) -> Use {
-    Use {
-        name: "browser".into(),
-        amount,
-        capacity: Some(1),
-        per_checkout: None,
-    }
+    assert!(
+        admitted(&jobs, 4),
+        "a lint needs no db, and fits beside job 3's start"
+    );
+    assert!(!admitted(&jobs, 5), "both dbs are in use");
 }
 
 #[test]
-fn a_job_waiting_for_what_a_running_job_holds_counts_on_its_end() {
-    // A long UI capture holds the one browser. A unit run that needs it too
-    // can only start once the capture ends, which frees 5 cores: it need not
-    // set aside its 2 meanwhile, and a lint behind it starts (clew, 0.9.0).
-    let mut jobs = vec![
-        job(1, Running, 5, vec![browser(1)], "/a"),
-        job(2, Waiting, 2, vec![browser(1)], "/b"),
-        job(3, Waiting, 3, vec![], "/c"),
-    ];
-    jobs[0].task = "ui".into();
-    jobs[1].task = "unit".into();
-    jobs[2].task = "lint".into();
-    let said_for = |jobs: &[Job], id| said(decide(jobs, id, None).unwrap());
+fn a_check_starts_beside_a_run_waiting_for_what_a_long_run_holds() {
+    // A long UI capture holds the one browser; a unit run waits for it. The
+    // unit run can only start once the capture ends, so a lint fits beside
+    // it then, and beside the capture now (clew, 0.9.0).
+    let jobs = named(
+        vec![
+            job(1, Running, 5, vec![browser(1)], "/a"),
+            job(2, Waiting, 2, vec![browser(1)], "/b"),
+            job(3, Waiting, 3, vec![], "/c"),
+        ],
+        &["ui", "unit", "lint"],
+    );
     assert_eq!(
-        said_for(&jobs, 2),
-        "0 ahead; waits for `browser` (1 of 1 in use by #1 `ui`); \
-         counts on 2 cores that #1 `ui` frees when it ends"
+        said(decide(&jobs, 2, None).unwrap()),
+        "0 ahead; waits for `browser` (1 of 1 in use by #1 `ui`)"
     );
     assert!(admitted(&jobs, 3));
-    // A capture that frees only 1 core leaves the unit run 1 to set aside.
-    jobs[0].weight = 1;
-    jobs[0].granted = Some(1);
-    assert_eq!(
-        said_for(&jobs, 2),
-        "0 ahead; waits for `browser` (1 of 1 in use by #1 `ui`); sets aside 1 core; \
-         counts on 1 core that #1 `ui` frees when it ends"
-    );
 }
 
 #[test]
-fn a_job_that_a_waiting_job_ahead_may_let_in_counts_on_nothing() {
-    // The unit run waits for the browser that job 2, ahead of it, waits for
-    // too: job 2 may leave the line instead, freeing nothing, and let it in.
+fn runs_waiting_in_turn_for_one_resource_keep_no_cores_from_others() {
+    // A capture (8 of 12 cores) holds the browser; three 4-core units wait
+    // for it in turn, and a 4-core lint behind them starts (clew, 0.11).
+    let b = || vec![browser(1)];
+    let mut jobs: Vec<Job> = vec![sized(job(1, Running, 8, b(), "/a"), 12, true)];
+    for id in 2..=4 {
+        jobs.push(sized(job(id, Waiting, 4, b(), "/b"), 12, true));
+    }
+    jobs.push(sized(job(5, Waiting, 4, vec![], "/c"), 12, true));
+    assert!(admitted(&jobs, 5));
+    // A second capture waiting behind the first holds nothing back either.
+    let captures = [
+        sized(job(1, Running, 8, b(), "/a"), 12, true),
+        sized(job(2, Waiting, 8, b(), "/b"), 12, true),
+        sized(job(3, Waiting, 4, vec![], "/c"), 12, true),
+    ];
+    assert!(admitted(&captures, 3));
+}
+
+#[test]
+fn a_small_job_starts_ahead_of_a_big_one_only_where_it_cannot_delay_it() {
+    // Job 2 needs one of the running jobs to end; beside it then, one of
+    // them may still run: 3 + 4 + 2 > 8, so job 3 (2 cores) waits ...
     let jobs = [
-        job(1, Running, 1, vec![], "/a"),
-        job(2, JobState::Parked, 1, vec![browser(1)], "/a"),
-        job(3, Waiting, 2, vec![browser(1)], "/b"),
+        job(1, Running, 3, vec![], "/a"),
+        job(2, Running, 3, vec![], "/a"),
+        job(3, Waiting, 4, vec![], "/a"),
+        job(4, Waiting, 2, vec![], "/a"),
     ];
     assert_eq!(
-        said(decide(&jobs, 3, None).unwrap()),
-        "1 ahead; waits for `browser` (1 free, but 1 set aside for #2 `job2`); \
-         sets aside 2 cores"
+        said(decide(&jobs, 4, None).unwrap()),
+        "1 ahead; waits for 2 cores (7 of 8 could be in use when #3 `job3` starts, beside \
+         #1 `job1`)"
     );
-}
-
-#[test]
-fn a_job_counts_on_the_end_of_a_job_ahead_that_has_not_started_too() {
-    // The capture holds the browser, and job 2, ahead of the unit run, waits
-    // for it too: job 2 may start first and end last, freeing what it will
-    // start with, at least 1 core while CPU outside the queue can lower that.
-    // Job 2 counts on 2 of the capture's 5 cores itself.
-    let mut jobs = vec![
-        job(1, Running, 5, vec![browser(1)], "/a"),
-        job(2, Waiting, 2, vec![browser(1)], "/b"),
-        job(3, Waiting, 3, vec![browser(1)], "/c"),
-    ];
-    assert_eq!(
-        said(decide(&jobs, 3, None).unwrap()),
-        "1 ahead; waits for `browser` (behind #2 `job2`, which waits for it too); \
-         sets aside 2 cores; counts on 1 core that each of #1 `job1` and #2 `job2` frees \
-         when it ends"
-    );
-    // Without adapting, it starts with its weight, 2 cores, and the capture
-    // has 3 left to free.
-    jobs[1].adapt_cpu = false;
-    assert_eq!(
-        said(decide(&jobs, 3, None).unwrap()),
-        "1 ahead; waits for `browser` (behind #2 `job2`, which waits for it too); \
-         sets aside 1 core; counts on 2 cores that each of #1 `job1` and #2 `job2` frees \
-         when it ends"
-    );
-}
-
-#[test]
-fn a_job_short_of_cpu_that_the_load_outside_may_free_counts_on_nothing() {
-    // The capacity is 8 of 14 cores; 9 busy outside the queue lower the CPU
-    // limit to 5. Job 2 needs 4 cores next to job 1's 2, which the load going
-    // down would let in too: it sets aside its `db`.
-    let outside = Some(Outside {
-        busy: 9.0,
-        cores: 14,
-    });
-    let jobs = [
-        job(1, Running, 2, vec![db(1)], "/a"),
-        job(2, Waiting, 4, vec![db(1)], "/b"),
-    ];
-    let Admission::Waiting(wait) = decide(&jobs, 2, outside).unwrap() else {
-        panic!("job 2 does not fit");
-    };
-    assert_eq!(wait.counts_on, None);
-    assert_eq!(
-        wait.reserves_text().as_deref(),
-        Some("`db` and `db` in its checkout")
-    );
-}
-
-#[test]
-fn what_one_end_frees_is_counted_on_once() {
-    // Job 1 holds the browser and the db's checkout slot, and frees 4 cores.
-    // Job 2 waits for the browser and job 3 for the slot, 3 cores each: job 2
-    // counts on 3 of them, which leaves job 3 only 1.
-    let jobs = [
-        job(1, Running, 4, vec![browser(1), db(1)], "/a"),
-        job(2, Waiting, 3, vec![browser(1)], "/b"),
-        job(3, Waiting, 3, vec![db(1)], "/a"),
-        job(4, Waiting, 2, vec![], "/c"),
-    ];
-    assert_eq!(
-        said(decide(&jobs, 3, None).unwrap()),
-        "1 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
-         sets aside 2 cores; counts on 1 core and `db` that #1 `job1` frees when it ends"
-    );
-    // 4 running and 2 set aside for job 3: job 4 fits in the 2 left of 8.
-    assert!(admitted(&jobs, 4));
+    // ... but 1 core fits.
     let jobs = [
         jobs[0].clone(),
         jobs[1].clone(),
         jobs[2].clone(),
-        job(4, Waiting, 3, vec![], "/c"),
+        job(4, Waiting, 1, vec![], "/a"),
+    ];
+    assert!(admitted(&jobs, 4));
+    // A 6-core job running excludes job 3 until it ends: 4 + 1 fits.
+    let jobs = [
+        job(1, Running, 6, vec![], "/a"),
+        job(2, Waiting, 4, vec![], "/a"),
+        job(3, Waiting, 1, vec![], "/b"),
+    ];
+    assert!(admitted(&jobs, 3));
+}
+
+#[test]
+fn a_job_waits_where_a_start_ahead_could_run_beside_a_running_one() {
+    // B waits for the browser C holds; when C ends, B starts beside A.
+    let jobs = [
+        sized(job(1, Running, 2, vec![browser(1)], "/a"), 12, false),
+        sized(job(2, Running, 5, vec![], "/a"), 12, false),
+        sized(job(3, Waiting, 6, vec![browser(1)], "/a"), 12, false),
+        sized(job(4, Waiting, 5, vec![], "/a"), 12, false),
+    ];
+    assert_eq!(
+        said(decide(&jobs, 4, None).unwrap()),
+        "1 ahead; waits for 5 cores (11 of 12 could be in use when #3 `job3` starts, beside \
+         #2 `job2`)"
+    );
+}
+
+#[test]
+fn a_job_that_may_start_now_may_start_later_with_more() {
+    // Job 1 may start now with 4 of its 8 cores (CPU outside), but if it does
+    // not, it may start later with 8: job 2 waits.
+    let outside = Some(Outside {
+        busy: 4.0,
+        cores: 8,
+    });
+    let jobs = [
+        sized(job(1, Waiting, 8, vec![], "/a"), 8, true),
+        sized(job(2, Waiting, 4, vec![], "/a"), 8, false),
+    ];
+    assert_eq!(decide(&jobs, 1, outside).unwrap(), Admission::Admitted);
+    assert_ne!(decide(&jobs, 2, outside).unwrap(), Admission::Admitted);
+}
+
+#[test]
+fn a_job_that_may_start_now_counts_as_running_for_the_jobs_behind() {
+    // Under a lowered limit of 1 core, job 1 starts first whatever order the
+    // two poll in.
+    let outside = Some(Outside {
+        busy: 1.0,
+        cores: 2,
+    });
+    let jobs = [
+        sized(job(1, Waiting, 1, vec![], "/a"), 2, true),
+        sized(job(2, Waiting, 1, vec![], "/a"), 2, true),
+    ];
+    assert_eq!(decide(&jobs, 1, outside).unwrap(), Admission::Admitted);
+    assert_ne!(decide(&jobs, 2, outside).unwrap(), Admission::Admitted);
+}
+
+#[test]
+fn a_job_that_adapts_may_start_beside_a_start_with_fewer_cores() {
+    // When job 1 ends, job 3 may start with 2 cores before job 2 starts,
+    // which does not see it: job 4 must leave room for both.
+    let jobs = [
+        sized(job(1, Running, 1, vec![browser(1)], "/a"), 5, false),
+        sized(job(2, Waiting, 3, vec![browser(1)], "/a"), 5, false),
+        sized(job(3, Waiting, 3, vec![], "/a"), 5, true),
+        sized(job(4, Waiting, 1, vec![], "/a"), 5, false),
     ];
     assert!(!admitted(&jobs, 4));
 }
 
 #[test]
-fn a_smaller_limit_ahead_is_named_as_the_cause() {
-    // A job queued under capacity 1 is parked ahead: the job behind it fits
-    // in its own capacity of 8, but respects that one's.
-    let mut small = job(1, JobState::Parked, 1, vec![], "/a");
-    small.capacity = 1;
-    let jobs = [small, job(2, Waiting, 4, vec![], "/b")];
+fn beside_a_job_that_starts_with_fewer_cores_runs_nothing_ahead_of_it() {
+    // Job 3 adapts: with fewer cores it starts only with no core in use
+    // ahead of it, so jobs 1 and 2 are not beside it then.
+    let jobs = [
+        sized(job(1, Running, 5, vec![], "/a"), 12, true),
+        sized(job(2, Running, 5, vec![], "/a"), 12, true),
+        sized(job(3, Waiting, 4, vec![], "/a"), 12, true),
+        sized(job(4, Waiting, 2, vec![], "/a"), 12, true),
+    ];
+    assert!(admitted(&jobs, 4));
+}
+
+#[test]
+fn limits_that_disagree_bind_by_the_smallest() {
+    // Jobs 1 and 2 record r = 10 and may run together; job 3 records 7.
+    let r = |capacity| res("r", 4, capacity);
+    let jobs = named(
+        vec![
+            sized(job(1, Waiting, 1, vec![r(10)], "/a"), 12, false),
+            sized(job(2, Waiting, 1, vec![r(10)], "/a"), 12, false),
+            sized(job(3, Waiting, 1, vec![res("r", 3, 7)], "/a"), 12, false),
+        ],
+        &["a", "z", "k"],
+    );
     assert_eq!(
-        said(decide(&jobs, 2, None).unwrap()),
-        "1 ahead; waits for 4 cores (#1 `job1`, ahead, got in line with a limit of 1)"
+        said(decide(&jobs, 3, None).unwrap()),
+        "2 ahead; waits for 3 of `r` (8 of 7 in use by #1 `a` and #2 `z`)"
+    );
+    // A job ahead with a smaller capacity binds only its own start: 8 + 4
+    // now, and 4 + 4 of its 8 when it starts beside job 3.
+    let jobs = [
+        sized(job(1, Running, 8, vec![browser(1)], "/a"), 12, false),
+        sized(job(2, Waiting, 4, vec![browser(1)], "/a"), 8, false),
+        sized(job(3, Waiting, 4, vec![], "/a"), 12, false),
+    ];
+    assert!(admitted(&jobs, 3));
+    let jobs = [
+        sized(job(1, Running, 7, vec![browser(1)], "/a"), 12, false),
+        sized(job(2, Waiting, 4, vec![browser(1)], "/a"), 8, false),
+        sized(job(3, Waiting, 5, vec![], "/a"), 12, false),
+    ];
+    assert_eq!(
+        said(decide(&jobs, 3, None).unwrap()),
+        "1 ahead; waits for 5 cores (4 of 8 could be in use when #2 `job2` starts; the limit \
+         is the one #2 `job2` got in line with)"
     );
 }
 
 #[test]
-fn what_a_waiting_job_sets_aside_includes_unlimited_resources() {
-    // Job 2 records no limit for `gpu`, but sets it aside, and job 3, which
-    // has one, waits for it.
+fn a_use_without_a_limit_of_its_own_still_counts() {
+    // Without a per-checkout limit, job 2 still uses the checkout's db.
+    let jobs = [
+        job(1, Running, 1, vec![db(1)], "/a"),
+        job(2, Waiting, 1, vec![capped_db(1)], "/a"),
+    ];
+    assert_eq!(
+        said(decide(&jobs, 2, None).unwrap()),
+        "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`; the limit is \
+         the one #1 `job1` got in line with)"
+    );
+    // Without a machine-wide one, job 2 still uses a gpu, which job 3 waits
+    // for when job 2 starts.
     let gpu = |capacity| Use {
         name: "gpu".into(),
         amount: 1,
@@ -813,40 +885,56 @@ fn what_a_waiting_job_sets_aside_includes_unlimited_resources() {
         job(3, Waiting, 1, vec![gpu(Some(1))], "/b"),
     ];
     assert_eq!(
-        said(decide(&jobs, 2, None).unwrap()),
-        "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
-         sets aside `gpu`; counts on 1 core and `db` that #1 `job1` frees when it ends"
-    );
-    assert_eq!(
         said(decide(&jobs, 3, None).unwrap()),
-        "1 ahead; waits for `gpu` (1 free, but 1 set aside for #2 `job2`); sets aside 1 core"
+        "1 ahead; waits for `gpu` (1 of 1 could be in use when #2 `job2` starts)"
     );
 }
 
 #[test]
-fn a_job_short_of_cpu_holds_back_everyone_behind_it() {
+fn measure_only_jobs_count_where_they_run_and_may_end() {
+    // Job 1 started without the rule: it counts now, but beside job 3's start
+    // it may have ended, and then job 2 runs beside job 3.
+    let mut measured = sized(job(1, Running, 1, vec![res("r", 1, 2)], "/a"), 12, false);
+    measured.measure_only = true;
     let jobs = [
-        job(1, Running, 6, vec![], "/a"),
-        job(2, Waiting, 4, vec![], "/a"),
-        job(3, Waiting, 1, vec![], "/b"),
+        measured,
+        sized(job(2, Running, 5, vec![res("r", 1, 2)], "/a"), 12, false),
+        sized(job(3, Waiting, 5, vec![res("r", 1, 2)], "/a"), 12, false),
+        sized(job(4, Waiting, 6, vec![], "/a"), 12, false),
     ];
-    assert!(!admitted(&jobs, 3), "1 core is free, but job 2 needs it");
+    assert!(!admitted(&jobs, 4));
+    // One behind a job counts for it too.
+    let mut measured = sized(job(2, Running, 4, vec![browser(1)], "/a"), 8, false);
+    measured.measure_only = true;
+    let jobs = [
+        sized(job(1, Waiting, 4, vec![browser(1)], "/a"), 8, false),
+        measured,
+        sized(job(3, Waiting, 4, vec![], "/a"), 8, false),
+    ];
+    assert!(!admitted(&jobs, 1));
+    assert!(admitted(&jobs, 3));
 }
 
 #[test]
-fn jobs_behind_leave_a_waiting_job_its_share() {
+fn a_parked_job_keeps_its_protection() {
     let jobs = [
-        job(1, Running, 1, vec![db(1)], "/a"),
-        job(2, Running, 1, vec![db(1)], "/b"),
-        // Short of a db; it fits on CPU, and counts on 1 core from whichever
-        // of jobs 1 and 2 ends, so 1 core is set aside for it.
-        job(3, Waiting, 2, vec![db(1)], "/c"),
-        job(4, Waiting, 4, vec![], "/a"),
-        // 2 running + 1 set aside for job 3 + 4 for job 4, about to start.
-        job(5, Waiting, 2, vec![], "/a"),
+        sized(job(1, Running, 4, vec![], "/a"), 4, false),
+        sized(job(2, JobState::Parked, 4, vec![], "/a"), 4, false),
+        sized(job(3, Waiting, 4, vec![], "/a"), 4, false),
     ];
-    assert!(admitted(&jobs, 4));
-    assert!(!admitted(&jobs, 5));
+    assert!(!admitted(&jobs, 3));
+}
+
+#[test]
+fn large_capacities_cost_no_more_than_small_ones() {
+    let jobs = [
+        sized(job(1, Running, 1, vec![], "/a"), 1_000_000, true),
+        sized(job(2, Waiting, 1_000_000, vec![], "/a"), 1_000_000, true),
+        sized(job(3, Waiting, 1, vec![], "/a"), 1_000_000, true),
+    ];
+    let started = std::time::Instant::now();
+    assert!(!admitted(&jobs, 3));
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
 }
 
 #[test]
@@ -863,11 +951,10 @@ fn per_checkout_limits_count_only_their_checkout() {
     ];
     assert_eq!(
         said(decide(&same_checkout, 2, None).unwrap()),
-        "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`); \
-         counts on 2 cores and `db` that #1 `job1` frees when it ends"
+        "0 ahead; waits for `db` in its checkout (1 of 1 in use by #1 `job1`)"
     );
-    // Job 2 can only start once job 1 ends, which frees a machine-wide db
-    // too: job 3, of another checkout, takes the one free meanwhile.
+    // Job 2 starts only once job 1 ends, which frees the db it uses: job 3,
+    // of another checkout, takes the one free meanwhile.
     assert!(admitted(&same_checkout, 3));
 }
 
@@ -892,7 +979,7 @@ fn a_job_without_a_capacity_still_counts_toward_others_limits() {
         job(4, Waiting, 1, vec![uncapped_db(1)], "/d"),
     ];
     assert!(!admitted(&jobs, 3), "2 of 2 in use");
-    assert!(!admitted(&jobs, 4), "job 3 is short of a db ahead of it");
+    assert!(!admitted(&jobs, 4), "job 2's limit of 2 binds it too");
 }
 
 #[test]
@@ -911,19 +998,16 @@ fn unlimited_resources_do_not_hold_anyone_back() {
 }
 
 #[test]
-fn a_job_behind_respects_the_smallest_limit_ahead() {
-    // Processes may disagree on a capacity. Job 1 got in line with CPU
-    // capacity 4 and waits for a db; job 2 says 8, but taking 3 cores would
-    // leave job 1 too little by its own measure once a db frees up.
-    let mut short_of_db = job(1, Waiting, 3, vec![db(1)], "/a");
-    short_of_db.capacity = 4;
+fn a_job_behind_respects_the_smallest_capacity_of_a_start_ahead() {
+    // Job 1 got in line with a CPU capacity of 4 and may start now; job 4
+    // says 8, but beside job 1 and job 3 it would take the machine past 4.
+    let mut small = job(1, Waiting, 3, vec![db(1)], "/a");
+    small.capacity = 4;
     let jobs = [
+        small,
         job(3, Running, 1, vec![db(1)], "/a"),
-        short_of_db,
         job(4, Waiting, 3, vec![], "/b"),
     ];
-    let mut jobs = jobs.to_vec();
-    jobs.sort_by_key(|j| j.id);
     assert!(!admitted(&jobs, 4));
 }
 
@@ -935,32 +1019,77 @@ struct Arrival {
     weight: u32,
     uses: Vec<Use>,
     checkout: &'static str,
+    /// When it leaves the line, if it has not started by then.
+    leaves: Option<u32>,
+    adapt: bool,
+    capacity: u32,
+    /// When it parks (if it waits then), and when it resumes; if never, its
+    /// place expires 5 steps later.
+    parks: Option<(u32, Option<u32>)>,
 }
 
+/// The "start" of a job that left the line, for comparing runs.
+const LEFT: u32 = u32::MAX;
+
 /// CPU busy outside the queue at each time step, of a machine with 14 cores
-/// (the jobs' capacity is 8).
+/// (the jobs' capacity is 6 or 8).
 type Load<'a> = &'a dyn Fn(u32) -> Option<Outside>;
 
+thread_local! {
+    /// A seed for polling in a random order instead.
+    static POLL_SEED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Runs `arrivals` through the admission rule in discrete time steps, letting
-/// every waiting job poll (in `order`) until nothing changes, and returns
-/// when each job started. Checks every limit after each step.
+/// every waiting job poll (in line order, the reverse, or a random order)
+/// until nothing changes, and returns when each job started (`LEFT` if it
+/// left the line). Checks every limit, and the explanations, after each step.
 fn simulate(arrivals: &[Arrival], reverse: bool, outside: Load) -> Vec<u32> {
     let mut jobs: Vec<Job> = Vec::new();
     let mut started = vec![None; arrivals.len()];
     for t in 0..10_000 {
-        // Finish, then arrive.
+        // Finish, leave, park, resume, expire, then arrive.
         jobs.retain(|j| {
             let i = j.id as usize - 1;
-            started[i].is_none_or(|s: u32| s + arrivals[i].duration > t)
+            started[i].is_none_or(|s: u32| s == LEFT || s + arrivals[i].duration > t)
+        });
+        jobs.retain(|j| {
+            let i = j.id as usize - 1;
+            let leaving = j.state == Waiting && arrivals[i].leaves == Some(t);
+            if leaving {
+                started[i] = Some(LEFT);
+            }
+            !leaving
+        });
+        for j in jobs.iter_mut() {
+            match arrivals[j.id as usize - 1].parks {
+                Some((at, _)) if at == t && j.state == Waiting => j.state = JobState::Parked,
+                Some((_, Some(back))) if back == t && j.state == JobState::Parked => {
+                    j.state = Waiting;
+                }
+                _ => {}
+            }
+        }
+        jobs.retain(|j| {
+            let i = j.id as usize - 1;
+            let expired = j.state == JobState::Parked
+                && matches!(arrivals[i].parks, Some((at, None)) if at + 5 == t);
+            if expired {
+                started[i] = Some(LEFT);
+            }
+            !expired
         });
         for (i, a) in arrivals.iter().enumerate().filter(|(_, a)| a.at == t) {
-            let id = i as JobId + 1;
-            jobs.push(job(
-                id,
-                Waiting,
-                a.weight.min(8),
-                a.uses.clone(),
-                a.checkout,
+            jobs.push(sized(
+                job(
+                    i as JobId + 1,
+                    Waiting,
+                    a.weight.min(a.capacity),
+                    a.uses.clone(),
+                    a.checkout,
+                ),
+                a.capacity,
+                a.adapt,
             ));
         }
         loop {
@@ -971,6 +1100,12 @@ fn simulate(arrivals: &[Arrival], reverse: bool, outside: Load) -> Vec<u32> {
                 .collect();
             if reverse {
                 ids.reverse();
+            }
+            if let Some(seed) = POLL_SEED.get() {
+                let mut order = Rng(seed ^ (u64::from(t) << 32 | ids.len() as u64) | 1);
+                for i in (1..ids.len()).rev() {
+                    ids.swap(i, order.below(i as u32 + 1) as usize);
+                }
             }
             let admit = ids
                 .into_iter()
@@ -990,25 +1125,26 @@ fn simulate(arrivals: &[Arrival], reverse: bool, outside: Load) -> Vec<u32> {
     panic!("the workload did not finish: {started:?}");
 }
 
+/// The running jobs use no more on any dimension than the smallest limit any
+/// of them records for it (CPU: the smallest capacity).
 fn assert_within_limits(jobs: &[Job]) {
     let mut used: BTreeMap<Dim, u64> = BTreeMap::new();
     let mut limits: BTreeMap<Dim, u64> = BTreeMap::new();
     for job in jobs.iter().filter(|j| j.state == Running) {
         for (dim, amount, limit) in demands(job, None) {
             *used.entry(dim).or_default() += amount;
-            limits.insert(dim, limit);
+            let limit = if dim == Dim::Cpu {
+                u64::from(job.capacity)
+            } else {
+                limit
+            };
+            let entry = limits.entry(dim).or_insert(u64::MAX);
+            *entry = (*entry).min(limit);
         }
     }
     for (dim, used) in used {
         assert!(used <= limits[&dim], "{dim:?}: {used} > {}", limits[&dim]);
     }
-}
-
-thread_local! {
-    /// How many waiting jobs `assert_explained` found counting on what a job
-    /// ahead frees, rather than setting it aside: the simulations must take
-    /// that path too.
-    static COUNTED_ON: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Once no job can start, `explain` says so for every job, giving reasons,
@@ -1020,25 +1156,15 @@ fn assert_explained(jobs: &[Job], outside: Option<Outside>) {
         jobs.iter().filter(|j| j.state != Running).count()
     );
     for (id, admission) in explained {
+        let job = jobs.iter().find(|j| j.id == id).unwrap();
         assert_eq!(admission, decide(jobs, id, outside).unwrap());
         match admission {
+            // A parked job does not poll.
+            Admission::Admitted if job.state == JobState::Parked => {}
             Admission::Admitted => panic!("job {id} could start but did not"),
-            Admission::Waiting(wait) => {
-                assert!(!wait.short.is_empty(), "job {id}");
-                if wait.counts_on.is_some() {
-                    COUNTED_ON.set(COUNTED_ON.get() + 1);
-                }
-            }
+            Admission::Waiting(wait) => assert!(!wait.short.is_empty(), "job {id}"),
         }
     }
-}
-
-/// Runs `simulations`, and checks that some waiting job in them counted on
-/// what a job ahead frees.
-fn counting_on_ends(simulations: impl FnOnce()) {
-    COUNTED_ON.set(0);
-    simulations();
-    assert!(COUNTED_ON.get() > 0, "no job counted on an end");
 }
 
 /// xorshift64*: deterministic, no dependency needed.
@@ -1060,10 +1186,12 @@ fn random_workload(rng: &mut Rng, jobs: usize, resources: bool) -> Vec<Arrival> 
             at += rng.below(3);
             let mut uses = vec![];
             if resources {
-                // Some jobs record no machine-wide capacity for `db`.
-                match rng.below(6) {
+                // Some record no machine-wide capacity, some no per-checkout
+                // limit, for the same `db`.
+                match rng.below(7) {
                     0 | 1 => uses.push(db(1)),
                     2 => uses.push(uncapped_db(1)),
+                    3 => uses.push(capped_db(1)),
                     _ => {}
                 }
             }
@@ -1074,52 +1202,64 @@ fn random_workload(rng: &mut Rng, jobs: usize, resources: bool) -> Vec<Arrival> 
             if resources && rng.below(4) == 0 {
                 uses.push(browser(1));
             }
+            // Declared with capacity 1 by some repositories, 2 by others.
+            if resources && rng.below(6) == 0 {
+                uses.push(res("db1", 1, 1 + rng.below(2)));
+            }
             Arrival {
                 at,
                 duration: 1 + rng.below(6),
                 weight: [1, 1, 2, 4, 8, 9][rng.below(6) as usize],
                 uses,
                 checkout: ["/a", "/b", "/c"][rng.below(3) as usize],
+                leaves: (rng.below(5) == 0).then(|| at + 1 + rng.below(8)),
+                adapt: rng.below(3) != 0,
+                capacity: if rng.below(4) == 0 { 6 } else { 8 },
+                parks: (rng.below(6) == 0).then(|| {
+                    let p = at + rng.below(4);
+                    (p, (rng.below(3) != 0).then(|| p + 1 + rng.below(5)))
+                }),
             }
         })
         .collect()
 }
 
-#[test]
-fn no_job_is_delayed_by_jobs_that_got_in_line_after_it() {
-    counting_on_ends(no_job_is_delayed);
+/// Each job starts at the same time whatever the order in which the jobs
+/// poll, and whether or not the jobs behind it exist.
+fn check_workload(round: usize, arrivals: &[Arrival], outside: Load) {
+    let all = simulate(arrivals, false, outside);
+    assert_eq!(
+        all,
+        simulate(arrivals, true, outside),
+        "round {round}: poll order"
+    );
+    POLL_SEED.set(Some(round as u64 * 7919 + 1));
+    let shuffled = simulate(arrivals, false, outside);
+    POLL_SEED.set(None);
+    assert_eq!(all, shuffled, "round {round}: random poll order");
+    for k in 0..arrivals.len() {
+        let alone = simulate(&arrivals[..=k], false, outside);
+        assert_eq!(
+            alone[k],
+            all[k],
+            "round {round}: job {} started at {} with the later jobs, at {} without",
+            k + 1,
+            all[k],
+            alone[k]
+        );
+    }
 }
 
-fn no_job_is_delayed() {
+#[test]
+fn no_job_is_delayed_by_jobs_that_got_in_line_after_it() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for round in 0..300 {
-        let arrivals = random_workload(&mut rng, 12, true);
-        let all = simulate(&arrivals, false, &|_| None);
-        assert_eq!(
-            all,
-            simulate(&arrivals, true, &|_| None),
-            "round {round}: poll order"
-        );
-        for k in 0..arrivals.len() {
-            let alone = simulate(&arrivals[..=k], false, &|_| None);
-            assert_eq!(
-                alone[k],
-                all[k],
-                "round {round}: job {} started at {} with the later jobs, at {} without",
-                k + 1,
-                all[k],
-                alone[k]
-            );
-        }
+        check_workload(round, &random_workload(&mut rng, 12, true), &|_| None);
     }
 }
 
 #[test]
 fn cpu_busy_outside_delays_no_job_for_jobs_behind_it_and_stalls_none() {
-    counting_on_ends(cpu_busy_outside_delays_no_job);
-}
-
-fn cpu_busy_outside_delays_no_job() {
     // The CPU outside the queue changes on its own, sometimes taking all
     // 14 cores: every job still starts (or `simulate` panics), and still
     // when it would without the jobs that got in line after it.
@@ -1133,16 +1273,21 @@ fn cpu_busy_outside_delays_no_job() {
                 cores: 14,
             })
         };
-        let all = simulate(&arrivals, false, &outside);
-        assert_eq!(
-            all,
-            simulate(&arrivals, true, &outside),
-            "round {round}: poll order"
-        );
-        for k in 0..arrivals.len() {
-            let alone = simulate(&arrivals[..=k], false, &outside);
-            assert_eq!(alone[k], all[k], "round {round}: job {}", k + 1);
+        check_workload(round, &arrivals, &outside);
+    }
+}
+
+#[test]
+fn large_capacities_keep_the_promises() {
+    // Rooms above what is tracked exactly are bounded instead.
+    let mut rng = Rng(0xA5A5_5A5A_1234_4321);
+    for round in 0..100 {
+        let mut arrivals = random_workload(&mut rng, 10, true);
+        for a in &mut arrivals {
+            a.capacity *= 10;
+            a.weight *= 10;
         }
+        check_workload(round, &arrivals, &|_| None);
     }
 }
 
@@ -1293,19 +1438,6 @@ fn a_measurement_taken_earlier_does_not_replace_a_later_one() {
 }
 
 #[test]
-fn with_cpu_alone_jobs_start_in_line_order() {
-    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
-    for round in 0..300 {
-        let arrivals = random_workload(&mut rng, 12, false);
-        let started = simulate(&arrivals, false, &|_| None);
-        assert!(
-            started.windows(2).all(|w| w[0] <= w[1]),
-            "round {round}: {started:?}"
-        );
-    }
-}
-
-#[test]
 fn running_jobs_of_other_layouts_are_found_by_the_columns_every_layout_keeps() {
     let dir = tempfile::tempdir().unwrap();
     let me = ProcessId::current().unwrap();
@@ -1370,4 +1502,86 @@ fn running_jobs_of_other_layouts_are_found_by_the_columns_every_layout_keeps() {
     files.sort();
     assert_eq!(files, ["queue-v2.db"]);
     drop(running);
+}
+
+#[test]
+fn a_long_line_is_judged_in_little_time() {
+    // 28 jobs, each using a resource of its own with room for one, on 32
+    // cores (Codex); and 40 jobs sharing a few resources.
+    let own: Vec<Job> = (1..=28)
+        .map(|id| {
+            let name = format!("r{id}");
+            sized(job(id, Waiting, 1, vec![res(&name, 1, 1)], "/a"), 32, true)
+        })
+        .collect();
+    let shared: Vec<Job> = (1..=40)
+        .map(|id| {
+            let uses = match id % 4 {
+                0 => vec![browser(1)],
+                1 => vec![db(1)],
+                2 => vec![mem(1 + id as u32 % 5)],
+                _ => vec![],
+            };
+            let state = if id <= 6 { Running } else { Waiting };
+            sized(
+                job(
+                    id,
+                    state,
+                    1 + id as u32 % 4,
+                    uses,
+                    ["/a", "/b"][id as usize % 2],
+                ),
+                32,
+                true,
+            )
+        })
+        .collect();
+    for jobs in [own, shared] {
+        let started = std::time::Instant::now();
+        let last = jobs.last().unwrap().id;
+        let _ = decide(&jobs, last, None).unwrap();
+        let _ = explain(&jobs, None);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "took {took:?}"
+        );
+    }
+}
+
+#[test]
+fn a_set_beside_a_start_is_named_only_if_it_can_run() {
+    // Job 2 records a capacity of 4: beside its start nothing else runs, so
+    // job 1 is not named.
+    let jobs = [
+        sized(job(1, Running, 3, vec![], "/a"), 8, false),
+        sized(job(2, Waiting, 4, vec![], "/a"), 4, false),
+        sized(job(3, Waiting, 1, vec![], "/a"), 8, false),
+    ];
+    assert_eq!(
+        said(decide(&jobs, 3, None).unwrap()),
+        "1 ahead; waits for 1 core (4 of 4 could be in use when #2 `job2` starts; the limit is \
+         the one #2 `job2` got in line with)"
+    );
+}
+
+#[test]
+fn limits_that_keep_growing_do_not_make_the_rule_start_over() {
+    // 100 parked jobs, then 100 waiting ones that use `r`, each recording a
+    // larger capacity for it than the one before (Codex).
+    let mut jobs: Vec<Job> = (1..=100)
+        .map(|id| sized(job(id, JobState::Parked, 1, vec![], "/a"), 8, false))
+        .collect();
+    jobs.extend((101..=200).map(|id| {
+        let capacity = (id - 100) as u32;
+        sized(
+            job(id, Waiting, 1, vec![res("r", 1, capacity)], "/a"),
+            8,
+            false,
+        )
+    }));
+    let started = std::time::Instant::now();
+    let _ = decide(&jobs, 200, None).unwrap();
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
 }

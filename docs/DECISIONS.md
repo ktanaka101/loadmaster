@@ -218,11 +218,11 @@ milliseconds, so it is accepted rather than paid for with a more complex wait.
   string could make two different directories look the same.
 - A re-run resumes the place only if it asks for exactly what the parked job
   did: the same weight, resources and limits, from the same checkout. Jobs
-  behind may have started next to what the parked job set aside, and would
-  delay a re-run that needed more; one whose config changed in the meantime
-  gets in line again instead.
-- A parked job holds its place exactly like a waiting job: it sets aside what
-  it needs, or holds back what it is short of. If parked jobs let others pass
+  behind may have started beside what the parked job would start with, and
+  would delay a re-run that needed more; one whose config changed in the
+  meantime gets in line again instead.
+- A parked job holds its place exactly like a waiting job: every job behind
+  it leaves room for its start. If parked jobs let others pass
   freely, a big job whose waits keep timing out could starve: small jobs would
   refill the capacity during each gap between its attempts.
 - Parked jobs expire after 120 seconds. That comfortably covers an agent
@@ -247,9 +247,13 @@ same moment on a fresh state directory occasionally got "database is locked"
 (found in the real-tools demo, about 1 run in 300). The switch is retried for
 up to the busy timeout; everything else relies on SQLite's busy handler.
 
-The version of the database's layout is in its file name (`queue-v3.db`): a
-`loadmaster` that changes the layout uses a new file, and never changes the
-schema or the rows of one of another layout: a queue only holds the jobs that
+The version of the database's layout and of the admission rule is in its
+file name (`queue-v4.db`): the rule is the protocol between the processes
+that share a queue, so a `loadmaster` that changes either uses a new file,
+and never changes the schema or the rows of one of another layout. 0.12
+moved to `queue-v4.db` with the rule of [Resources](#resources), although
+the schema stayed: 0.11's rule does not keep the smaller capacity of a
+running job ahead, so the promises are for the new queue only. a queue only holds the jobs that
 run now, so nothing in it is worth carrying over. Versions with different layouts keep
 separate queues and do not count each other's jobs, so while both run, the
 machine and its resources can be used beyond their capacity: for the minutes
@@ -314,90 +318,97 @@ resources.
   each job by that record. A process from another repository, which may not
   know a resource at all, can still tell whether a job fits.
 
-**Admission.** The line stays first come, first served, but a job waiting in
-it holds back only what it is short of. Jobs are considered in line order, on
-every dimension at once (CPU, each machine-wide resource, each per-checkout
-resource of each checkout):
+**Admission.** Jobs are judged in line order, on every dimension at once
+(CPU, each machine-wide resource, each resource in each checkout). Every use
+of a resource counts in its checkout's dimension, with or without a
+per-checkout limit of its own, as a use without a machine-wide capacity
+counts machine-wide; before 0.12 such a use was left out of the checkout, and
+a run could take a checkout past the limit another task recorded.
 
-- A job fits if, on every dimension, what the running jobs ahead of it use
-  plus what is set aside for jobs ahead of it plus its own amount is within
-  the limit, and it uses nothing that a job ahead of it is short of. A job
-  that fits may start.
-- A job that does not fit is short of some dimensions: no job behind it may
-  use those at all. On the dimensions where it fits, its amount is set aside,
-  less what it is sure to get back by the time it can start (see below), so
-  jobs behind it can only use what is left.
-- A job ahead that fits but has not started yet (its own poll comes later)
-  has its whole amount set aside.
+A job decides from the jobs ahead of it alone (and every running
+measure-only job, which started without the rule), so no job is ever
+delayed by jobs that got in line after it: whatever they do, its decisions
+see the same thing. What the rule has to protect is the limits. A job ahead
+decides its own start without looking behind it, so whatever started behind
+it meanwhile must still fit beside it then. A job may therefore start now if:
 
-A job behind can therefore start first only by using nothing the waiting job
-is short of and leaving it its share everywhere else, so no job is ever
-delayed by jobs that got in line after it. Running jobs behind a job do not
-count against it: they only started in room it did not need then, or that
-the end it waits for gives back, and while the limits stay put that changes
-nothing. CPU busy outside the queue can
-lower the CPU limit after they started, though (see
-[Load outside the queue](#load-outside-the-queue)), and counting them would
-then make the job wait for them. Not counting them can take the machine past
-that lowered limit, never past the capacity: a job behind only started
-beside the whole amount of each job ahead that fit, and none of those can
-start with more. Measure-only jobs did not start by the rule, so they count
-against every job, wherever they are in line. Every task uses CPU, so a job
-waiting for CPU still holds back everyone behind it: with CPU alone, no job
-starts while one ahead of it is short of CPU, as in the strict line of the
-first version. (One difference is for the better: a parked job that fits used
-to block everyone until it was resumed or expired, and now only sets aside its
-weight.) Without the rule, a third e2e run waiting
-for a database stack would hold up every lint behind it, though no lint needs
-a stack.
+1. **it fits now**: beside the running jobs ahead of it and those ahead that
+   the rule lets start now (at what they would start with), within the
+   smallest limit it or any of them records, and on CPU within its own limit
+   lowered by CPU busy outside the queue; and
+2. **it fits beside every start ahead**: for every job X ahead of it that has
+   not started (waiting, parked, or able to start now), X plus the most the
+   other jobs ahead could use beside X, plus it, fit within the smallest
+   limit any of them records.
 
-**What a waiting job sets aside.** A set-aside is there so that a waiting job
-finds what it needs free at the moment it can start; so it sets aside its
-amount less what is sure to be freed by then. Each event that can let a job
-in frees a known amount: a running job ahead ending frees what it holds; a
-job ahead leaving the line, a kept place expiring, or CPU outside the queue
-going down frees nothing. When, on every dimension a job is short of, the
-running jobs ahead leave it no room by its own limit (whatever becomes of
-the jobs ahead that have not started), and that limit cannot rise, only the
-end of a job ahead that holds such a dimension can let it in: one running
-now, or one ahead that has not started yet and may start first. Whichever it
-is frees at least what it holds: a job that has not started, what it will
-start with, and on CPU one core while CPU outside the queue can lower that.
-So on each dimension where the waiting job fits, it sets aside only what the
-least of them frees falls short of, and each of them keeps that much for it:
-what one end frees is counted on once, in line order. Otherwise an event
-that frees nothing may let it in, and it sets aside its whole amount. Jobs
-behind may use what it counts on meanwhile; the end that lets it in gives
-that back, and the job then fits, which sets its whole amount aside before a
-job behind can take it.
+"The most the other jobs ahead could use beside X" is over the sets of them
+that fit together with X. A job not started counts with any amount it may
+start with: CPU from one core to its weight if it adapts to CPU outside the
+queue. X itself counts at its weight. One that adapts may start with fewer
+cores, but only while its lowered limit is below its weight, and then only
+with no core in use ahead of it; the jobs behind it that run then each
+started fitting beside it at its weight, so together they fit beside it at
+its weight, and with fewer cores too. (The design checked that start
+separately; taking that check out failed no test, and the argument above is
+why.) Which sets fit is judged within X's own limit where it records one,
+since everything running when X starts fits within it, and elsewhere within
+the largest limit the jobs ahead record; what the job must keep, within the
+smallest limit it or any of them records. All of that comes from the jobs
+ahead of the job judged, never from the jobs behind it.
 
-The first real user's UI capture held the one browser for minutes. A unit run
-waiting for it set aside 2 cores, and a lint behind it, short of those, held
-back every check behind it (clew, 0.9.0); clew got its checks in line in an
-order of its own to get around it. The unit run can only start once the
-capture ends, which frees 8 cores: it now sets none aside, and the lint
-starts. Likewise a job waiting for its checkout's limit no longer sets aside
-the machine-wide stack that the run ahead in its checkout frees, so a job
-from another checkout takes the one that is free. Skipping set-asides there
-had been considered before, and left out because a job ahead may leave the
-line instead of releasing anything: the rule counts only on ends, and on
-none while something else could let the job in. Run times are not used: a
-backfill that lets a job behind start when it is expected to end in time
-breaks the guarantee whenever the estimate is wrong. The layout did not
-change with the rule, so a loadmaster of 0.10 shares the queue with one of
-0.11: each job is admitted by its own loadmaster, and the earlier rule only
-sets aside more, which starts its job no earlier than this one would.
+When a job Z starts, every job W running behind it started while Z waited,
+and checked that it fits beside Z's start next to any set of the jobs ahead
+of it that could run beside Z; the jobs running at Z's start are such a set
+(by induction over the jobs behind Z in line order), so everything running
+then fits within the smallest limit any of them records. A job that may
+start now counts as running for the jobs behind it, so the order in which
+jobs poll changes nothing; it stays a constraint with its whole range, since
+it may still start later, with more. Measure-only jobs count where they run,
+but start whatever the rule says, so the promises do not cover them: while
+one runs, or after one started, a job ahead may start past a limit, since
+the jobs behind it made room for its start beside what ran then, not beside
+a measure-only job that came later (found in review). A queue that mixes
+them, from processes with different machine configs, is a measurement
+setup, not one to rely on.
 
-A unit test simulates random workloads with several resources (one with room
-for a single job, as for a browser), with and without CPU outside the queue
-that changes on its own, and checks that each job starts at the same time
-whether or not the jobs that got in line after it exist, that the order in
-which jobs poll changes nothing, that every limit holds, that every job
-starts, and that some waiting job counted on an end. Leaving out the jobs
-ahead that have not started makes the poll order matter, and counting one
-end twice takes a limit past what it allows (both found by it). The soak
-test adds resources and a second checkout and checks every limit from
-inside the tasks.
+Before 0.12 a waiting job set aside its amount where it fit, less what it
+was sure to get back by the time it could start (0.11), and held back from
+everyone behind it what it was short of. That estimate was refined three
+times and stayed too cautious wherever the order of the line mattered: units
+waiting in turn for the browser a long UI capture held set aside cores that
+only a later end would give them, and a second capture waiting behind the
+first, short of CPU, held back every job behind it, though each could only
+start once the run ahead of it ended and freed its cores (clew, 0.9 to
+0.11). The rule now checks the condition the set-asides stood for. Run times
+are still not used: a backfill that lets a job behind start when it is
+expected to end in time breaks the guarantee whenever the estimate is wrong.
+With CPU alone, a small job may now start ahead of a big one that waits, but
+only where it cannot be running in the big one's way when that starts.
+
+"The most beside X" is worked out by a small dynamic program over the usage
+of the dimensions that have little room beside X (at most 64 each, and at
+most 4,096 usage vectors in all); any other dimension is bounded by the sum
+of the jobs' largest amounts, which only makes the bound larger. A waiting
+`loadmaster` works it out for every job ahead of it on every poll, so its
+cost does not grow with the size of a capacity. The design was reviewed three
+times (Codex); each review found counterexamples to the version before it (a
+measure-only job that may end, a job that may start now and then starts
+later with more, a use without a checkout limit, limits that disagree, poll
+order under a lowered CPU limit), and each is now a unit test.
+
+A unit test simulates random workloads with several resources (a browser of
+capacity 1, one that some jobs declare with capacity 1 and others with 2,
+uses with and without per-checkout limits), departures from the line, parks
+that resume or expire, jobs that adapt to CPU outside the queue or not,
+capacities of 6 and 8 cores (and ten times as many), with and without CPU
+outside the queue that changes on its own, polling in line order, in reverse
+and at random. It checks that each job starts at the same time whatever the
+order of polls and whether or not the jobs that got in line after it exist,
+that every job starts, and that the running jobs never use more than the
+smallest limit any of them records. Leaving out any part of the rule (jobs
+not started beside X, their range of cores, the smallest limit, a job that
+may start now in either condition) fails it. The soak test adds resources
+and a second checkout and checks every limit from inside the tasks.
 
 A nested run takes no part in admission: it has to fit in its holder's
 slot (see [Nested runs](#nested-runs)).
@@ -408,16 +419,16 @@ The first real user could not tell from `status` why jobs waited: a unit run
 waiting for the browser that a long UI capture held set its cores aside, and
 every check behind it stopped. That only showed in a separate experiment. So
 the admission rule explains its own decision, rather than a second piece of
-code guessing at it: for each dimension a job does not fit, it says whether
-running jobs use too much of it (naming the ones that hold a resource),
-whether it would fit but is set aside for jobs ahead (naming them), whether
-a job ahead waits for it too (naming the first), or whether a job ahead got
-in line with a smaller limit, which the jobs behind it respect (naming that
-job). It also lists what the waiting job sets aside meanwhile, which is the
-cost it puts on the jobs behind it, including resources it has no limit for
-(other jobs may have one), and what it counts on getting back instead, from
-which jobs' ends. `status` shows this for every waiting job and the waiting
-messages for their own; both use the same words. The simulation checks, at
+code guessing at it: for each dimension a job does not fit, either it does
+not fit now (the running jobs ahead, and those about to start, use too much
+of it: it names those that hold a resource, the CPU outside the queue if it
+lowered the limit, and the job ahead whose record set a smaller limit), or it
+would not fit beside a job ahead when that one starts (it names that job,
+says how much could be in use then, and names the jobs beside it when the
+rule found such a set; when the amount is only a bound, it says so rather
+than name a set that may not be able to run). `status` shows this for every
+waiting job and the waiting messages for their own, in the same words, and
+`status --json` as data. The simulation checks, at
 every step, that the explanation agrees with the decision each job gets and
 that every waiting job has a reason.
 
@@ -429,6 +440,19 @@ explanations above, the warnings of `loadmaster check` and the report's
 measured cores cover most of the need; replaying the recorded history against
 other settings would answer the rest from real inputs, and is the form to
 build if it is needed.
+
+## Status as JSON
+
+Tools read the queue too. clew's list of the pull requests whose checks were
+in line parsed the table `status` prints, and stopped working the day a new
+state (`lingering`) appeared in it (0.11). The table is for people and keeps
+changing with the explanations, so `status --json` prints the same
+information in a format of its own, with a `format` number: its fields and
+the values of `state` and of a wait's `reason` are documented in the README,
+and any change to them is a breaking change of a release. Why a job waits
+comes as data (the reason, the dimension, what is used and the limit, the jobs
+by ID, and whether the jobs beside a start are a found set or only a bound),
+with the sentence the table shows beside it.
 
 ## Canceling jobs
 
@@ -565,8 +589,11 @@ limit, was not taken, for three reasons this design answers:
   first job in line therefore still starts once the jobs ahead of it are
   done: outside work can slow the line, but not stop it.
 - It breaks the guarantee the line gives, in an order nobody can predict.
-  Instead the rule stays the same rule with a lower CPU limit, and judges a
-  job only by the jobs ahead of it (see [Resources](#resources)), so jobs
+  Instead the lowered limit only throttles starts: a job that adapts starts
+  only if it and the jobs ahead of it fit within it, while what the rule
+  protects is the capacity (see [Resources](#resources)); jobs that started
+  before may keep the machine above the lowered limit, never above the
+  capacity. A job is still judged by the jobs ahead of it alone, so jobs
   behind never delay it, however the CPU outside the queue changes; a
   simulation with outside load that changes on its own checks that.
 
@@ -708,12 +735,18 @@ task is polled for exit every 20 ms. The waiting message is printed when a
 job starts waiting and then every 10 seconds: often enough to show progress,
 rarely enough not to flood an agent's context.
 
-Only the head of the line can be admitted, and the new head notices free
-capacity on its own next poll, so a backlog drains at roughly one admission per
-poll. That is negligible for tasks that run for seconds or minutes, but visible
-with tiny ones: 200 simultaneous 50 ms jobs took 16 s on a 14-core Mac (zero
-capacity violations). Admitting the whole fitting prefix of the line in one
-transaction would remove this cost; it is left out until it matters.
+Each waiting job notices on its own next poll that it may start. A job that
+may start counts as running for the jobs behind it, so jobs that fit together
+start in the same round of polls; one that fits only once a job ahead of it
+has started waits for that job's next poll, and a backlog of such jobs drains
+at about one start per poll. That is negligible for tasks that run for seconds
+or minutes, but visible with tiny ones: 200 simultaneous 50 ms jobs took 16 s
+on a 14-core Mac under 0.11's rule (zero capacity violations). Admitting every
+job that may start in one transaction would remove this cost; it is left out
+until it matters. Judging a job takes a pass over the line in which, for each
+job ahead that waits, what could run beside its start is built up job by job:
+about 50 microseconds for a line of 12 jobs, and 3 ms for 40 jobs sharing
+several resources on 32 cores (release build, Apple M-series).
 
 ## Configuration details
 
@@ -739,7 +772,10 @@ transaction would remove this cost; it is left out until it matters.
   them on this machine: a weight at or above the capacity (it takes the
   machine, and while it waits everyone behind it waits), a resource with no
   limit anywhere, and a task whose run, waiting for a resource held by a
-  long run, sets aside enough cores to keep other tasks out. Warnings depend
+  long run, keeps other tasks out: a task that fits beside the long run but
+  not beside the waiting run's start, and would if the waiting run took one
+  core. The rule itself decides that, on a made-up queue of the three runs,
+  so the warning cannot drift from the rule. Warnings depend
   on the machine's capacity and do not fail the check. Under measure-only,
   where nothing waits, there are none, and a capacity of 1 (a small CI
   runner) does not get one per task.

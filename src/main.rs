@@ -13,6 +13,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use clap::{Args, Parser, Subcommand};
 
+mod json;
+
 use loadmaster::check;
 use loadmaster::config::{self, MachineConfig, RepoConfig, Task};
 use loadmaster::history::{self, HISTORY_FILE, Outcome, Record};
@@ -64,7 +66,7 @@ enum Cmd {
     /// Run a task from .loadmaster.toml once its weight fits in the machine's capacity
     Run(RunArgs),
     /// Show running and waiting jobs
-    Status,
+    Status(StatusArgs),
     /// Reclaim places and slots held by jobs whose processes are gone
     Clean,
     /// Summarize the history log: results, run and wait times, load
@@ -77,6 +79,13 @@ enum Cmd {
     /// Exit 0 if this process runs inside a loadmaster job started from this
     /// checkout, 1 if not; for scripts that must only run through the queue
     Held(HeldArgs),
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    /// Print it as JSON, in the documented format, for tools
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -146,7 +155,7 @@ fn main() {
     });
     let result = match cli.command {
         Cmd::Run(args) => run(args),
-        Cmd::Status => status(),
+        Cmd::Status(args) => status(args),
         Cmd::Clean => clean(),
         Cmd::Report(args) => report(args),
         Cmd::Check => check(),
@@ -403,17 +412,11 @@ fn wait_turn(
                 }
                 if last_report.is_none_or(|at| at.elapsed() >= REPORT_INTERVAL) {
                     say!(
-                        "loadmaster: waiting to run `{}` (weight {}, {}) for {}{}{}",
+                        "loadmaster: waiting to run `{}` (weight {}, {}) for {}",
                         task.name,
                         task.weight,
                         format_ahead(wait.ahead),
                         wait.waits_for(),
-                        wait.reserves_text()
-                            .map_or(String::new(), |reserved| format!(
-                                "; {reserved} set aside for it meanwhile"
-                            )),
-                        wait.counts_on_text()
-                            .map_or(String::new(), |counted| format!("; it counts on {counted}")),
                     );
                     last_report = Some(Instant::now());
                 }
@@ -800,7 +803,7 @@ fn spawn_failure_code(err: &io::Error) -> i32 {
     }
 }
 
-fn status() -> Result<i32> {
+fn status(args: StatusArgs) -> Result<i32> {
     let machine = MachineConfig::load()?;
     let (state_dir, queue) = open_queue()?;
     let snapshot = queue.snapshot()?;
@@ -816,13 +819,32 @@ fn status() -> Result<i32> {
     } else {
         None
     };
+    if args.json {
+        let explained = queue::explain(&snapshot.jobs, outside);
+        let others = queue::running_in_other_queues(&state_dir);
+        let value = json::status(&json::Status {
+            machine: &machine,
+            snapshot: &snapshot,
+            outside: outside.filter(|_| adapting),
+            resources: &resources_in_use(&snapshot.jobs, &machine),
+            others: &others,
+            explained: &explained,
+        });
+        print(&format!("{value:#}\n"));
+        return Ok(0);
+    }
     let mut out = format!(
         "{}/{} in use (capacity {})\n",
         snapshot.used(),
         machine.capacity,
         machine.capacity_source
     );
-    out += &resources_in_use(&snapshot.jobs, &machine);
+    for (name, used, capacity) in resources_in_use(&snapshot.jobs, &machine) {
+        out += &match capacity {
+            Some(capacity) => format!("{name}: {used}/{capacity} in use\n"),
+            None => format!("{name}: {used} in use (no machine-wide limit)\n"),
+        };
+    }
     out += &load_line();
     if let Some(outside) = outside.filter(|_| adapting) {
         out += &format!(
@@ -919,16 +941,7 @@ fn why_jobs_wait(jobs: &[Job], outside: Option<queue::Outside>) -> String {
             let who = format!("#{id} `{}`", job.task);
             Some(match admission {
                 Admission::Admitted => format!("  {who} is about to start\n"),
-                Admission::Waiting(wait) => format!(
-                    "  {who} waits for {}{}{}\n",
-                    wait.waits_for(),
-                    wait.reserves_text()
-                        .map_or(String::new(), |reserved| format!(
-                            "; sets aside {reserved} meanwhile"
-                        )),
-                    wait.counts_on_text()
-                        .map_or(String::new(), |counted| format!("; counts on {counted}"))
-                ),
+                Admission::Waiting(wait) => format!("  {who} waits for {}\n", wait.waits_for()),
             })
         })
         .collect();
@@ -938,10 +951,12 @@ fn why_jobs_wait(jobs: &[Job], outside: Option<queue::Outside>) -> String {
     format!("\nwhy jobs wait:\n{}", lines.concat())
 }
 
-/// One line per machine-wide resource that any job uses: how much running
-/// jobs use, against the machine config's capacity, else the one jobs
-/// recorded.
-fn resources_in_use(jobs: &[Job], machine: &MachineConfig) -> String {
+/// Each machine-wide resource that any job uses: how much running jobs use,
+/// and the machine config's capacity, else the one jobs recorded.
+fn resources_in_use<'j>(
+    jobs: &'j [Job],
+    machine: &MachineConfig,
+) -> Vec<(&'j str, u64, Option<u32>)> {
     let mut resources: std::collections::BTreeMap<&str, (u64, Option<u32>)> =
         std::collections::BTreeMap::new();
     for job in jobs {
@@ -957,11 +972,24 @@ fn resources_in_use(jobs: &[Job], machine: &MachineConfig) -> String {
     }
     resources
         .into_iter()
-        .map(|(name, (used, capacity))| match capacity {
-            Some(capacity) => format!("{name}: {used}/{capacity} in use\n"),
-            None => format!("{name}: {used} in use (no machine-wide limit)\n"),
-        })
+        .map(|(name, (used, capacity))| (name, used, capacity))
         .collect()
+}
+
+/// A job's state as `status` shows it, and since when it has been in it: a
+/// running job whose loadmaster is gone is orphaned while its task's command
+/// runs, and lingering once that exited and processes it left in its group
+/// hold the slot.
+fn shown_state(job: &Job) -> (&'static str, Option<SystemTime>) {
+    match job.state {
+        JobState::Running if job.is_orphaned() => match job.child {
+            Some(group) if group.leader_exited() => ("lingering", job.started_at),
+            _ => ("orphaned", job.started_at),
+        },
+        JobState::Running => ("running", job.started_at),
+        JobState::Waiting => ("waiting", Some(job.enqueued_at)),
+        JobState::Parked => ("parked", job.parked_at),
+    }
 }
 
 fn jobs_table(jobs: &[Job]) -> String {
@@ -980,31 +1008,22 @@ fn jobs_table(jobs: &[Job]) -> String {
     // Jobs whose task's command exited, and what holds their slot.
     let mut lingering = Vec::new();
     for job in jobs {
-        let (state, at) = match job.state {
-            // Its loadmaster is gone, or handed the slot over when the task's
-            // command exited and left processes in its group.
-            JobState::Running if job.is_orphaned() => match job.child {
-                Some(group) if group.leader_exited() => {
+        let (state, at) = shown_state(job);
+        match state {
+            "lingering" => {
+                if let Some(group) = job.child {
                     lingering.push(format!(
                         "  #{} `{}`: {}\n",
                         job.id,
                         job.task,
                         name_group(&group)
                     ));
-                    ("lingering", job.started_at)
                 }
-                _ => {
-                    orphaned = true;
-                    ("orphaned", job.started_at)
-                }
-            },
-            JobState::Running => ("running", job.started_at),
-            JobState::Waiting => ("waiting", Some(job.enqueued_at)),
-            JobState::Parked => {
-                parked = true;
-                ("parked", job.parked_at)
             }
-        };
+            "orphaned" => orphaned = true,
+            "parked" => parked = true,
+            _ => {}
+        }
         rows.push([
             job.id.to_string(),
             state.to_owned(),

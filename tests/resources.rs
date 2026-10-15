@@ -82,8 +82,7 @@ fn a_lint_passes_an_e2e_run_waiting_for_a_database() {
     wait_until("the reason on stderr", || {
         sandbox.read("e2e.err").contains(
             "loadmaster: waiting to run `e2e` (weight 2, next in line) for `db` \
-             (1 of 1 in use by #1 `e2e-hold`); it counts on 2 cores that #1 `e2e-hold` \
-             frees when it ends",
+             (1 of 1 in use by #1 `e2e-hold`)\n",
         )
     });
 
@@ -121,8 +120,7 @@ fn one_e2e_run_per_checkout() {
     assert!(
         status.contains(
             "why jobs wait:\n  #3 `e2e` waits for `db` in its checkout \
-             (1 of 1 in use by #1 `e2e-hold`); counts on 2 cores and `db` that \
-             #1 `e2e-hold` frees when it ends\n"
+             (1 of 1 in use by #1 `e2e-hold`)\n"
         ),
         "{status}"
     );
@@ -277,10 +275,7 @@ fn a_check_starts_beside_one_waiting_for_what_a_long_run_holds() {
 
     let status = stdout(&sandbox.run(&["status"]));
     assert!(
-        status.contains(
-            "#2 `unit` waits for `browser` (1 of 1 in use by #1 `ui`); counts on 2 cores that \
-             #1 `ui` frees when it ends\n"
-        ),
+        status.contains("#2 `unit` waits for `browser` (1 of 1 in use by #1 `ui`)\n"),
         "{status}"
     );
     let lint = sandbox.run(&["run", "lint", "--max-wait", "0"]);
