@@ -1336,6 +1336,10 @@ fn check_scenario(path: &Path) -> Result<i32> {
                 "{who} is measure-only: it starts at once with {}\n",
                 cores(job.weight)
             ),
+            (JobState::Parked, _) if job.measure_only => format!(
+                "{who} is parked and measure-only: resumed, it starts at once with {}\n",
+                cores(job.weight)
+            ),
             (JobState::Parked, Some(Admission::Admitted)) => {
                 format!(
                     "{who} is parked; resumed now, it would start with {}\n",

@@ -182,6 +182,15 @@ fn a_scenario_starts_measure_only_jobs_at_once_and_refuses_duplicate_ids() {
         "{}",
         stdout(&output)
     );
+    let parked = job(3, 4, true).replace("\"waiting\"", "\"parked\"");
+    let output = judge(&[job(1, 8, false), parked]);
+    assert!(
+        stdout(&output).contains(
+            "#3 `t3` is parked and measure-only: resumed, it starts at once with 4 cores\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
     let output = judge(&[job(1, 8, false), job(1, 1, false)]);
     assert_ne!(output.status.code(), Some(0));
     assert!(
