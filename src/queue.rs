@@ -328,11 +328,17 @@ pub struct Use {
 }
 
 impl Job {
+    /// The most cores it may start with: its weight, which above its
+    /// capacity counts as all of it.
+    pub fn most(&self) -> u32 {
+        self.weight.min(self.capacity).max(1)
+    }
+
     /// The least cores it may start with: its `min_weight`; for a job of
     /// 0.12 to 0.14, one if it adapts to CPU outside the queue, else its
-    /// weight.
+    /// weight. Like the weight, capped at its capacity.
     pub fn least(&self) -> u32 {
-        let weight = self.weight.min(self.capacity).max(1);
+        let weight = self.most();
         self.min_weight
             .unwrap_or(if self.adapt_cpu { 1 } else { weight })
             .clamp(1, weight)

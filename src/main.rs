@@ -1454,18 +1454,18 @@ fn check_scenario(path: &Path) -> Result<i32> {
         let start = decision
             .and_then(|(_, _, cores)| *cores)
             .or(job.granted)
-            .unwrap_or(job.weight);
+            .unwrap_or(job.most());
         let decision = decision.map(|(_, admission, _)| admission);
         out += &match (job.state, decision) {
             (JobState::Running, _) => format!("{who} holds {}\n", cores(start)),
             // It starts at once, whatever the line and the capacity.
             (JobState::Waiting, _) if job.measure_only => format!(
                 "{who} is measure-only: it starts at once with {}\n",
-                cores(job.weight)
+                cores(job.most())
             ),
             (JobState::Parked, _) if job.measure_only => format!(
                 "{who} is parked and measure-only: resumed, it starts at once with {}\n",
-                cores(job.weight)
+                cores(job.most())
             ),
             (JobState::Parked, Some(Admission::Admitted)) => {
                 format!(
