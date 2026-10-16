@@ -28,8 +28,12 @@ pub struct Status<'a> {
     /// Each machine-wide resource in use: name, used, capacity.
     pub resources: &'a [(&'a str, u64, Option<u32>)],
     pub others: &'a [OtherQueue],
-    /// The admission rule's decision for every job not running.
-    pub explained: &'a [(JobId, Admission)],
+    /// The admission rule's decision for every job not running, with the
+    /// cores a job that may start starts with.
+    pub explained: &'a [(JobId, Admission, Option<u32>)],
+    /// The jobs of 0.12 to 0.14 left in a queue that is moving to this
+    /// version's admission protocol, if it is.
+    pub moving: Option<usize>,
 }
 
 pub fn status(status: &Status) -> Value {
@@ -39,16 +43,18 @@ pub fn status(status: &Status) -> Value {
         .jobs
         .iter()
         .map(|job| {
-            let admission = status
+            let decision = status
                 .explained
                 .iter()
-                .find(|(id, _)| *id == job.id)
-                .map(|(_, admission)| admission);
-            job_value(job, admission)
+                .find(|(id, _, _)| *id == job.id)
+                .map(|(_, admission, cores)| (admission, *cores));
+            job_value(job, decision)
         })
         .collect();
     json!({
         "format": FORMAT,
+        "protocol": if status.moving.is_some() { 1 } else { 2 },
+        "moving": status.moving.map(|left| json!({ "left": left })),
         "capacity": machine.capacity,
         "capacity_source": machine.capacity_source.to_string(),
         "measure_only": machine.measure_only,
@@ -176,6 +182,11 @@ fn scenario_job(value: &Value) -> Result<Job, String> {
             _ => None,
         },
         state_since: None,
+        // Without one, as a job of 0.12 to 0.14 recorded it.
+        min_weight: match &value["min_weight"] {
+            Value::Null => None,
+            v => Some(number(v).ok_or_else(|| missing("min_weight"))?),
+        },
     })
 }
 
@@ -185,7 +196,7 @@ fn unix_ms(t: SystemTime) -> Option<u64> {
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn job_value(job: &Job, admission: Option<&Admission>) -> Value {
+fn job_value(job: &Job, decision: Option<(&Admission, Option<u32>)>) -> Value {
     let (state, since) = super::shown_state(job);
     let processes: Option<Vec<Value>> =
         (state == "lingering")
@@ -203,6 +214,7 @@ fn job_value(job: &Job, admission: Option<&Admission>) -> Value {
         "state": state,
         "task": job.task,
         "weight": job.weight,
+        "min_weight": job.least(),
         "cores": job.granted.filter(|_| job.state == JobState::Running),
         "uses": job.uses.iter().map(|u| (u.name.clone(), json!({
             "amount": u.amount,
@@ -223,8 +235,14 @@ fn job_value(job: &Job, admission: Option<&Admission>) -> Value {
         "adapts_to_outside_cpu": job.adapt_cpu,
         "measure_only": job.measure_only,
         "processes": processes,
-        "wait": admission.map(|admission| match admission {
-            Admission::Admitted => json!({ "starts_now": true, "ahead": null, "for": [], "text": "about to start" }),
+        "wait": decision.map(|(admission, cores)| match admission {
+            Admission::Admitted => json!({
+                "starts_now": true,
+                "cores": cores,
+                "ahead": null,
+                "for": [],
+                "text": "about to start",
+            }),
             Admission::Waiting(wait) => wait_value(wait),
         }),
     })
@@ -233,6 +251,7 @@ fn job_value(job: &Job, admission: Option<&Admission>) -> Value {
 fn wait_value(wait: &Wait) -> Value {
     json!({
         "starts_now": false,
+        "cores": null,
         "ahead": wait.ahead,
         "for": wait.short.iter().map(shortage_value).collect::<Vec<_>>(),
         "text": wait.waits_for(),

@@ -102,6 +102,11 @@ pub enum Error {
         layout: i64,
         protocol: Option<i64>,
     },
+    #[error(
+        "the queue is moving to the admission protocol of loadmaster 0.15 and later: {left} \
+         job(s) of loadmaster 0.12 to 0.14 have to finish first"
+    )]
+    QueueMoving { left: usize },
     #[error("job #{0} disappeared from the queue")]
     JobVanished(JobId),
 

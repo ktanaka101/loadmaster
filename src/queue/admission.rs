@@ -1,22 +1,31 @@
 //! The admission rule (see `docs/DECISIONS.md`, "Admission"). A job decides
 //! from the jobs ahead of it alone, so no job is delayed by the jobs behind
 //! it; what the rule protects is the limits. A job ahead decides its own
-//! start without the jobs behind it, so a job may start now only if it fits
-//! now and will still fit beside every job ahead of it when that one starts:
+//! start without the jobs behind it, so a job may start now, with some
+//! number of cores from the least it may start with to its weight, only if
+//! it fits now and will still fit beside every job ahead of it when that one
+//! starts:
 //!
-//! 1. On each dimension it uses, the running jobs ahead of it and those ahead
-//!    that may start now (at what they would start with), plus it, fit
+//! 1. On each dimension it uses, the running jobs ahead of it, plus it, fit
 //!    within the smallest limit any of them records; on CPU also within its
-//!    own limit lowered by CPU busy outside the queue.
+//!    own limit lowered by CPU busy outside the queue (never below the least
+//!    it may start with).
 //! 2. For every job X ahead of it that has not started, on each dimension it
 //!    uses, X plus the most that other jobs ahead could use beside X, plus
-//!    it, fit within the smallest limit it, X or those jobs record.
+//!    it, fit within the smallest limit it, X or those jobs record. X may
+//!    start with the least cores it may: the room beside it is worked out at
+//!    that, and X is counted at its weight.
+//!
+//! It starts with the most cores both allow. The jobs are judged in one pass
+//! in line order, and a waiting job that may start counts as running, with
+//! what it starts with, for the jobs behind it: the process that admits jobs
+//! admits all of these at once (see [`plan`]).
 //!
 //! "The jobs ahead" are the jobs ahead in line plus every running
-//! measure-only job, wherever it is. The jobs are judged in one pass in line
-//! order: for each kind of job not started (its amounts and limits), what
-//! could run beside its start is built up as the jobs behind it are passed,
-//! so a pass costs as many additions as there are jobs times kinds.
+//! measure-only job, wherever it is. For each kind of job not started (its
+//! amounts and limits), what could run beside its start is built up as the
+//! jobs behind it are passed, so a pass costs as many additions as there are
+//! jobs times kinds.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -38,27 +47,38 @@ type Amounts<'a> = BTreeMap<Dim<'a>, (u64, u64)>;
 struct Info<'a> {
     job: &'a Job,
     /// What it may hold: what it holds if it runs; if not, its amounts, with
-    /// CPU from 1 core to its weight if it adapts to CPU outside the queue.
+    /// CPU from the least it may start with to its weight.
     amounts: Amounts<'a>,
     /// The limit it records for each dimension it uses, if any (CPU: its
     /// capacity).
     records: BTreeMap<Dim<'a>, Option<u64>>,
-    /// What it holds or would start with now, and its own limit (see
-    /// [`demands`]).
+    /// What it holds if it runs, and on CPU its own limit, lowered by CPU
+    /// busy outside the queue if it adapts to it (see [`super::cpu_demand`]).
     now: Vec<(Dim<'a>, u64, u64)>,
 }
 
 impl<'a> Info<'a> {
     fn of(job: &'a Job, outside: Option<Outside>) -> Info<'a> {
+        Info::with(job, outside, None)
+    }
+
+    /// A job that a pass lets start with `cores`: it runs with them from
+    /// then on, for the jobs behind it.
+    fn started(job: &'a Job, cores: u64) -> Info<'a> {
+        Info::with(job, None, Some(cores))
+    }
+
+    fn with(job: &'a Job, outside: Option<Outside>, started: Option<u64>) -> Info<'a> {
         let base = demands(job, None);
+        let least = u64::from(job.least());
         let amounts = base
             .iter()
-            .map(|&(dim, amount, _)| {
-                if dim == Dim::Cpu && job.state != JobState::Running && job.adapt_cpu {
-                    (dim, (1, amount))
-                } else {
-                    (dim, (amount, amount))
+            .map(|&(dim, amount, _)| match (dim, started) {
+                (Dim::Cpu, Some(cores)) => (dim, (cores, cores)),
+                (Dim::Cpu, None) if job.state != JobState::Running => {
+                    (dim, (least.min(amount), amount))
                 }
+                _ => (dim, (amount, amount)),
             })
             .collect();
         let records = base
@@ -72,16 +92,27 @@ impl<'a> Info<'a> {
                 (dim, limit)
             })
             .collect();
+        let mut now = demands(job, outside);
+        if let Some(cores) = started {
+            for entry in now.iter_mut().filter(|(d, _, _)| *d == Dim::Cpu) {
+                *entry = (Dim::Cpu, cores, u64::from(job.capacity));
+            }
+        }
         Info {
             job,
             amounts,
             records,
-            now: demands(job, outside),
+            now,
         }
     }
 
     fn record(&self, dim: Dim) -> Option<u64> {
         self.records.get(&dim).copied().flatten()
+    }
+
+    /// The least and the most cores it may hold.
+    fn cpu(&self) -> (u64, u64) {
+        self.amounts.get(&Dim::Cpu).copied().unwrap_or((0, 0))
     }
 
     /// Whether the two are jobs of a kind, as far as the rule goes: the same
@@ -91,44 +122,71 @@ impl<'a> Info<'a> {
     }
 }
 
+/// The rule's decision for one job not running, and if it may start, the
+/// cores it starts with.
+#[derive(Debug, PartialEq)]
+pub(super) struct Decision {
+    pub id: JobId,
+    pub admission: Admission,
+    pub cores: Option<u32>,
+}
+
 /// The rule for the job at `at` in `jobs` (in line order).
-pub(super) fn decide(jobs: &[Job], at: usize, outside: Option<Outside>) -> Admission {
+pub(super) fn decide(jobs: &[Job], at: usize, outside: Option<Outside>) -> Decision {
     pass(jobs, outside, Some(at), true)
         .pop()
-        .map_or(Admission::Admitted, |(_, admission)| admission)
+        .unwrap_or_else(|| Decision {
+            id: jobs[at].id,
+            admission: Admission::Admitted,
+            cores: None,
+        })
 }
 
 /// The rule for every job that has not started, in line order.
-pub(super) fn explain(jobs: &[Job], outside: Option<Outside>) -> Vec<(JobId, Admission)> {
+pub(super) fn explain(jobs: &[Job], outside: Option<Outside>) -> Vec<Decision> {
     pass(jobs, outside, None, true)
+}
+
+/// The waiting jobs to start now, with the cores each starts with, in line
+/// order: each counts as running for the jobs behind it, so they are to start
+/// together, in one transaction. Measure-only jobs start by themselves.
+pub(super) fn plan(jobs: &[Job], outside: Option<Outside>) -> Vec<(JobId, u32)> {
+    explain(jobs, outside)
+        .into_iter()
+        .filter_map(|d| {
+            let job = jobs.iter().find(|job| job.id == d.id)?;
+            (job.state == JobState::Waiting && !job.measure_only).then_some((d.id, d.cores?))
+        })
+        .collect()
 }
 
 /// [`explain`], working out the start of every job not started, as if no two
 /// were of a kind: what the rule must agree with.
 #[cfg(test)]
-pub(super) fn explain_every_start(
-    jobs: &[Job],
-    outside: Option<Outside>,
-) -> Vec<(JobId, Admission)> {
+pub(super) fn explain_every_start(jobs: &[Job], outside: Option<Outside>) -> Vec<Decision> {
     pass(jobs, outside, None, false)
 }
 
 /// Judges the jobs in line order, up to `only` (whose decision is the one
-/// returned, explained) or all (each explained). With `by_kind`, one start
-/// stands for every later one of its kind (see [`Info::like`]): the jobs
-/// beside the later one are those beside the first, with the two swapped, so
-/// its condition is the same.
+/// returned, explained) or all (each explained). A waiting job that may start
+/// counts as running, with the cores it starts with, for the jobs behind it.
+/// With `by_kind`, one start stands for every later one of its kind (see
+/// [`Info::like`]): the jobs beside the later one are those beside the first,
+/// with the two swapped, so its condition is the same.
 fn pass(
     jobs: &[Job],
     outside: Option<Outside>,
     only: Option<usize>,
     by_kind: bool,
-) -> Vec<(JobId, Admission)> {
-    let infos: Vec<Info> = jobs.iter().map(|job| Info::of(job, outside)).collect();
+) -> Vec<Decision> {
+    let mut infos: Vec<Info> = jobs.iter().map(|job| Info::of(job, outside)).collect();
     let measured: Vec<usize> = (0..jobs.len())
         .filter(|&i| jobs[i].state == JobState::Running && jobs[i].measure_only)
         .collect();
-    let mut may_start = vec![false; jobs.len()];
+    let mut running: Vec<bool> = jobs
+        .iter()
+        .map(|job| job.state == JobState::Running && !job.measure_only)
+        .collect();
     let mut starts: Vec<Start> = Vec::new();
     let mut out = Vec::new();
     for i in 0..only.map_or(jobs.len(), |at| at + 1) {
@@ -143,29 +201,35 @@ fn pass(
             continue;
         }
         let explain = only.is_none_or(|at| at == i);
-        let admission = judge(&infos, i, &may_start, &measured, &starts, outside, explain);
-        if job.state == JobState::Waiting {
-            may_start[i] = admission == Admission::Admitted;
-        }
+        let (admission, cores) = judge(&infos, i, &running, &measured, &starts, outside, explain);
+        let cores = (admission == Admission::Admitted).then_some(cores);
         if explain {
-            out.push((job.id, admission));
+            out.push(Decision {
+                id: job.id,
+                admission,
+                cores: cores.map(|c| u32::try_from(c).unwrap_or(u32::MAX)),
+            });
+        }
+        // It starts with these, together with the others that may.
+        let starts_now = job.state == JobState::Waiting && !job.measure_only;
+        if let Some(cores) = cores.filter(|_| starts_now) {
+            infos[i] = Info::started(job, cores);
+            running[i] = true;
         }
         for start in &mut starts {
             start.add(&infos, i);
         }
-        if !(by_kind && starts.iter().any(|s| infos[s.at].like(&infos[i]))) {
+        let started = running[i];
+        if !started && !(by_kind && starts.iter().any(|s| infos[s.at].like(&infos[i]))) {
             starts.push(Start::new(&infos, i, &measured));
         }
     }
     out
 }
 
-/// A job ahead that has not started, and what could run beside its start,
-/// at its full CPU, of the jobs ahead of the one judged. One that adapts may
-/// start with fewer cores, but only while its lowered limit is below its
-/// weight, and then only with no core in use ahead of it: the jobs behind it
-/// running then started fitting beside it at its full CPU, and fit beside it
-/// with fewer.
+/// A job ahead that has not started, and what could run beside its start, of
+/// the jobs ahead of the one judged: the room beside it is worked out at the
+/// least cores it may start with, and it counts at its weight.
 struct Start<'a> {
     at: usize,
     beside: Beside<'a>,
@@ -173,8 +237,7 @@ struct Start<'a> {
 
 impl<'a> Start<'a> {
     fn new(infos: &[Info<'a>], at: usize, measured: &[usize]) -> Start<'a> {
-        let (_, hi) = infos[at].amounts.get(&Dim::Cpu).copied().unwrap_or((0, 0));
-        let mut beside = Beside::new(&infos[at], at, hi);
+        let mut beside = Beside::new(&infos[at], at);
         // The jobs ahead of it, and the measure-only ones, which are beside
         // every start.
         for i in (0..at).filter(|i| !measured.contains(i)) {
@@ -215,6 +278,9 @@ impl<'a> Start<'a> {
 struct Beside<'a> {
     x: usize,
     x_amounts: Amounts<'a>,
+    /// The least cores X may start with, which the room beside it is worked
+    /// out at, and the most, which it counts at.
+    x_least: u64,
     x_cpu: u64,
     /// X's own limit where it records one.
     x_limits: BTreeMap<Dim<'a>, u64>,
@@ -258,7 +324,8 @@ struct Most {
 }
 
 impl<'a> Beside<'a> {
-    fn new(x: &Info<'a>, at: usize, x_cpu: u64) -> Beside<'a> {
+    fn new(x: &Info<'a>, at: usize) -> Beside<'a> {
+        let (x_least, x_cpu) = x.cpu();
         let x_limits: BTreeMap<Dim, u64> = x
             .records
             .iter()
@@ -271,6 +338,7 @@ impl<'a> Beside<'a> {
         Beside {
             x: at,
             x_amounts: x.amounts.clone(),
+            x_least,
             x_cpu,
             smallest: x_limits.iter().map(|(&d, &l)| (d, (l, at))).collect(),
             x_limits,
@@ -288,6 +356,7 @@ impl<'a> Beside<'a> {
         }
     }
 
+    /// What X is counted at on `dim`: its weight on CPU.
     fn x_amount(&self, dim: Dim) -> u64 {
         if dim == Dim::Cpu {
             self.x_cpu
@@ -296,10 +365,20 @@ impl<'a> Beside<'a> {
         }
     }
 
+    /// The least X may hold on `dim`, which what could run beside it is
+    /// worked out at: whatever runs when X starts fits beside that.
+    fn x_least(&self, dim: Dim) -> u64 {
+        if dim == Dim::Cpu {
+            self.x_least
+        } else {
+            self.x_amount(dim)
+        }
+    }
+
     /// The room beside X on `dim`, if it is bounded.
     fn room(&self, dim: Dim) -> Option<u64> {
         let within = *self.within.get(&dim)?;
-        (within != u64::MAX).then(|| within.saturating_sub(self.x_amount(dim)))
+        (within != u64::MAX).then(|| within.saturating_sub(self.x_least(dim)))
     }
 
     /// Whether job `i` fits beside X on its own, within the limits both
@@ -309,7 +388,7 @@ impl<'a> Beside<'a> {
             self.room(d).is_none_or(|room| lo <= room)
                 && infos[i]
                     .record(d)
-                    .is_none_or(|own| lo + self.x_amount(d) <= own)
+                    .is_none_or(|own| lo + self.x_least(d) <= own)
         })
     }
 
@@ -669,22 +748,26 @@ impl Moves {
 fn judge<'a>(
     infos: &[Info<'a>],
     at: usize,
-    may_start: &[bool],
+    running: &[bool],
     measured: &[usize],
     starts: &[Start<'a>],
     outside: Option<Outside>,
     explain: bool,
-) -> Admission {
+) -> (Admission, u64) {
     let k = &infos[at];
+    let (least, most) = k.cpu();
+    // What it needs on each dimension to start: on CPU the least it may
+    // start with. The room left on CPU, which it starts with up to its
+    // weight.
+    let need = |dim: Dim, amount: u64| if dim == Dim::Cpu { least } else { amount };
+    let mut cpu_room = most;
     let mut causes: BTreeMap<Dim, Cause> = BTreeMap::new();
+    let waits = |infos: &[Info]| (waiting(infos, at, Vec::new()), 0);
 
-    // 1. Now: the running jobs ahead, those that may start now, and the
+    // 1. Now: the running jobs ahead, those of this pass included, and the
     // measure-only ones.
     let now: Vec<usize> = (0..at)
-        .filter(|&i| {
-            let job = infos[i].job;
-            (job.state == JobState::Running && !job.measure_only) || may_start[i]
-        })
+        .filter(|&i| running[i])
         .chain(measured.iter().copied().filter(|&i| i != at))
         .collect();
     for &(dim, amount, own) in &k.now {
@@ -709,9 +792,9 @@ fn judge<'a>(
             (limit, limit_by) = (own, None);
             lowered = outside.map(|o| o.lowered());
         }
-        if used + amount > limit {
+        if used + need(dim, amount) > limit {
             if !explain {
-                return waiting(infos, at, Vec::new());
+                return waits(infos);
             }
             causes.insert(
                 dim,
@@ -723,6 +806,8 @@ fn judge<'a>(
                     outside: lowered,
                 },
             );
+        } else if dim == Dim::Cpu {
+            cpu_room = cpu_room.min(limit - used);
         }
     }
 
@@ -749,17 +834,19 @@ fn judge<'a>(
             if limit == u64::MAX {
                 continue;
             }
+            // On CPU, worth a closer look while it could start with more.
+            let wanted = if dim == Dim::Cpu { most } else { amount };
             let mut used = beside.heaviest(dim) + beside.x_amount(dim);
-            if used + amount > limit && beside.untracked(dim) {
+            if used + wanted > limit && beside.untracked(dim) {
                 if !explain {
-                    unsure.push((beside, dim, amount, limit));
+                    unsure.push((beside, dim, need(dim, amount), limit));
                     continue;
                 }
                 used = beside.used(infos, dim);
             }
-            if used + amount > limit {
+            if used + need(dim, amount) > limit {
                 if !explain {
-                    return waiting(infos, at, Vec::new());
+                    return waits(infos);
                 }
                 causes.insert(
                     dim,
@@ -775,18 +862,23 @@ fn judge<'a>(
                             .map(|i| JobRef::of(infos[i].job)),
                     },
                 );
+            } else if dim == Dim::Cpu {
+                cpu_room = cpu_room.min(limit - used);
             }
         }
     }
-    if unsure
-        .iter()
-        .any(|&(beside, dim, amount, limit)| beside.used(infos, dim) + amount > limit)
-    {
-        return waiting(infos, at, Vec::new());
+    for (beside, dim, needed, limit) in unsure {
+        let used = beside.used(infos, dim);
+        if used + needed > limit {
+            return waits(infos);
+        }
+        if dim == Dim::Cpu {
+            cpu_room = cpu_room.min(limit - used);
+        }
     }
 
     if causes.is_empty() {
-        return Admission::Admitted;
+        return (Admission::Admitted, cpu_room);
     }
     let short = k
         .now
@@ -794,12 +886,12 @@ fn judge<'a>(
         .filter_map(|&(dim, amount, _)| {
             Some(Shortage {
                 need: dim.need(),
-                amount,
+                amount: need(dim, amount),
                 cause: causes.remove(&dim)?,
             })
         })
         .collect();
-    waiting(infos, at, short)
+    (waiting(infos, at, short), 0)
 }
 
 fn waiting(infos: &[Info], at: usize, short: Vec<Shortage>) -> Admission {

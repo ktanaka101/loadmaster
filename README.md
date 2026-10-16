@@ -289,6 +289,7 @@ run against the main checkout's code: loadmaster says so and fails.
 | Key | Meaning |
 | --- | --- |
 | `weight` | Integer ≥ 1. Use "roughly how many CPU cores this task keeps busy" as the unit, in every repository, because all repositories on the machine share one capacity. |
+| `min_weight` | Optional: the fewest cores the task may start with, from 1 to its weight. Set it only for a task that sizes its parallelism by `LOADMASTER_WEIGHT` (`vitest --maxWorkers=$LOADMASTER_WEIGHT`, `eslint --concurrency=$LOADMASTER_WEIGHT`): it then starts with what is left whenever that fits, rather than waiting for its whole weight, and runs longer with fewer workers. Without it, a task always starts with its weight. A task that holds a scarce resource while it runs (a browser, a database) holds it longer with fewer cores, which may keep others waiting longer than they gain. |
 | `cmd` | Array: the program and its arguments. No shell is involved. Arguments after `--` are appended to the end exactly as given. |
 | `uses` | Optional: the resources the task uses, such as `{ e2e-db = 1 }`; see [Resources besides CPU](#resources-besides-cpu). |
 | `ok_exit_codes` | Optional: the exit codes that mean the check passed, for the history log and `loadmaster report`; `[0]` if not set. A check that reports "differences found" with exit code 2 would set `[0, 2]`. loadmaster itself still exits with the task's code. |
@@ -408,9 +409,9 @@ using it, and keeps new runs off it until they are done.
 
 The running task gets two environment variables:
 
-- `LOADMASTER_WEIGHT`: the cores the task got: its weight, or fewer while CPU
-  is busy outside the queue, so the task can size its own parallelism to
-  match the slot it holds.
+- `LOADMASTER_WEIGHT`: the cores the task got: its weight, or, for a task
+  with `min_weight`, as many of them as fit when it started, so the task can
+  size its own parallelism to match the slot it holds.
 - `LOADMASTER_HELD`: the ID of the job holding the slot (see
   [Nested runs](#nested-runs) and
   [Guarding a script](#guarding-a-script)).
@@ -492,9 +493,9 @@ and its place in line, and only records it, to get a baseline; see
 
 While CPU is busy outside the queue (a game, a video call, a build that does
 not go through loadmaster) beyond the cores the capacity leaves free, jobs
-start with fewer cores; see [How it works](#how-it-works).
-`adapt_to_outside_cpu = false` turns that off, so jobs always start with
-their weight.
+start with fewer cores, down to their `min_weight`; a task without one starts
+with its weight once nothing runs ahead of it. See
+[How it works](#how-it-works). `adapt_to_outside_cpu = false` turns that off.
 
 `$XDG_CONFIG_HOME` is honored, and `LOADMASTER_CONFIG` overrides the path; a
 file it names must exist, while a missing file in the default place means all
@@ -503,16 +504,20 @@ that reads it with `min_version`, for a file shared across machines.
 
 The queue lives in `~/.local/state/loadmaster/queue-v4.db` (`$XDG_STATE_HOME`,
 `LOADMASTER_STATE_DIR`), and stays there: from 0.12 on every version shares
-it. The database records the admission protocol its writers keep; versions
-of one protocol (0.12 to 0.14 so far) count each other's jobs and may run
-side by side, and from 0.14 on a version that does not know the protocol a
-later one moved the queue to stops with an error instead of starting work
-(0.12 and 0.13 do not read it: a later protocol will close the queue to new
-jobs before it changes, which stops them too). Versions
-up to 0.11 kept separate files (`queue-v3.db` and before) and do not count
-the jobs of 0.12 and later, or the other way round: `loadmaster status` and
-`loadmaster run` say when such a file holds jobs. Give every agent on a
-machine 0.12 or later.
+it. The database records the admission protocol its writers keep: versions
+of one protocol count each other's jobs and may run side by side, and a
+version that does not know the protocol a later one moved the queue to stops
+with an error instead of starting work. 0.15 moved it from the protocol of
+0.12 to 0.14 to its own, which lets a job start with fewer cores than its
+weight: the first 0.15 to open the queue closes it to new jobs, so that runs
+of 0.12 to 0.14 fail and say why, and runs of 0.15 wait without a place in
+line; the jobs in it finish, their own loadmaster admitting them; then the
+first 0.15 that writes finds it empty and moves it, and the runs of 0.15 get
+in line. From then on 0.12 to 0.14 cannot use it. So upgrade every agent on a
+machine at once, when few checks run. Versions up to 0.11 kept separate files
+(`queue-v3.db` and before) and do not count the jobs of later ones, or the
+other way round: `loadmaster status` and `loadmaster run` say when such a
+file holds jobs.
 Next to it, `history.jsonl` gets one line per job
 (task, weight and the cores it got if fewer, resources, capacity, wait and run
 time, CPU time, load average, the machine's CPU busy while it ran, signal,
@@ -525,16 +530,19 @@ line, the process that later reclaims the job writes one with outcome `lost`.
 ## How it works
 
 - **Admission**: jobs are judged in line order. A job starts when its weight
-  and each resource it uses fit beside the running jobs ahead of it now, and
-  will still fit beside every job ahead of it that waits, when that one
-  starts, next to whatever else could be running then. A job decides from the
-  jobs ahead of it alone, so no job is ever delayed by jobs that got in line
-  after it, and the jobs that start never take the machine past a limit. A
-  small job can start ahead of a big one that waits for cores only where it
-  cannot be in its way; when the big one needs the whole machine, a quick
-  lint waits behind it even while some cores are free. A job waiting for a
-  resource, such as a database stack, lets jobs that don't need it pass, as
-  long as they fit beside it when it starts.
+  (or, with `min_weight`, some of it) and each resource it uses fit beside the
+  running jobs ahead of it now, and will still fit beside every job ahead of
+  it that waits, when that one starts, next to whatever else could be running
+  then; it starts with the most cores that allows. A job decides from the
+  jobs ahead of it alone, so no job is ever delayed, or started with fewer
+  cores, by jobs that got in line after it, and the jobs that start never take
+  the machine past a limit. A small job can start ahead of a big one that
+  waits for cores only where it cannot be in its way; when the big one needs
+  the whole machine, a quick lint waits behind it even while some cores are
+  free. A job waiting for a resource, such as a database stack, lets jobs that
+  don't need it pass, as long as they fit beside it when it starts. Whichever
+  waiting `loadmaster` first finds that jobs may start starts all of them, in
+  line order, in one transaction; each finds itself started on its next poll.
 - **Crashes**: state is a per-user SQLite database. Every update first checks
   that the processes holding places and slots are still alive (comparing PID
   and process start time, so a reused PID can't fool it):
@@ -599,8 +607,11 @@ another one, so it has to fit there:
 
 - the job must be running and must have been started from the same checkout,
   so a stale, made-up or leaked `LOADMASTER_HELD` is not a free pass;
-- the inner task's weight must not exceed the outer task's, and every resource
-  it uses must be in the outer task's `uses`, with at least the same amount.
+- the inner task's weight must not exceed the cores the outer task got (its
+  weight, unless it started with fewer; an inner task with `min_weight` fits
+  if that does, and gets the outer task's `LOADMASTER_WEIGHT`), and every
+  resource it uses must be in the outer task's `uses`, with at least the same
+  amount.
 
 Otherwise the inner call fails with exit code 125 and says what to change.
 Give the outer task a weight and `uses` that cover everything it runs. Nested
@@ -721,12 +732,17 @@ type or unit changed, and a new value of `state`, `need` or `reason`. The
 table above, and every `text`, may change in any release.
 
 - `format`: 2.
+- `protocol`: the admission protocol of the queue (2 from 0.15 on), and
+  `moving`: while the queue moves to it from protocol 1, `{left}`, the jobs
+  of 0.12 to 0.14 still in it (whose waits are their own loadmaster's to
+  explain: `wait` is `null`), else `null`.
 - `capacity`, `capacity_source`, `measure_only`, and `cores_in_use` by
   running jobs.
 - `cpu`: if the CPU busy outside the queue was measured (jobs adapt to it),
   `{cores, busy_beyond_running_jobs, start_limit}`: the machine's CPUs, the
   cores busy beyond what running jobs got, as measured, and the most cores a
-  job of this machine's capacity starts with now; else `null`.
+  job of this machine's capacity starts with now (one whose `min_weight` is
+  more starts with that); else `null`.
 - `load_average` over the last minute, or `null`.
 - `resources`: `{name, in_use, capacity}` for each machine-wide resource a job
   uses (`capacity` is `null` if nothing limits it).
@@ -736,8 +752,10 @@ table above, and every `text`, may change in any release.
   where the file could not be read).
 - `reclaimed`: how many jobs whose processes were gone were reclaimed.
 - `jobs`, in line order, each with:
-  - `id`, `task`, `weight`, `cores` (what it started with, once it runs, else
-    `null`), `uses` (for each resource, `{amount, capacity, per_checkout}` as
+  - `id`, `task`, `weight`, `min_weight` (the fewest cores it may start
+    with: its weight unless the task sets one), `cores` (what it started
+    with, once it runs, else `null`), `uses` (for each resource, `{amount,
+    capacity, per_checkout}` as
     the job got in line with them, the limits `null` where it had none),
     `dir` and `checkout` (bytes that are not UTF-8 replaced), `args`, `pid`
     (of its `loadmaster`) and `pgid` (of its task), or `null`; `capacity`,
@@ -756,10 +774,13 @@ table above, and every `text`, may change in any release.
   - `processes`: for a lingering job, `{pid, name}` of each process in its
     group; else `null`;
   - `wait`: `null` for a job that runs. For one that waits or is parked,
-    `{starts_now, ahead, for, text}`: `starts_now` is true if the rule lets it
-    start now (it does on its next poll, unless parked), `ahead` is the number
-    of jobs ahead of it that have not started (`null` with `starts_now`),
-    `text` the reason as the table words it, and `for` what it waits for,
+    `{starts_now, cores, ahead, for, text}`: `starts_now` is true if the rule
+    lets it start now (the next poll of a waiting job's `loadmaster` starts
+    it, with every other that may; a parked one when resumed), `cores` the
+    cores it starts with then (else `null`), `ahead` is the number of jobs
+    ahead of it that have not started (`null` with `starts_now`), `text` the
+    reason as the table words it, and `for` what it waits for (on cores, its
+    `min_weight`),
     each with:
     - `need` (`cores`, `resource` or `checkout_resource`), `resource` (its
       name, or `null`) and `amount`;
@@ -1086,9 +1107,9 @@ on your machine:
 3. Run `loadmaster report`.
 
 The report has one section per setting (measure-only or admission, and the
-capacity), and one row per task and setting: a task run with another weight
-or other resources, as by an old branch during a switch-over, gets a row of
-its own. Tasks are grouped by name across all repositories; if two projects
+capacity), and one row per task and setting: a task run with another weight,
+`min_weight` (shown as `4 (from 1)`) or other resources, as by an old branch
+during a switch-over, gets a row of its own. Tasks are grouped by name across all repositories; if two projects
 both have a `test` task, look at one at a time with `--dir`; to see the runs
 of a task given some argument, such as a flag you tried, use `--args`. To compare the
 time before and after a change, use `--until` and `--since` with the time of
@@ -1144,9 +1165,10 @@ What to compare between the two periods:
   the machine can run above its capacity; raise the weight. Read them from the admission
   period; under contention they read low.
 - **OVER**: passed checks that kept more than 1.2 times the cores they got
-  busy, each against its own: its weight, or fewer while CPU was busy outside
-  the queue. A task that does not size itself by `LOADMASTER_WEIGHT` shows up
-  here when it got fewer, even if it stays within its weight.
+  busy, each against its own: its weight, or fewer for a task with
+  `min_weight`. A task that does not size itself by `LOADMASTER_WEIGHT` shows
+  up here when it got fewer, even if it stays within its weight: take its
+  `min_weight` out, or make it size itself.
 - **above capacity ... of the time checks ran**: how often the weights of the
   checks running at once (measure-only) or asking to run (admission) added up
   to more than the capacity. It is only as meaningful as the weights are; the

@@ -32,6 +32,10 @@ const RESERVED_CORES: u32 = 2;
 pub struct Task {
     pub name: String,
     pub weight: u32,
+    /// The least cores it may start with, if it says (`min_weight`): its
+    /// consent to fewer than its weight, which it sizes itself by through
+    /// `LOADMASTER_WEIGHT`. Without it, it starts with its weight.
+    pub min_weight: Option<u32>,
     /// Resources the task uses, by name, all declared in the same file.
     pub uses: BTreeMap<String, u32>,
     /// Exit codes that mean the check passed (`[0]` unless set), for the
@@ -78,6 +82,7 @@ struct RepoFile {
 #[serde(deny_unknown_fields)]
 struct TaskFile {
     weight: u32,
+    min_weight: Option<u32>,
     #[serde(default)]
     uses: BTreeMap<String, u32>,
     ok_exit_codes: Option<Vec<i64>>,
@@ -238,6 +243,14 @@ impl Task {
         if def.weight == 0 {
             return Err(format!("task `{name}`: weight must be at least 1"));
         }
+        if let Some(min) = def.min_weight
+            && !(1..=def.weight).contains(&min)
+        {
+            return Err(format!(
+                "task `{name}`: min_weight must be from 1 to its weight, {}",
+                def.weight
+            ));
+        }
         if let Some(undeclared) = def.uses.keys().find(|r| !resources.contains_key(*r)) {
             let declared = if resources.is_empty() {
                 "none".to_owned()
@@ -320,6 +333,7 @@ impl Task {
         Ok(Task {
             name,
             weight: def.weight,
+            min_weight: def.min_weight,
             uses: def.uses,
             ok_exit_codes,
             stop_signal,
@@ -584,6 +598,7 @@ mod tests {
             &Task {
                 name: "test".into(),
                 weight: 4,
+                min_weight: None,
                 uses: BTreeMap::new(),
                 ok_exit_codes: vec![0],
                 stop_signal: libc::SIGTERM,

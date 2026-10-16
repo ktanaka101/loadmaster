@@ -21,6 +21,7 @@ fn request<'a>(task: &'a str, weight: u32, args: &'a [String]) -> JobRequest<'a>
     JobRequest {
         task,
         weight,
+        min_weight: weight,
         dir: Path::new("/repo"),
         args,
         command: task,
@@ -139,7 +140,7 @@ fn running_job_survives_its_owner_while_child_group_lives() {
     f.queue
         .conn
         .execute(
-            "UPDATE jobs SET owner_start = owner_start + 1 WHERE id = ?1",
+            "UPDATE jobs SET owner_start = owner_start + 1 WHERE rowid = ?1",
             [ticket.id()],
         )
         .unwrap();
@@ -215,7 +216,7 @@ fn parked_job_keeps_its_place_and_can_be_resumed() {
     };
     let running = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
     running.try_admit().unwrap();
-    let first = f.queue.enqueue(&small(&args), f.me).unwrap();
+    let mut first = f.queue.enqueue(&small(&args), f.me).unwrap();
     let first_id = first.id();
     first.park().unwrap();
     let later = f.queue.enqueue(&small(&[]), f.me).unwrap();
@@ -237,7 +238,7 @@ fn a_parked_job_is_resumed_only_with_the_same_demands() {
     // Jobs behind may have started next to the parked job's set-aside; a
     // re-run that needs more could then be delayed by them.
     let f = fixture();
-    let parked = f.queue.enqueue(&request("e2e", 2, &[]), f.me).unwrap();
+    let mut parked = f.queue.enqueue(&request("e2e", 2, &[]), f.me).unwrap();
     let parked_id = parked.id();
     parked.park().unwrap();
     let bigger = f.queue.enqueue(&request("e2e", 4, &[]), f.me).unwrap();
@@ -263,7 +264,7 @@ fn a_parked_job_is_resumed_only_with_the_same_demands() {
 #[test]
 fn parked_head_blocks_until_it_expires() {
     let f = fixture();
-    let parked = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
+    let mut parked = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
     let parked_id = parked.id();
     parked.park().unwrap();
     let next = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
@@ -275,7 +276,7 @@ fn parked_head_blocks_until_it_expires() {
     f.queue
         .conn
         .execute(
-            "UPDATE jobs SET parked_at = ?2 WHERE id = ?1",
+            "UPDATE jobs SET parked_at = ?2 WHERE rowid = ?1",
             params![parked_id, expired],
         )
         .unwrap();
@@ -316,7 +317,7 @@ fn resume_key_compares_directories_byte_for_byte() {
     // Both are "/repo/\u{FFFD}" when converted lossily.
     let a = Path::new(OsStr::from_bytes(b"/repo/\xff"));
     let b = Path::new(OsStr::from_bytes(b"/repo/\xfe"));
-    let parked = f
+    let mut parked = f
         .queue
         .enqueue(
             &JobRequest {
@@ -373,7 +374,7 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
         .conn
         .execute(
             "UPDATE jobs SET owner_start = owner_start + 1, started_at = enqueued_at + 250
-             WHERE id = ?1",
+             WHERE rowid = ?1",
             [running.id()],
         )
         .unwrap();
@@ -388,20 +389,20 @@ fn reaping_a_killed_owner_logs_the_job_as_lost() {
         .execute(
             "UPDATE jobs SET owner_start = owner_start + 1, enqueued_at = enqueued_at - 5000,
                  started_at = enqueued_at - 4750
-             WHERE id = ?1",
+             WHERE rowid = ?1",
             [admitted.id()],
         )
         .unwrap();
     std::mem::forget(admitted);
     // Gave up and expired: already logged as gave_up by its owner.
-    let parked = f.queue.enqueue(&request("e2e", 2, &[]), f.me).unwrap();
+    let mut parked = f.queue.enqueue(&request("e2e", 2, &[]), f.me).unwrap();
     let parked_id = parked.id();
     parked.park().unwrap();
     let expired = unix_ms(SystemTime::now() - PARK_TTL - Duration::from_secs(1));
     f.queue
         .conn
         .execute(
-            "UPDATE jobs SET parked_at = ?2 WHERE id = ?1",
+            "UPDATE jobs SET parked_at = ?2 WHERE rowid = ?1",
             params![parked_id, expired],
         )
         .unwrap();
@@ -454,7 +455,7 @@ fn admit_now_ignores_the_line_and_the_capacity() {
     let f = fixture();
     let big = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
     big.try_admit().unwrap();
-    let parked = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
+    let mut parked = f.queue.enqueue(&request("test", 4, &[]), f.me).unwrap();
     parked.park().unwrap();
     let late = f.queue.enqueue(&request("lint", 4, &[]), f.me).unwrap();
     late.admit_now().unwrap();
@@ -501,7 +502,7 @@ fn insert_as_0_13(conn: &Connection, state: &str, owner: Option<ProcessId>, at: 
 }
 
 #[test]
-fn a_queue_of_0_12_and_0_13_is_brought_up_in_place() {
+fn a_queue_of_0_12_to_0_14_moves_to_protocol_2_once_their_jobs_are_done() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(QUEUE_DB_FILE);
     let me = ProcessId::current().unwrap();
@@ -513,11 +514,12 @@ fn a_queue_of_0_12_and_0_13_is_brought_up_in_place() {
     insert_as_0_13(&old, "running", None, 3_000);
     insert_as_0_13(&old, "waiting", Some(me), 0);
     old.execute("DELETE FROM jobs WHERE id = 5", []).unwrap();
-    drop(old);
 
+    // Brought up to 0.14's layout, and closed to new jobs.
     let queue = Queue::open(&path).unwrap();
-    assert_eq!(layout(&queue.conn).unwrap(), LAYOUT);
-    assert_eq!(protocol(&queue.conn).unwrap(), Some(PROTOCOL));
+    assert_eq!(layout(&queue.conn).unwrap(), 2);
+    assert_eq!(protocol(&queue.conn).unwrap(), Some(1));
+    assert!(closed(&queue.conn).unwrap());
     let since: Vec<Option<SystemTime>> = load_jobs(&queue.conn)
         .unwrap()
         .iter()
@@ -534,9 +536,73 @@ fn a_queue_of_0_12_and_0_13_is_brought_up_in_place() {
             None
         ]
     );
-    // IDs go on from the highest ever given, not from the jobs left.
+    // Nothing gets in meanwhile, whoever asks. Getting in line reaps first:
+    // the expired place and the job nobody holds are gone, two are left.
+    assert!(matches!(
+        queue.enqueue(&request("new", 1, &[]), me),
+        Err(Error::QueueMoving { left: 2 })
+    ));
+    let refused = old
+        .execute(
+            "INSERT INTO jobs (task, weight, state, dir, args, command, enqueued_at, capacity,
+                 measure_only, checkout, uses, adapt_cpu, stop_signal)
+             VALUES ('t', 1, 'waiting', x'2f', '[]', 't', 1, 8, 0, x'2f', '[]', 0, 15)",
+            [],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("moving to the admission protocol of loadmaster 0.15"),
+        "{refused}"
+    );
+    // The jobs there run their course, by their own loadmaster's rule.
+    old.execute(
+        "UPDATE jobs SET state = 'running', started_at = 4000, granted = 1 WHERE id = 3",
+        [],
+    )
+    .unwrap();
+    old.execute("DELETE FROM jobs", []).unwrap();
+    assert_eq!(layout(&queue.conn).unwrap(), 2);
+
+    // Empty: the next write moves it.
+    queue.snapshot().unwrap();
+    assert_eq!(layout(&queue.conn).unwrap(), LAYOUT);
+    assert_eq!(protocol(&queue.conn).unwrap(), Some(PROTOCOL));
+    assert!(!closed(&queue.conn).unwrap());
+    // Nothing that 0.12 to 0.14 do works on it any more.
+    // A connection opened before still knows the old names, until it runs a
+    // statement: then SQLite prepares it again, and it fails.
+    let gone = old
+        .query_row("SELECT id FROM jobs", [], |r| r.get::<_, i64>(0))
+        .unwrap_err()
+        .to_string();
+    assert!(gone.contains("no such column: id"), "{gone}");
+    let refused = old
+        .execute(
+            "INSERT INTO jobs (task, weight, state, dir, args, command, enqueued_at, capacity,
+                 measure_only, checkout, uses, adapt_cpu, stop_signal)
+             VALUES ('t', 1, 'waiting', x'2f', '[]', 't', 1, 8, 0, x'2f', '[]', 0, 15)",
+            [],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("keeps the admission protocol of loadmaster 0.15"),
+        "{refused}"
+    );
+    drop(old);
+    // IDs go on from the highest ever given.
     let next = queue.enqueue(&request("next", 1, &[]), me).unwrap();
     assert_eq!(next.id(), 6);
+}
+
+#[test]
+fn a_new_queue_starts_at_protocol_2() {
+    let f = fixture();
+    assert_eq!(layout(&f.queue.conn).unwrap(), LAYOUT);
+    assert_eq!(protocol(&f.queue.conn).unwrap(), Some(PROTOCOL));
+    let ticket = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
+    assert_eq!(ticket.id(), 1);
 }
 
 #[test]
@@ -546,13 +612,13 @@ fn every_write_checks_the_queue_is_of_this_layout_and_protocol() {
     // A later loadmaster moved the queue to another admission protocol.
     f.queue
         .conn
-        .execute("UPDATE protocol SET version = 2", [])
+        .execute("UPDATE protocol SET version = 3", [])
         .unwrap();
     assert!(matches!(
         ticket.try_admit(),
         Err(Error::QueueTooNew {
             layout: LAYOUT,
-            protocol: Some(2),
+            protocol: Some(3),
             ..
         })
     ));
@@ -564,12 +630,12 @@ fn every_write_checks_the_queue_is_of_this_layout_and_protocol() {
     // Or to another layout: it cannot even be opened.
     f.queue
         .conn
-        .execute_batch("UPDATE protocol SET version = 1; PRAGMA user_version = 3;")
+        .execute_batch("UPDATE protocol SET version = 2; PRAGMA user_version = 4;")
         .unwrap();
     let path = f._dir.path().join(QUEUE_DB_FILE);
     assert!(matches!(
         Queue::open(&path),
-        Err(Error::QueueTooNew { layout: 3, .. })
+        Err(Error::QueueTooNew { layout: 4, .. })
     ));
     f.queue
         .conn
@@ -596,7 +662,7 @@ fn the_database_records_when_a_job_entered_its_state_whoever_writes_it() {
         after
     };
     let pause = || std::thread::sleep(Duration::from_millis(5));
-    let ticket = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
+    let mut ticket = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
     let id = ticket.id();
     let enqueued = since(id);
     pause();
@@ -608,7 +674,7 @@ fn the_database_records_when_a_job_entered_its_state_whoever_writes_it() {
         .conn
         .execute(
             "UPDATE jobs SET state = 'waiting', owner_pid = ?2, owner_start = ?3, parked_at = NULL
-             WHERE id = ?1",
+             WHERE rowid = ?1",
             params![id, f.me.pid, f.me.start_time as i64],
         )
         .unwrap();
@@ -617,7 +683,7 @@ fn the_database_records_when_a_job_entered_its_state_whoever_writes_it() {
     f.queue
         .conn
         .execute(
-            "UPDATE jobs SET state = 'running', started_at = 1, granted = 1 WHERE id = ?1",
+            "UPDATE jobs SET state = 'running', started_at = 1, granted = 1 WHERE rowid = ?1",
             [id],
         )
         .unwrap();
@@ -626,13 +692,13 @@ fn the_database_records_when_a_job_entered_its_state_whoever_writes_it() {
     // Recording its task's group is no change of state.
     f.queue
         .conn
-        .execute("UPDATE jobs SET child_pgid = 1 WHERE id = ?1", [id])
+        .execute("UPDATE jobs SET child_pgid = 1 WHERE rowid = ?1", [id])
         .unwrap();
     assert_eq!(since(id), started);
     f.queue
         .conn
         .execute(
-            "UPDATE jobs SET owner_pid = NULL, owner_start = NULL WHERE id = ?1",
+            "UPDATE jobs SET owner_pid = NULL, owner_start = NULL WHERE rowid = ?1",
             [id],
         )
         .unwrap();
@@ -775,6 +841,8 @@ fn job(id: JobId, state: JobState, weight: u32, uses: Vec<Use>, checkout: &str) 
         stop_signal: libc::SIGTERM,
         granted: (state == JobState::Running).then_some(weight),
         state_since: None,
+        // As 0.15 records a job without a `min_weight`: it starts with its weight.
+        min_weight: Some(weight),
     }
 }
 
@@ -954,30 +1022,59 @@ fn a_job_that_may_start_now_counts_as_running_for_the_jobs_behind() {
     assert_ne!(decide(&jobs, 2, outside).unwrap(), Admission::Admitted);
 }
 
+/// `job` that may start with as few as `least` cores.
+fn least(job: Job, least: u32) -> Job {
+    Job {
+        min_weight: Some(least),
+        ..job
+    }
+}
+
 #[test]
-fn a_job_that_adapts_may_start_beside_a_start_with_fewer_cores() {
+fn a_job_that_may_start_with_fewer_cores_may_start_beside_a_start() {
     // When job 1 ends, job 3 may start with 2 cores before job 2 starts,
     // which does not see it: job 4 must leave room for both.
     let jobs = [
         sized(job(1, Running, 1, vec![browser(1)], "/a"), 5, false),
         sized(job(2, Waiting, 3, vec![browser(1)], "/a"), 5, false),
-        sized(job(3, Waiting, 3, vec![], "/a"), 5, true),
+        least(sized(job(3, Waiting, 3, vec![], "/a"), 5, true), 1),
         sized(job(4, Waiting, 1, vec![], "/a"), 5, false),
     ];
     assert!(!admitted(&jobs, 4));
 }
 
 #[test]
-fn beside_a_job_that_starts_with_fewer_cores_runs_nothing_ahead_of_it() {
-    // Job 3 adapts: with fewer cores it starts only with no core in use
-    // ahead of it, so jobs 1 and 2 are not beside it then.
+fn the_room_beside_a_start_is_at_the_least_it_may_start_with() {
+    // Job 1 runs on 6 of 8 cores; job 3 waits for `r`, which job 2 holds, and
+    // may start with 1 to 4 cores. At its weight it could not run beside job
+    // 1, but with 2 it can, once job 2 is done: job 4 would make it 9 (Codex).
+    let jobs = [
+        sized(job(1, Running, 6, vec![], "/a"), 8, false),
+        sized(job(2, Running, 1, vec![res("r", 1, 1)], "/a"), 8, false),
+        least(
+            sized(job(3, Waiting, 4, vec![res("r", 1, 1)], "/a"), 8, false),
+            1,
+        ),
+        sized(job(4, Waiting, 1, vec![], "/a"), 8, false),
+    ];
+    assert!(!admitted(&jobs, 4));
+}
+
+#[test]
+fn beside_a_start_with_fewer_cores_is_room_for_more() {
+    // Job 3 may start with one core beside jobs 1 and 2, and then counts at
+    // its weight: 5 + 5 + 4 leaves job 4 nothing. Starting with its weight
+    // only, it never runs beside both.
     let jobs = [
         sized(job(1, Running, 5, vec![], "/a"), 12, true),
         sized(job(2, Running, 5, vec![], "/a"), 12, true),
-        sized(job(3, Waiting, 4, vec![], "/a"), 12, true),
+        least(sized(job(3, Waiting, 4, vec![], "/a"), 12, true), 1),
         sized(job(4, Waiting, 2, vec![], "/a"), 12, true),
     ];
-    assert!(admitted(&jobs, 4));
+    assert!(!admitted(&jobs, 4));
+    let mut fixed = jobs.clone();
+    fixed[2].min_weight = Some(4);
+    assert!(admitted(&fixed, 4));
 }
 
 #[test]
@@ -1196,6 +1293,7 @@ fn the_most_beside_a_start_is_over_the_sets_that_fit_on_every_dimension() {
     // With 3 cores it would not fit beside job 3 and job 2.
     let mut bigger = jobs.clone();
     bigger[4].weight = 3;
+    bigger[4].min_weight = Some(3);
     assert!(!admitted(&bigger, 5));
 }
 
@@ -1250,6 +1348,8 @@ struct Arrival {
     /// When it parks (if it waits then), and when it resumes; if never, its
     /// place expires 5 steps later.
     parks: Option<(u32, Option<u32>)>,
+    /// The least cores it may start with, if fewer than its weight.
+    least: Option<u32>,
 }
 
 /// The "start" of a job that left the line, for comparing runs.
@@ -1268,7 +1368,7 @@ thread_local! {
 /// every waiting job poll (in line order, the reverse, or a random order)
 /// until nothing changes, and returns when each job started (`LEFT` if it
 /// left the line). Checks every limit, and the explanations, after each step.
-fn simulate(arrivals: &[Arrival], reverse: bool, outside: Load) -> Vec<u32> {
+fn simulate(arrivals: &[Arrival], reverse: bool, outside: Load) -> Vec<(u32, u32)> {
     simulate_with(arrivals, reverse, outside, &mut |_| {})
 }
 
@@ -1278,20 +1378,20 @@ fn simulate_with(
     reverse: bool,
     outside: Load,
     look: &mut dyn FnMut(&[Job]),
-) -> Vec<u32> {
+) -> Vec<(u32, u32)> {
     let mut jobs: Vec<Job> = Vec::new();
-    let mut started = vec![None; arrivals.len()];
+    let mut started: Vec<Option<(u32, u32)>> = vec![None; arrivals.len()];
     for t in 0..10_000 {
         // Finish, leave, park, resume, expire, then arrive.
         jobs.retain(|j| {
             let i = j.id as usize - 1;
-            started[i].is_none_or(|s: u32| s == LEFT || s + arrivals[i].duration > t)
+            started[i].is_none_or(|(s, _)| s == LEFT || s + arrivals[i].duration > t)
         });
         jobs.retain(|j| {
             let i = j.id as usize - 1;
             let leaving = j.state == Waiting && arrivals[i].leaves == Some(t);
             if leaving {
-                started[i] = Some(LEFT);
+                started[i] = Some((LEFT, 0));
             }
             !leaving
         });
@@ -1309,22 +1409,20 @@ fn simulate_with(
             let expired = j.state == JobState::Parked
                 && matches!(arrivals[i].parks, Some((at, None)) if at + 5 == t);
             if expired {
-                started[i] = Some(LEFT);
+                started[i] = Some((LEFT, 0));
             }
             !expired
         });
         for (i, a) in arrivals.iter().enumerate().filter(|(_, a)| a.at == t) {
-            jobs.push(sized(
-                job(
-                    i as JobId + 1,
-                    Waiting,
-                    a.weight.min(a.capacity),
-                    a.uses.clone(),
-                    a.checkout,
-                ),
-                a.capacity,
-                a.adapt,
-            ));
+            let weight = a.weight.min(a.capacity);
+            jobs.push(Job {
+                min_weight: Some(a.least.unwrap_or(weight).min(weight)),
+                ..sized(
+                    job(i as JobId + 1, Waiting, weight, a.uses.clone(), a.checkout),
+                    a.capacity,
+                    a.adapt,
+                )
+            });
         }
         loop {
             let mut ids: Vec<JobId> = jobs
@@ -1341,14 +1439,20 @@ fn simulate_with(
                     ids.swap(i, order.below(i as u32 + 1) as usize);
                 }
             }
+            // The first that may start starts every job that may, as one
+            // transaction, with the cores each gets.
             let admit = ids
                 .into_iter()
                 .find(|&id| decide(&jobs, id, outside(t)).unwrap() == Admission::Admitted);
-            let Some(id) = admit else { break };
-            let job = jobs.iter_mut().find(|j| j.id == id).unwrap();
-            job.granted = Some(cpu_demand(job, outside(t)).0);
-            job.state = Running;
-            started[id as usize - 1] = Some(t);
+            if admit.is_none() {
+                break;
+            }
+            for (id, cores) in super::admission::plan(&jobs, outside(t)) {
+                let job = jobs.iter_mut().find(|j| j.id == id).unwrap();
+                job.granted = Some(cores);
+                job.state = Running;
+                started[id as usize - 1] = Some((t, cores));
+            }
         }
         assert_within_limits(&jobs);
         assert_explained(&jobs, outside(t));
@@ -1454,7 +1558,15 @@ fn random_workload(rng: &mut Rng, jobs: usize, resources: bool) -> Vec<Arrival> 
                     let p = at + rng.below(4);
                     (p, (rng.below(3) != 0).then(|| p + 1 + rng.below(5)))
                 }),
+                least: None,
             }
+        })
+        .collect::<Vec<Arrival>>()
+        .into_iter()
+        .map(|a| Arrival {
+            // Half of them may start with fewer cores.
+            least: (rng.below(2) == 0).then(|| 1 + rng.below(a.weight.min(a.capacity))),
+            ..a
         })
         .collect()
 }
@@ -1477,7 +1589,8 @@ fn check_workload(round: usize, arrivals: &[Arrival], outside: Load) {
         assert_eq!(
             alone[k],
             all[k],
-            "round {round}: job {} started at {} with the later jobs, at {} without",
+            "round {round}: job {} started (at, with cores) {:?} with the later jobs, {:?} \
+             without",
             k + 1,
             all[k],
             alone[k]
@@ -1532,10 +1645,15 @@ fn cpu_busy_outside_lowers_what_jobs_start_with() {
         busy: 10.2,
         cores: 14,
     });
-    // 4 cores are left; a weight of 8 counts as all of them.
-    let big = job(1, Waiting, 8, vec![], "/a");
+    // 4 cores are left; a weight of 8 that may start with fewer counts as
+    // all of them.
+    let big = least(job(1, Waiting, 8, vec![], "/a"), 1);
     assert_eq!(cpu_demand(&big, outside), (4, 4));
     assert_eq!(decide(&[big], 1, outside).unwrap(), Admission::Admitted);
+    // One that starts with its weight does, once nothing runs ahead of it.
+    let fixed = job(1, Waiting, 8, vec![], "/a");
+    assert_eq!(cpu_demand(&fixed, outside), (8, 8));
+    assert_eq!(decide(&[fixed], 1, outside).unwrap(), Admission::Admitted);
 
     let jobs = [
         Job {
@@ -1613,6 +1731,7 @@ fn a_job_starts_with_what_the_shared_measurement_leaves() {
         .unwrap();
     let request = JobRequest {
         adapt_cpu: true,
+        min_weight: 1,
         ..request("e2e", 8, &[])
     };
     let ticket = f.queue.enqueue(&request, f.me).unwrap();
@@ -1889,7 +2008,7 @@ fn one_start_stands_for_its_kind() {
             cores: 14,
         });
         assert_eq!(
-            explain(&jobs, outside),
+            super::admission::explain(&jobs, outside),
             super::admission::explain_every_start(&jobs, outside),
             "round {round}: {jobs:#?}"
         );
@@ -1906,15 +2025,18 @@ fn assert_explained_agrees(jobs: &[Job], outside: Option<Outside>) {
 
 // ---- The most any rule could start, by brute force. ----
 
-/// Whether `set` could all run at once: on each dimension, within the
-/// smallest limit any of them records (CPU: capacity). Jobs not started count
-/// at their weight.
-fn fits_together(set: &[&Job]) -> bool {
+/// Whether `set` could all run at once: on each dimension (CPU too, unless
+/// `cpu` is false), within the smallest limit any of them records (CPU:
+/// capacity). On CPU a job counts what it holds (`granted`), else its weight.
+fn fits_on(set: &[&Job], cpu: bool) -> bool {
     let mut used: BTreeMap<Dim, u64> = BTreeMap::new();
     let mut limits: BTreeMap<Dim, u64> = BTreeMap::new();
     for job in set {
         for (dim, amount, limit) in demands(job, None) {
             let (amount, limit) = if dim == Dim::Cpu {
+                if !cpu {
+                    continue;
+                }
                 (
                     u64::from(job.granted.unwrap_or(job.weight)),
                     u64::from(job.capacity),
@@ -1930,40 +2052,82 @@ fn fits_together(set: &[&Job]) -> bool {
     used.iter().all(|(d, u)| *u <= limits[d])
 }
 
-/// The most permissive decision for the job at `at` that keeps every limit
-/// whatever the jobs ahead do: it fits beside the running jobs ahead, and
-/// beside every job X ahead not started together with any set of the others
-/// that fits with X. Jobs may end and leave at any time, so every such set
-/// may be what runs when X starts.
-fn most_permissive(jobs: &[Job], at: usize) -> bool {
+fn fits_together(set: &[&Job]) -> bool {
+    fits_on(set, true)
+}
+
+/// `job`, as holding `cores`: for fitting.
+fn holding(job: &Job, cores: u32) -> Job {
+    Job {
+        granted: Some(cores),
+        ..job.clone()
+    }
+}
+
+/// The most cores the job at `at` could start with now, keeping every limit
+/// whatever the jobs ahead do, if it could at all (as few as it may start
+/// with): it fits beside the running jobs ahead, and beside every job X
+/// ahead not started together with any set of the others that could run with
+/// X. Jobs may end and leave at any time, so every set that fits with X, X
+/// and the jobs not started at the least they may start with, may be what
+/// runs when X starts; they may then hold up to their weight, and X takes up
+/// to its weight, within the limits.
+fn most_cores(jobs: &[Job], at: usize) -> Option<u32> {
     let k = &jobs[at];
+    let weight = k.weight.min(k.capacity);
+    (k.least()..=weight).rev().find(|&g| safe_with(jobs, at, g))
+}
+
+fn safe_with(jobs: &[Job], at: usize, cores: u32) -> bool {
+    let k = holding(&jobs[at], cores);
     let ahead: Vec<&Job> = jobs[..at].iter().collect();
-    let running: Vec<&Job> = ahead
+    let mut now: Vec<&Job> = ahead
         .iter()
         .copied()
         .filter(|j| j.state == Running)
-        .chain([k])
         .collect();
-    if !fits_together(&running) {
+    now.push(&k);
+    if !fits_together(&now) {
         return false;
     }
+    let at_least = |j: &Job| match j.state {
+        Running => j.clone(),
+        _ => holding(j, j.least()),
+    };
+    let at_most = |j: &Job| match j.state {
+        Running => j.clone(),
+        _ => holding(j, j.weight.min(j.capacity)),
+    };
+    let cpu = |j: &Job| u64::from(j.granted.unwrap_or(j.weight));
     for (xi, x) in ahead.iter().enumerate().filter(|(_, j)| j.state != Running) {
         let others: Vec<&Job> = (0..ahead.len())
             .filter(|&i| i != xi)
             .map(|i| ahead[i])
             .collect();
         for mask in 0u32..(1 << others.len()) {
-            let mut set: Vec<&Job> = vec![x];
-            set.extend(
-                (0..others.len())
-                    .filter(|i| mask >> i & 1 == 1)
-                    .map(|i| others[i]),
-            );
-            if fits_together(&set) {
-                set.push(k);
-                if !fits_together(&set) {
-                    return false;
-                }
+            let members: Vec<&Job> = (0..others.len())
+                .filter(|i| mask >> i & 1 == 1)
+                .map(|i| others[i])
+                .chain([*x])
+                .collect();
+            let least: Vec<Job> = members.iter().map(|j| at_least(j)).collect();
+            if !fits_together(&least.iter().collect::<Vec<_>>()) {
+                continue;
+            }
+            let most: Vec<Job> = members.iter().map(|j| at_most(j)).collect();
+            let mut with_k: Vec<&Job> = most.iter().collect();
+            with_k.push(&k);
+            if !fits_on(&with_k, false) {
+                return false;
+            }
+            let limit = |set: &[&Job]| set.iter().map(|j| u64::from(j.capacity)).min().unwrap();
+            let worst = most
+                .iter()
+                .map(cpu)
+                .sum::<u64>()
+                .min(limit(&most.iter().collect::<Vec<_>>()));
+            if worst + u64::from(cores) > limit(&with_k) {
+                return false;
             }
         }
     }
@@ -1973,13 +2137,15 @@ fn most_permissive(jobs: &[Job], at: usize) -> bool {
 #[test]
 fn with_limits_all_jobs_agree_on_the_rule_starts_all_it_safely_could() {
     // CPU capacity 8, the browser 1, `db` 2 and 1 per checkout, `mem` 6 for
-    // every job; no CPU outside the queue, no job that adapts to it. Every
-    // job that waits after a step would, if it started, risk a limit.
+    // every job; no CPU outside the queue. After every step, a job that
+    // waits could not start even with the least it may start with without
+    // risking a limit, and one that started got the most cores it safely
+    // could.
     let mut rng = Rng(0x5EED_1234_0000_0002);
-    let mut checked = 0;
+    let (mut waited, mut started) = (0, 0);
     for round in 0..150 {
         let mut at = 0;
-        let arrivals: Vec<Arrival> = (0..12)
+        let arrivals: Vec<Arrival> = (0..11)
             .map(|_| {
                 at += rng.below(3);
                 let mut uses = vec![];
@@ -1992,31 +2158,56 @@ fn with_limits_all_jobs_agree_on_the_rule_starts_all_it_safely_could() {
                 if rng.below(4) == 0 {
                     uses.push(browser(1));
                 }
+                let weight = [1, 1, 2, 3, 4, 5, 8][rng.below(7) as usize];
                 Arrival {
                     at,
                     duration: 1 + rng.below(8),
-                    weight: [1, 1, 2, 3, 4, 5, 8][rng.below(7) as usize],
+                    weight,
                     uses,
                     checkout: ["/a", "/b"][rng.below(2) as usize],
                     leaves: (rng.below(5) == 0).then(|| at + 1 + rng.below(8)),
                     adapt: false,
                     capacity: 8,
                     parks: (rng.below(8) == 0).then(|| (at + rng.below(3), Some(at + 4))),
+                    least: (rng.below(2) == 0).then(|| 1 + rng.below(weight)),
                 }
             })
             .collect();
+        let mut running_before: Vec<JobId> = Vec::new();
         simulate_with(&arrivals, false, &|_| None, &mut |jobs| {
-            for at in (0..jobs.len()).filter(|&at| jobs[at].state == Waiting) {
-                checked += 1;
-                assert!(
-                    !most_permissive(jobs, at),
-                    "round {round}: job {} waits, but could start: {jobs:#?}",
-                    jobs[at].id
-                );
+            for at in 0..jobs.len() {
+                let job = &jobs[at];
+                if job.state == Waiting {
+                    waited += 1;
+                    assert_eq!(
+                        most_cores(jobs, at),
+                        None,
+                        "round {round}: job {} waits, but could start: {jobs:#?}",
+                        job.id
+                    );
+                } else if job.state == Running && !running_before.contains(&job.id) {
+                    // As the rule saw it: everything ahead as it is now.
+                    started += 1;
+                    let mut before = jobs.to_vec();
+                    before[at].state = Waiting;
+                    before[at].granted = None;
+                    assert_eq!(
+                        most_cores(&before, at),
+                        job.granted,
+                        "round {round}: job {} started with {:?} cores: {jobs:#?}",
+                        job.id,
+                        job.granted
+                    );
+                }
             }
+            running_before = jobs
+                .iter()
+                .filter(|j| j.state == Running)
+                .map(|j| j.id)
+                .collect();
         });
     }
-    assert!(checked > 1_000, "{checked}");
+    assert!(waited > 500 && started > 500, "{waited} {started}");
 }
 
 #[test]
@@ -2031,4 +2222,71 @@ fn a_poll_sees_what_other_processes_changed() {
     }
     drop(holder);
     assert_eq!(next.try_admit().unwrap(), Admission::Admitted);
+}
+
+#[test]
+fn one_poll_starts_every_job_that_may_in_line_order() {
+    let f = fixture();
+    let a = f.queue.enqueue(&request("a", 2, &[]), f.me).unwrap();
+    let b = f.queue.enqueue(&request("b", 2, &[]), f.me).unwrap();
+    // `b` polls first, and starts `a`, ahead of it, as well: in one
+    // transaction, `a` counting as running for `b`.
+    assert_eq!(b.try_admit().unwrap(), Admission::Admitted);
+    let jobs = f.queue.snapshot().unwrap().jobs;
+    assert!(jobs.iter().all(|j| j.state == Running), "{jobs:#?}");
+    // `a` finds itself started.
+    assert_eq!(a.try_admit().unwrap(), Admission::Admitted);
+    assert_eq!(a.granted().unwrap(), 2);
+}
+
+#[test]
+fn a_job_that_gives_up_after_another_started_it_runs() {
+    let f = fixture();
+    let mut a = f.queue.enqueue(&request("a", 2, &[]), f.me).unwrap();
+    let b = f.queue.enqueue(&request("b", 2, &[]), f.me).unwrap();
+    assert_eq!(b.try_admit().unwrap(), Admission::Admitted);
+    // Its `--max-wait` ran out meanwhile: it runs instead of parking.
+    assert!(!a.park().unwrap());
+    assert_eq!(a.granted().unwrap(), 2);
+    let jobs = f.queue.snapshot().unwrap().jobs;
+    assert_eq!(jobs.len(), 2);
+    drop(a);
+    assert_eq!(f.queue.snapshot().unwrap().jobs.len(), 1);
+}
+
+#[test]
+fn a_job_starts_with_fewer_cores_beside_running_ones_if_it_may() {
+    let f = fixture();
+    let holder = f.queue.enqueue(&request("hold", 6, &[]), f.me).unwrap();
+    assert_eq!(holder.try_admit().unwrap(), Admission::Admitted);
+    let fixed = f.queue.enqueue(&request("fixed", 4, &[]), f.me).unwrap();
+    assert!(matches!(fixed.try_admit().unwrap(), Admission::Waiting(_)));
+    drop(fixed);
+    let request = JobRequest {
+        min_weight: 2,
+        ..request("some", 4, &[])
+    };
+    let some = f.queue.enqueue(&request, f.me).unwrap();
+    assert_eq!(some.try_admit().unwrap(), Admission::Admitted);
+    assert_eq!(some.granted().unwrap(), 2);
+}
+
+#[test]
+fn a_parked_place_resumes_only_with_the_same_least() {
+    let f = fixture();
+    let holder = f.queue.enqueue(&request("hold", 8, &[]), f.me).unwrap();
+    assert_eq!(holder.try_admit().unwrap(), Admission::Admitted);
+    let some = |least| JobRequest {
+        min_weight: least,
+        ..request("some", 4, &[])
+    };
+    let mut parked = f.queue.enqueue(&some(2), f.me).unwrap();
+    let id = parked.id();
+    assert!(parked.park().unwrap());
+    let other = f.queue.enqueue(&some(4), f.me).unwrap();
+    assert!(!other.resumed());
+    assert_ne!(other.id(), id);
+    let same = f.queue.enqueue(&some(2), f.me).unwrap();
+    assert!(same.resumed());
+    assert_eq!(same.id(), id);
 }

@@ -107,9 +107,15 @@ fn agents_under_timeouts_and_crashes() {
                 .map_or(String::new(), |(_, signal)| {
                     format!("stop_signal = \"{signal}\"\n")
                 });
+            // These may start with fewer cores than their weight.
+            let least = match *name {
+                "test" => "min_weight = 1\n",
+                "big" => "min_weight = 3\n",
+                _ => "",
+            };
             sh_task(name, *weight, &script).replacen(
                 "cmd = ",
-                &format!("uses = {{ {} }}\n{stop}cmd = ", uses.join(", ")),
+                &format!("uses = {{ {} }}\n{stop}{least}cmd = ", uses.join(", ")),
                 1,
             )
         })

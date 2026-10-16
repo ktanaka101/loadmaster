@@ -209,10 +209,23 @@ fn run(args: RunArgs) -> Result<i32> {
     {
         say!("loadmaster: {note} (capacity {})", machine.capacity_source);
     }
+    // Its least is its own to say: one the machine does not have would
+    // never start.
+    if let Some(min) = task.min_weight
+        && min > machine.capacity
+        && !machine.measure_only
+    {
+        return Err(Error::Usage(format!(
+            "`{}` has min_weight {min}, above this machine's capacity of {} ({}): it would \
+             never start",
+            task.name, machine.capacity, machine.capacity_source
+        )));
+    }
     let task = &Task {
         weight: task.weight.min(machine.capacity),
         ..task.clone()
     };
+    let min_weight = task.min_weight.unwrap_or(task.weight).min(task.weight);
     let uses = resource_uses(&repo, task, &machine);
     // Resolved, so every worktree path that leads here is one checkout.
     let checkout = fs::canonicalize(repo.dir()).unwrap_or_else(|_| repo.dir().to_owned());
@@ -229,6 +242,7 @@ fn run(args: RunArgs) -> Result<i32> {
     let request = JobRequest {
         task: &task.name,
         weight: task.weight,
+        min_weight,
         dir: &cwd,
         args: &args.args,
         command: &display,
@@ -241,7 +255,10 @@ fn run(args: RunArgs) -> Result<i32> {
     };
     // Both clocks start here, so wait times include getting in line.
     let (queued_at, wait_started) = (SystemTime::now(), Instant::now());
-    let ticket = queue.enqueue(&request, owner)?;
+    let mut ticket = match enqueue_once_moved(&queue, &request, owner, task, max_wait, &signals)? {
+        Ok(ticket) => ticket,
+        Err(code) => return Ok(code),
+    };
     if ticket.resumed() {
         say!("loadmaster: resumed your place in line for `{}`", task.name);
     }
@@ -267,6 +284,7 @@ fn run(args: RunArgs) -> Result<i32> {
         ok: None,
         stopped: false,
         granted: None,
+        min_weight: (min_weight < task.weight).then_some(min_weight),
         uses: task.uses.clone(),
     };
     // Set once this run's line is written: a place that gave up logs before
@@ -298,14 +316,26 @@ fn run(args: RunArgs) -> Result<i32> {
                 &mut record,
             ),
             Turn::GaveUp(wait) => {
-                // Logged first: killed before parking, the job is reaped and
-                // logged as lost, which the report joins to this record;
-                // killed after parking, nothing else would log it.
+                // A process admitting jobs may have started it meanwhile:
+                // then it runs. Logged once parked, so that a run that went
+                // on to start never says it gave up: killed in between, this
+                // run leaves no line (killed before parking, it is reaped and
+                // logged as lost).
+                if !ticket.park()? {
+                    return run_admitted(
+                        ticket,
+                        &state_dir,
+                        command,
+                        task,
+                        &signals,
+                        wait_started,
+                        &mut record,
+                    );
+                }
                 record.outcome = Outcome::GaveUp;
                 record.exit_code = Some(EXIT_GAVE_UP);
                 log(&record);
                 logged = true;
-                ticket.park()?;
                 say!(
                     "loadmaster: gave up waiting to run `{}` after {} ({}); it waited for {}\n\
                      loadmaster: your place in line is kept for {}s; \
@@ -387,6 +417,53 @@ enum Turn {
     Interrupted(i32),
 }
 
+/// Gets in line, once the queue has moved to this version's admission
+/// protocol: while jobs of 0.12 to 0.14 finish in it, nothing gets in (see
+/// [`Error::QueueMoving`]). Gives up as `--max-wait` says, or on a signal,
+/// with the exit code to end with: no place was kept.
+fn enqueue_once_moved<'q>(
+    queue: &'q Queue,
+    request: &JobRequest,
+    owner: ProcessId,
+    task: &Task,
+    max_wait: Option<u64>,
+    signals: &Signals,
+) -> Result<std::result::Result<Ticket<'q>, i32>> {
+    let started = Instant::now();
+    let mut last_report: Option<Instant> = None;
+    loop {
+        match queue.enqueue(request, owner) {
+            Err(Error::QueueMoving { left }) => {
+                if let Some(&signal) = signals.take().first() {
+                    return Ok(Err(128 + signal));
+                }
+                if max_wait.is_some_and(|max| started.elapsed() >= Duration::from_secs(max)) {
+                    say!(
+                        "loadmaster: gave up waiting to run `{}` after {}: the queue is still \
+                         moving to the admission protocol of 0.15 ({left} job(s) of loadmaster \
+                         0.12 to 0.14 left); no place in line was kept, run the same command \
+                         again",
+                        task.name,
+                        format_duration(started.elapsed())
+                    );
+                    return Ok(Err(EXIT_GAVE_UP));
+                }
+                if last_report.is_none_or(|at| at.elapsed() >= REPORT_INTERVAL) {
+                    say!(
+                        "loadmaster: waiting to get `{}` in line: the queue is moving to the \
+                         admission protocol of 0.15, once the {left} job(s) of loadmaster 0.12 \
+                         to 0.14 in it are done (give every agent 0.15 or later)",
+                        task.name
+                    );
+                    last_report = Some(Instant::now());
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            other => return other.map(Ok),
+        }
+    }
+}
+
 fn wait_turn(
     ticket: &Ticket,
     task: &Task,
@@ -463,13 +540,13 @@ fn run_admitted(
         record.outcome = Outcome::Interrupted;
         return Ok(128 + cancel_signal(kill, task));
     }
-    // Fewer cores than its weight while CPU is busy outside the queue: the
-    // task can size its parallelism by them.
+    // Fewer cores than its weight, which it may start with (its min_weight,
+    // or CPU busy outside the queue): the task sizes its parallelism by them.
     let granted = ticket.granted()?;
     if granted < task.weight {
         say!(
-            "loadmaster: starting `{}` with {granted} of its {} cores, since CPU is busy \
-             beyond what running jobs got ({WEIGHT_ENV}={granted})",
+            "loadmaster: starting `{}` with {granted} of its {} cores, the most that fit now \
+             ({WEIGHT_ENV}={granted})",
             task.name,
             task.weight
         );
@@ -679,16 +756,33 @@ fn run_nested(value: &str, repo: &RepoConfig, task: &Task, mut command: Command)
             ),
         })
     };
-    // Capped at the capacity the holder's slot was granted under.
+    // Capped at the capacity the holder's slot was granted under, and
+    // against what the holder got: it may have started with fewer cores than
+    // its weight. A task that may start with fewer gets the holder's.
     let weight = task.weight.min(holder.capacity);
-    if weight > holder.weight {
-        return does_not_fit(
-            format!(
-                "`{}` has weight {weight}, more than the {} of",
-                task.name, holder.weight
-            ),
-            format!("give `{}` a weight of at least {weight}", holder.task),
-        );
+    let least = task.min_weight.unwrap_or(weight).min(weight);
+    let granted = holder.granted.unwrap_or(holder.weight);
+    if least > granted {
+        let (what, fix) = if granted < holder.weight {
+            (
+                format!(
+                    "the {granted} cores (of its weight {}) that started",
+                    holder.weight
+                ),
+                format!("give `{}` a min_weight of at most {granted}", task.name),
+            )
+        } else {
+            (
+                format!("the {granted} of"),
+                format!("give `{}` a weight of at least {least}", holder.task),
+            )
+        };
+        let needs = if least < weight {
+            format!("needs at least {least} cores")
+        } else {
+            format!("has weight {weight}")
+        };
+        return does_not_fit(format!("`{}` {needs}, more than {what}", task.name), fix);
     }
     for (name, &amount) in &task.uses {
         let held = holder
@@ -835,8 +929,14 @@ fn status(args: StatusArgs) -> Result<i32> {
     } else {
         None
     };
+    // While the queue moves to this version's protocol, the jobs in it are
+    // those of 0.12 to 0.14, which their own loadmaster admits by its rule.
+    let moving = queue.moving()?;
+    let explained = match moving {
+        Some(_) => Vec::new(),
+        None => queue::explain_with_cores(&snapshot.jobs, outside),
+    };
     if args.json {
-        let explained = queue::explain(&snapshot.jobs, outside);
         let others = queue::jobs_in_other_queues(&state_dir);
         let value = json::status(&json::Status {
             machine: &machine,
@@ -845,6 +945,7 @@ fn status(args: StatusArgs) -> Result<i32> {
             resources: &resources_in_use(&snapshot.jobs, &machine),
             others: &others,
             explained: &explained,
+            moving,
         });
         print(&format!("{value:#}\n"));
         return Ok(0);
@@ -886,6 +987,13 @@ fn status(args: StatusArgs) -> Result<i32> {
     if let Some(others) = other_queues(&state_dir) {
         out += &format!("{others}\n");
     }
+    if let Some(left) = moving {
+        out += &format!(
+            "the queue is moving to the admission protocol of loadmaster 0.15 and later: new \
+             runs wait until the {left} job(s) of loadmaster 0.12 to 0.14 in it are done, which \
+             their own loadmaster admits; give every agent 0.15 or later\n"
+        );
+    }
     if machine.measure_only {
         out += "measure-only: jobs start at once and are only recorded (see `loadmaster report`)\n";
     }
@@ -900,7 +1008,7 @@ fn status(args: StatusArgs) -> Result<i32> {
     } else {
         out += "\n";
         out += &jobs_table(&snapshot.jobs);
-        out += &why_jobs_wait(&snapshot.jobs, outside);
+        out += &why_jobs_wait(&snapshot.jobs, &explained);
     }
     print(&out);
     Ok(0)
@@ -965,18 +1073,26 @@ fn load_line() -> String {
 }
 
 /// One line per waiting job: what the admission rule says it waits for.
-fn why_jobs_wait(jobs: &[Job], outside: Option<queue::Outside>) -> String {
-    let lines: Vec<String> = queue::explain(jobs, outside)
-        .into_iter()
-        .filter_map(|(id, admission)| {
-            let job = jobs.iter().find(|job| job.id == id)?;
+fn why_jobs_wait(jobs: &[Job], explained: &[(JobId, Admission, Option<u32>)]) -> String {
+    let lines: Vec<String> = explained
+        .iter()
+        .filter_map(|(id, admission, cores)| {
+            let job = jobs.iter().find(|job| job.id == *id)?;
             if job.state != JobState::Waiting || job.measure_only {
                 return None;
             }
             let who = format!("#{id} `{}`", job.task);
-            Some(match admission {
-                Admission::Admitted => format!("  {who} is about to start\n"),
-                Admission::Waiting(wait) => format!("  {who} waits for {}\n", wait.waits_for()),
+            Some(match (admission, cores) {
+                (Admission::Admitted, Some(cores)) if *cores < job.weight => {
+                    format!(
+                        "  {who} is about to start, with {cores} of its {} cores\n",
+                        job.weight
+                    )
+                }
+                (Admission::Admitted, _) => format!("  {who} is about to start\n"),
+                (Admission::Waiting(wait), _) => {
+                    format!("  {who} waits for {}\n", wait.waits_for())
+                }
             })
         })
         .collect();
@@ -1071,6 +1187,9 @@ fn jobs_table(jobs: &[Job]) -> String {
             // "6 of 8": it started with fewer cores, for CPU busy outside.
             match job.granted.filter(|&granted| granted < job.weight) {
                 Some(granted) => format!("{granted} of {}", job.weight),
+                None if job.state != JobState::Running && job.least() < job.weight => {
+                    format!("{} (from {})", job.weight, job.least())
+                }
                 None => job.weight.to_string(),
             },
             if job.uses.is_empty() {
@@ -1318,17 +1437,23 @@ fn check_scenario(path: &Path) -> Result<i32> {
             "CPU busy beyond what running jobs got: {} of {} cores\n",
             o.busy, o.cores
         ),
-        None => "no CPU busy outside the queue given: jobs start with their weight\n".to_owned(),
+        None => "no CPU busy outside the queue given\n".to_owned(),
     };
-    let explained = queue::explain(&jobs, outside);
+    if value["protocol"] != serde_json::json!(2) {
+        out += "judged by the admission protocol of 0.15 and later: a job of 0.12 to 0.14 \
+                (without `min_weight`) may start with as few as one core if it adapts to CPU \
+                outside the queue, else only with its weight\n";
+    }
+    let explained = queue::explain_with_cores(&jobs, outside);
     for job in &jobs {
         let who = format!("#{} `{}`", job.id, job.task);
         let cores = |n: u32| format!("{n} core{}", if n == 1 { "" } else { "s" });
-        let start = queue::start_cores(job, outside);
-        let decision = explained
-            .iter()
-            .find(|(id, _)| *id == job.id)
-            .map(|(_, a)| a);
+        let decision = explained.iter().find(|(id, _, _)| *id == job.id);
+        let start = decision
+            .and_then(|(_, _, cores)| *cores)
+            .or(job.granted)
+            .unwrap_or(job.weight);
+        let decision = decision.map(|(_, admission, _)| admission);
         out += &match (job.state, decision) {
             (JobState::Running, _) => format!("{who} holds {}\n", cores(start)),
             // It starts at once, whatever the line and the capacity.

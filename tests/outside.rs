@@ -45,7 +45,10 @@ fn jobs_start_with_fewer_cores_while_cpu_is_busy_outside_the_queue() {
         eprintln!("skipped: {usable} of {cores} CPUs usable here");
         return;
     }
+    // `show` may start with as few as one core, `fixed` only with its weight.
     let tasks = sh_task("show", cores, "echo $LOADMASTER_WEIGHT")
+        .replacen("cmd = ", "min_weight = 1\ncmd = ", 1)
+        + &sh_task("fixed", cores, "echo $LOADMASTER_WEIGHT")
         // Long enough for the machine's CPU time to be measured.
         + &sh_task("fail", 1, "sleep 0.5; exit 1");
     let sandbox = Sandbox::new(cores, &tasks);
@@ -61,12 +64,16 @@ fn jobs_start_with_fewer_cores_while_cpu_is_busy_outside_the_queue() {
     assert!(granted < cores, "LOADMASTER_WEIGHT={granted} of {cores}");
     assert!(
         stderr(&output).contains(&format!(
-            "starting `show` with {granted} of its {cores} cores, since CPU is busy beyond \
-             what running jobs got"
+            "starting `show` with {granted} of its {cores} cores, the most that fit now"
         )),
         "{}",
         stderr(&output)
     );
+    // Nothing runs ahead of it: without its consent to fewer, it starts with
+    // all of them all the same.
+    let output = sandbox.run(&["run", "fixed"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), cores.to_string());
     let status = stdout(&sandbox.run(&["status"]));
     assert!(
         status.contains("CPU busy beyond what running jobs got: "),

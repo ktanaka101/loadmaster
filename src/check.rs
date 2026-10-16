@@ -26,7 +26,9 @@ pub fn render(repo: &RepoConfig, machine: &MachineConfig) -> String {
         let spare = (cores as u64).saturating_sub(u64::from(capacity));
         out += &format!(
             "CPU busy beyond what running jobs got: lowers what jobs start with once it is more \
-             than the {spare} of {cores} cores the capacity leaves free\n"
+             than the {spare} of {cores} cores the capacity leaves free, down to their \
+             min_weight (a task without one starts with its weight, once nothing runs ahead of \
+             it)\n"
         );
     }
 
@@ -35,10 +37,19 @@ pub fn render(repo: &RepoConfig, machine: &MachineConfig) -> String {
     for task in repo.tasks() {
         rows.push([
             task.name.clone(),
-            if task.weight > capacity {
-                format!("{} (counts as {capacity})", task.weight)
-            } else {
-                task.weight.to_string()
+            {
+                let weight = if task.weight > capacity {
+                    format!("{} (counts as {capacity})", task.weight)
+                } else {
+                    task.weight.to_string()
+                };
+                match task
+                    .min_weight
+                    .filter(|&least| least < task.weight.min(capacity))
+                {
+                    Some(least) => format!("{weight} (from {least})"),
+                    None => weight,
+                }
             },
             if task.uses.is_empty() {
                 "-".to_owned()
@@ -108,6 +119,14 @@ pub fn warnings(repo: &RepoConfig, machine: &MachineConfig) -> Vec<String> {
         .filter(|_| machine.capacity > 1)
         .filter_map(|task| whole_machine(task, machine.capacity))
         .collect();
+    warnings.extend(repo.tasks().filter_map(|task| {
+        let least = task.min_weight.filter(|&least| least > machine.capacity)?;
+        Some(format!(
+            "`{}` has min_weight {least}, above this machine's capacity of {}: it never \
+             starts here",
+            task.name, machine.capacity
+        ))
+    }));
     warnings.extend(unlimited_resources(repo, machine));
     warnings.extend(kept_out_while_waiting(repo, machine));
     warnings
@@ -200,6 +219,7 @@ fn kept_out_while_waiting(repo: &RepoConfig, machine: &MachineConfig) -> Vec<Str
             stop_signal: libc::SIGTERM,
             granted: (state == JobState::Running).then_some(weight),
             state_since: None,
+            min_weight: Some(task.min_weight.unwrap_or(weight).min(weight)),
         }
     };
     // In u64: sums of u32 amounts cannot overflow it.
@@ -534,7 +554,8 @@ mod tests {
         let expected = format!(
             "{}: valid\ncapacity: 8 (default: 8 cores minus 2)\n\
              CPU busy beyond what running jobs got: lowers what jobs start with once it is more \
-             than the {} of {cores} cores the capacity leaves free\n\n\
+             than the {} of {cores} cores the capacity leaves free, down to their min_weight (a \
+             task without one starts with its weight, once nothing runs ahead of it)\n\n\
              TASK  WEIGHT           USES  OK EXIT CODES  STOP SIGNAL\n\
              e2e   9 (counts as 8)  db=1  0              SIGTERM\n\
              ui    2                -     0, 2           SIGINT\n\n\

@@ -42,6 +42,8 @@ pub struct Check {
     pub machine_busy: Option<f64>,
     /// The cores it started with, if fewer than its weight.
     pub granted: Option<u32>,
+    /// The least cores it may start with, if fewer than its weight.
+    pub min_weight: Option<u32>,
     /// The resources it used, by name.
     pub uses: BTreeMap<String, u32>,
     pub result: CheckResult,
@@ -172,6 +174,7 @@ fn join(first: &Entry, last: &Entry) -> Check {
         load: last.load,
         machine_busy: last.machine_busy,
         granted: last.granted,
+        min_weight: last.min_weight,
         uses: last.uses.clone(),
         result,
     }
@@ -464,8 +467,9 @@ fn saturated_line(checks: &[Check], cpus: Option<usize>) -> String {
 /// saturated machine; `loadmaster run` notes those as they happen.
 pub const SATURATED: f64 = 0.95;
 
-/// A task with one weight and one set of resources: a row of the table.
-type Setting<'a> = (&'a str, u32, &'a BTreeMap<String, u32>);
+/// A task with one weight, one least it may start with, and one set of
+/// resources: a row of the table.
+type Setting<'a> = (&'a str, u32, Option<u32>, &'a BTreeMap<String, u32>);
 
 /// The per-task table, and what it flags.
 fn task_table(checks: &[Check]) -> (String, Flags) {
@@ -474,7 +478,7 @@ fn task_table(checks: &[Check]) -> (String, Flags) {
     let mut by_task: BTreeMap<Setting, Vec<&Check>> = BTreeMap::new();
     for check in checks {
         by_task
-            .entry((&check.task, check.weight, &check.uses))
+            .entry((&check.task, check.weight, check.min_weight, &check.uses))
             .or_default()
             .push(check);
     }
@@ -499,7 +503,7 @@ fn task_table(checks: &[Check]) -> (String, Flags) {
     ];
     let mut rows = vec![header.map(String::from).to_vec()];
     let mut flags = Flags::default();
-    for ((task, weight, uses), checks) in by_task {
+    for ((task, weight, least, uses), checks) in by_task {
         let count = |result| {
             checks
                 .iter()
@@ -531,7 +535,10 @@ fn task_table(checks: &[Check]) -> (String, Flags) {
         };
         rows.push(vec![
             task.to_owned(),
-            weight.to_string(),
+            match least {
+                Some(least) => format!("{weight} (from {least})"),
+                None => weight.to_string(),
+            },
             if uses.is_empty() {
                 "-".to_owned()
             } else {
@@ -759,6 +766,7 @@ mod tests {
             ok: None,
             stopped: false,
             granted: None,
+            min_weight: None,
             uses: BTreeMap::new(),
         }
     }

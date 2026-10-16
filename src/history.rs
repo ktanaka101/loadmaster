@@ -82,10 +82,13 @@ pub struct Record<'a> {
     /// SIGTERM or a cancel) before it exited.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
-    /// The cores the task started with, if fewer than its weight because CPU
-    /// was busy outside the queue.
+    /// The cores the task started with, if fewer than its weight.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub granted: Option<u32>,
+    /// The least cores it may start with, if fewer than its weight (its
+    /// `min_weight`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_weight: Option<u32>,
     /// The resources the task used, by name, so runs of one task with
     /// different settings can be told apart.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -116,6 +119,8 @@ pub struct Entry {
     #[serde(default)]
     pub stopped: bool,
     pub granted: Option<u32>,
+    #[serde(default)]
+    pub min_weight: Option<u32>,
     #[serde(default)]
     pub uses: BTreeMap<String, u32>,
 }
@@ -196,6 +201,7 @@ mod tests {
             ok: Some(false),
             stopped: false,
             granted: None,
+            min_weight: None,
             uses: BTreeMap::from([("db".to_owned(), 1)]),
         };
         append(dir.path(), &record).unwrap();
@@ -261,6 +267,7 @@ mod tests {
                 ok: Some(false),
                 stopped: false,
                 granted: None,
+                min_weight: None,
                 uses: BTreeMap::from([("db".to_owned(), 1)]),
             }
         );

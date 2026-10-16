@@ -163,16 +163,46 @@ INSERT INTO protocol (id, version) VALUES (1, 1);
 PRAGMA user_version = 2;
 ";
 
+/// Closes a queue of protocol 1 to new jobs, for its move to protocol 2: a
+/// trigger, which the writers of 0.12 to 0.14 obey too, though they do not
+/// read the protocol. They finish the jobs they hold; once none is left the
+/// queue moves (see [`LAYOUT_3`]).
+const CLOSE_FOR_PROTOCOL_2: &str = "
+CREATE TRIGGER queue_closed BEFORE INSERT ON jobs
+BEGIN
+    SELECT RAISE(ABORT, 'the queue is moving to the admission protocol of loadmaster 0.15 and later: give every agent on this machine loadmaster 0.15 or later');
+END;
+";
+
+/// From layout 2 to 3, and from protocol 1 to 2, on an empty queue: each job
+/// records the least cores it may start with (`min_weight`), and nothing of
+/// 0.12 to 0.14 can use the queue any more. Their statements name `jobs.id`,
+/// which becomes `job_id` (this version's name the row by `rowid`, which is
+/// the same in both), except their insert, which a trigger refuses for want
+/// of a `min_weight`.
+const LAYOUT_3: &str = "
+DROP TRIGGER IF EXISTS queue_closed;
+ALTER TABLE jobs RENAME COLUMN id TO job_id;
+ALTER TABLE jobs ADD COLUMN min_weight INTEGER;
+CREATE TRIGGER jobs_of_protocol_2 BEFORE INSERT ON jobs WHEN NEW.min_weight IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'this queue keeps the admission protocol of loadmaster 0.15 and later: give every agent on this machine loadmaster 0.15 or later');
+END;
+UPDATE protocol SET version = 2;
+PRAGMA user_version = 3;
+";
+
 /// The layout of the database this version reads and writes (see
 /// [`SCHEMA`]).
-const LAYOUT: i64 = 2;
+const LAYOUT: i64 = 3;
 
 /// The admission protocol every writer of this queue keeps: what a job may
 /// start with and what it must fit beside (see `docs/DECISIONS.md`, "The
-/// queue file"). 1 is that of 0.12 to 0.14, whose rules may share a queue.
-/// Every write transaction checks it first: a queue a later loadmaster moved
-/// to another protocol is an error, never another file.
-const PROTOCOL: i64 = 1;
+/// queue file"). 1 is that of 0.12 to 0.14; 2, from 0.15 on, lets a job start
+/// with fewer cores than its weight wherever that fits, which protocol 1
+/// does not protect. Every write transaction checks it first: a queue a later
+/// loadmaster moved to another protocol is an error, never another file.
+const PROTOCOL: i64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
@@ -235,6 +265,9 @@ pub struct Job {
     pub granted: Option<u32>,
     /// When it entered its state, if that is known (see [`LAYOUT_2`]).
     pub state_since: Option<SystemTime>,
+    /// The least cores it may start with (see [`LAYOUT_3`]); `None` for a
+    /// job of 0.12 to 0.14, in a queue that has not moved yet.
+    pub min_weight: Option<u32>,
 }
 
 /// The CPU busy outside the queue, in cores: all the machine's busy CPU time
@@ -294,6 +327,16 @@ pub struct Use {
 }
 
 impl Job {
+    /// The least cores it may start with: its `min_weight`; for a job of
+    /// 0.12 to 0.14, one if it adapts to CPU outside the queue, else its
+    /// weight.
+    pub fn least(&self) -> u32 {
+        let weight = self.weight.min(self.capacity).max(1);
+        self.min_weight
+            .unwrap_or(if self.adapt_cpu { 1 } else { weight })
+            .clamp(1, weight)
+    }
+
     fn owner_alive(&self) -> bool {
         self.owner.is_some_and(|owner| owner.is_alive())
     }
@@ -329,6 +372,8 @@ impl Job {
 pub struct JobRequest<'a> {
     pub task: &'a str,
     pub weight: u32,
+    /// The least cores it may start with: its `min_weight`, else its weight.
+    pub min_weight: u32,
     /// The caller's working directory. Together with `task` and `args`, this
     /// is the key for resuming a parked job.
     pub dir: &'a Path,
@@ -571,6 +616,12 @@ impl Queue {
         Ok(queue)
     }
 
+    /// How many jobs of 0.12 to 0.14 are left in a queue that is moving to
+    /// this version's protocol, if it is (see [`CLOSE_FOR_PROTOCOL_2`]).
+    pub fn moving(&self) -> Result<Option<usize>> {
+        Ok(moving(&self.conn)?)
+    }
+
     /// Whether SQLite could only open the database for reading, as it does
     /// without telling when it may not write to it.
     pub fn is_read_only(&self) -> bool {
@@ -578,16 +629,24 @@ impl Queue {
     }
 
     fn create_schema(&self) -> Result<()> {
-        // Usually it is there; don't take the write lock then. One this
-        // process may not write is for the caller to report.
-        if layout(&self.conn)? == LAYOUT || self.is_read_only() {
+        // Usually it is there, or closed for the move already; don't take
+        // the write lock then. One this process may not write is for the
+        // caller to report.
+        if self.is_read_only() {
+            return Ok(());
+        }
+        if layout(&self.conn)? == LAYOUT || closed(&self.conn)? {
             return Ok(());
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // Again under the lock: another process may have made it since.
         match layout(&tx)? {
-            0 => tx.execute_batch(&format!("{SCHEMA}{LAYOUT_2}"))?,
-            1 => tx.execute_batch(LAYOUT_2)?,
+            0 => tx.execute_batch(&format!("{SCHEMA}{LAYOUT_2}{LAYOUT_3}"))?,
+            1 => {
+                tx.execute_batch(LAYOUT_2)?;
+                move_or_close(&tx)?;
+            }
+            2 if protocol(&tx)? == Some(1) => move_or_close(&tx)?,
             LAYOUT => {}
             _ => return Err(self.unknown_layout(&tx)),
         }
@@ -619,19 +678,29 @@ impl Queue {
     /// version's layout and protocol: before anything is reaped or changed,
     /// so that a process that opened it before a later loadmaster changed it
     /// writes nothing.
+    /// A queue of protocol 1 that this version closed for the move to
+    /// protocol 2 counts too: the writers of 0.12 to 0.14 finish their jobs in
+    /// it, and this version reaps them.
     fn begin(&self) -> Result<Transaction<'_>> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        if layout(&tx)? != LAYOUT || protocol(&tx)? != Some(PROTOCOL) {
-            return Err(self.unknown_layout(&tx));
+        match (layout(&tx)?, protocol(&tx)?) {
+            (LAYOUT, Some(PROTOCOL)) => {}
+            (2, Some(1)) if closed(&tx)? => {}
+            _ => return Err(self.unknown_layout(&tx)),
         }
         Ok(tx)
     }
 
-    /// Runs `f` in a write transaction, after reaping dead jobs. Once that is
-    /// committed, logs the reaped jobs that were lost, and returns them all.
+    /// Runs `f` in a write transaction, after reaping dead jobs, and once a
+    /// queue closed for the move to protocol 2 is empty, after moving it.
+    /// Once that is committed, logs the reaped jobs that were lost, and
+    /// returns them all.
     fn write<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<(T, Vec<Job>)> {
         let tx = self.begin()?;
         let reaped = reap(&tx)?;
+        if layout(&tx)? != LAYOUT {
+            move_or_close(&tx)?;
+        }
         let value = f(&tx)?;
         tx.commit()?;
         self.log_lost(&reaped);
@@ -724,16 +793,20 @@ impl Queue {
         let args = serde_json::to_string(request.args).expect("strings always serialize");
         let uses = serde_json::to_string(request.uses).expect("uses always serialize");
         let ((id, resumed), _) = self.write(|tx| {
+            // A queue moving to protocol 2 takes no jobs until it has.
+            if let Some(left) = moving(tx)? {
+                return Err(Error::QueueMoving { left });
+            }
             let parked: Option<JobId> = tx
                 .query_row(
                     // Only with the same demands: jobs behind may have
                     // started next to what the parked job set aside, and
                     // could delay it if it needed more now.
-                    "SELECT id FROM jobs
+                    "SELECT rowid FROM jobs
                  WHERE state = 'parked' AND dir = ?1 AND task = ?2 AND args = ?3
                    AND weight = ?4 AND capacity = ?5 AND uses = ?6 AND checkout = ?7
-                   AND adapt_cpu = ?8
-                 ORDER BY id LIMIT 1",
+                   AND adapt_cpu = ?8 AND min_weight = ?9
+                 ORDER BY rowid LIMIT 1",
                     params![
                         dir,
                         request.task,
@@ -742,7 +815,8 @@ impl Queue {
                         request.capacity,
                         uses,
                         checkout,
-                        request.adapt_cpu
+                        request.adapt_cpu,
+                        request.min_weight
                     ],
                     |r| r.get(0),
                 )
@@ -754,7 +828,7 @@ impl Queue {
                          owner_pid = ?4, owner_start = ?5, parked_at = NULL,
                          capacity = ?6, measure_only = ?7, checkout = ?8, uses = ?9,
                          stop_signal = ?10
-                     WHERE id = ?1",
+                     WHERE rowid = ?1",
                         params![
                             id,
                             request.weight,
@@ -775,9 +849,9 @@ impl Queue {
                         "INSERT INTO jobs (task, weight, state, dir, args, command,
                                        owner_pid, owner_start, enqueued_at,
                                        capacity, measure_only, checkout, uses, adapt_cpu,
-                                       stop_signal)
+                                       stop_signal, min_weight)
                      VALUES (?1, ?2, 'waiting', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                             ?14)",
+                             ?14, ?15)",
                         params![
                             request.task,
                             request.weight,
@@ -792,7 +866,8 @@ impl Queue {
                             checkout,
                             uses,
                             request.adapt_cpu,
-                            request.stop_signal
+                            request.stop_signal,
+                            request.min_weight
                         ],
                     )?;
                     (tx.last_insert_rowid(), false)
@@ -893,7 +968,7 @@ impl Queue {
     pub fn record_child(&self, id: JobId, child: ProcessGroup) -> Result<()> {
         let tx = self.begin()?;
         tx.execute(
-            "UPDATE jobs SET child_pgid = ?2, child_start = ?3 WHERE id = ?1",
+            "UPDATE jobs SET child_pgid = ?2, child_start = ?3 WHERE rowid = ?1",
             params![id, child.pgid, child.leader_start_time.map(|t| t as i64)],
         )?;
         tx.commit()?;
@@ -971,7 +1046,7 @@ fn signal_task(tx: &Transaction, job: Job) -> Result<Canceled> {
 }
 
 fn delete_job(tx: &Transaction, id: JobId) -> Result<()> {
-    tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+    tx.execute("DELETE FROM jobs WHERE rowid = ?1", [id])?;
     tx.execute("DELETE FROM cancel_requests WHERE job = ?1", [id])?;
     Ok(())
 }
@@ -1004,6 +1079,7 @@ fn record(job: &Job, outcome: Outcome, waited_until: SystemTime) -> Record<'_> {
         ok: None,
         stopped: false,
         granted: job.granted.filter(|&granted| granted < job.weight),
+        min_weight: job.min_weight.filter(|&least| least < job.weight),
         uses: job
             .uses
             .iter()
@@ -1122,18 +1198,19 @@ impl Ticket<'_> {
             }
         }
         drop(last);
+        // Every waiting job the rule lets start now starts, in this
+        // transaction, with the cores it gets: each counts as running for the
+        // jobs behind it, so they are to start together. Their loadmasters
+        // find them started on their next poll.
         let (admission, _) = self.queue.write(|tx| {
             let jobs = load_jobs(tx)?;
             let admission = decide(&jobs, self.id, outside)?;
-            let me = jobs
-                .iter()
-                .find(|job| job.id == self.id)
-                .ok_or(Error::JobVanished(self.id))?;
-            if admission == Admission::Admitted && me.state != JobState::Running {
-                let (granted, _) = cpu_demand(me, outside);
+            let now = unix_ms(SystemTime::now());
+            for (id, cores) in admission::plan(&jobs, outside) {
                 tx.execute(
-                    "UPDATE jobs SET state = 'running', started_at = ?2, granted = ?3 WHERE id = ?1",
-                    params![self.id, unix_ms(SystemTime::now()), granted],
+                    "UPDATE jobs SET state = 'running', started_at = ?2, granted = ?3
+                     WHERE rowid = ?1 AND state = 'waiting'",
+                    params![id, now, cores],
                 )?;
             }
             Ok(admission)
@@ -1148,7 +1225,7 @@ impl Ticket<'_> {
         self.queue
             .conn
             .query_row(
-                "SELECT granted FROM jobs WHERE id = ?1 AND granted IS NOT NULL",
+                "SELECT granted FROM jobs WHERE rowid = ?1 AND granted IS NOT NULL",
                 [self.id],
                 |r| r.get(0),
             )
@@ -1160,7 +1237,7 @@ impl Ticket<'_> {
         let (started, _) = self.queue.write(|tx| {
             Ok(tx.execute(
                 "UPDATE jobs SET state = 'running', started_at = ?2, granted = weight
-                 WHERE id = ?1 AND state = 'waiting'",
+                 WHERE rowid = ?1 AND state = 'waiting'",
                 params![self.id, unix_ms(SystemTime::now())],
             )?)
         })?;
@@ -1189,7 +1266,7 @@ impl Ticket<'_> {
             )?;
         }
         tx.execute(
-            "UPDATE jobs SET owner_pid = NULL, owner_start = NULL WHERE id = ?1",
+            "UPDATE jobs SET owner_pid = NULL, owner_start = NULL WHERE rowid = ?1",
             [self.id],
         )?;
         tx.commit()?;
@@ -1198,20 +1275,33 @@ impl Ticket<'_> {
 
     /// Stops waiting but keeps the place in line for [`PARK_TTL`]: an
     /// [`Queue::enqueue`] with the same (`dir`, `task`, `args`) resumes it.
-    pub fn park(mut self) -> Result<()> {
-        self.armed = false;
+    /// Unless another process, admitting jobs, started it meanwhile: then it
+    /// is to run, the ticket is kept, and this returns false.
+    pub fn park(&mut self) -> Result<bool> {
         let tx = self.queue.begin()?;
         let parked = tx.execute(
             "UPDATE jobs SET state = 'parked', owner_pid = NULL, owner_start = NULL,
                  parked_at = ?2
-             WHERE id = ?1 AND state = 'waiting'",
+             WHERE rowid = ?1 AND state = 'waiting'",
             params![self.id, unix_ms(SystemTime::now())],
         )?;
+        let started: bool = tx
+            .query_row(
+                "SELECT state = 'running' FROM jobs WHERE rowid = ?1",
+                [self.id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
         tx.commit()?;
-        if parked == 0 {
-            return Err(Error::JobVanished(self.id));
+        match (parked, started) {
+            (1, _) => {
+                self.armed = false;
+                Ok(true)
+            }
+            (_, true) => Ok(false),
+            _ => Err(Error::JobVanished(self.id)),
         }
-        Ok(())
     }
 }
 
@@ -1293,18 +1383,16 @@ fn demands(job: &Job, outside: Option<Outside>) -> Vec<(Dim<'_>, u64, u64)> {
 /// judged by: a running job keeps what it was granted, whatever the CPU
 /// outside the queue has done since; a waiting one is judged by its
 /// capacity lowered by the CPU busy outside the queue now.
-/// The cores `job` holds if it runs, or would start with now.
-pub fn start_cores(job: &Job, outside: Option<Outside>) -> u32 {
-    cpu_demand(job, outside).0
-}
-
+/// The cores `job` holds, or the most it starts with now, and the limit on
+/// CPU it starts within: its capacity, lowered by CPU busy outside the queue
+/// if it adapts to it, but never below the least it may start with.
 fn cpu_demand(job: &Job, outside: Option<Outside>) -> (u32, u32) {
     if job.state == JobState::Running {
         return (job.granted.unwrap_or(job.weight), job.capacity);
     }
-    let limit = outside
-        .filter(|_| job.adapt_cpu)
-        .map_or(job.capacity, |o| o.cpu_limit(job.capacity));
+    let limit = outside.filter(|_| job.adapt_cpu).map_or(job.capacity, |o| {
+        o.cpu_limit(job.capacity).max(job.least()).min(job.capacity)
+    });
     (job.weight.min(limit), limit)
 }
 
@@ -1325,7 +1413,7 @@ fn decide(jobs: &[Job], id: JobId, outside: Option<Outside>) -> Result<Admission
         .iter()
         .position(|job| job.id == id)
         .ok_or(Error::JobVanished(id))?;
-    Ok(admission::decide(jobs, at, outside))
+    Ok(admission::decide(jobs, at, outside).admission)
 }
 
 /// Whether the last of `jobs` may start by the admission rule, with no CPU
@@ -1341,6 +1429,20 @@ pub fn would_start(jobs: &[Job]) -> bool {
 /// thereby says exactly what the rule decides.
 pub fn explain(jobs: &[Job], outside: Option<Outside>) -> Vec<(JobId, Admission)> {
     admission::explain(jobs, outside)
+        .into_iter()
+        .map(|d| (d.id, d.admission))
+        .collect()
+}
+
+/// [`explain`], with the cores each job that may start starts with.
+pub fn explain_with_cores(
+    jobs: &[Job],
+    outside: Option<Outside>,
+) -> Vec<(JobId, Admission, Option<u32>)> {
+    admission::explain(jobs, outside)
+        .into_iter()
+        .map(|d| (d.id, d.admission, d.cores))
+        .collect()
 }
 
 fn reap(tx: &Transaction) -> Result<Vec<Job>> {
@@ -1400,6 +1502,39 @@ fn read_cpu(conn: &Connection) -> Result<Option<CpuRow>> {
 
 /// Whether the schema has been made: the last statement of [`SCHEMA`] marks
 /// it.
+/// Moves a queue of protocol 1 to protocol 2 if it is empty, else closes it
+/// to new jobs until it is (see [`CLOSE_FOR_PROTOCOL_2`]).
+fn move_or_close(tx: &Transaction) -> rusqlite::Result<()> {
+    let empty: bool = tx.query_row("SELECT NOT EXISTS (SELECT 1 FROM jobs)", [], |r| r.get(0))?;
+    if empty {
+        tx.execute_batch(LAYOUT_3)
+    } else if !closed(tx)? {
+        tx.execute_batch(CLOSE_FOR_PROTOCOL_2)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the queue is closed to new jobs for its move to protocol 2.
+fn closed(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'queue_closed')",
+        [],
+        |r| r.get(0),
+    )
+}
+
+/// The jobs of a queue that is moving to protocol 2 and has not yet: all of
+/// 0.12 to 0.14, which hold their places by protocol 1. `None` if the queue
+/// has moved.
+pub fn moving(conn: &Connection) -> rusqlite::Result<Option<usize>> {
+    if layout(conn)? == LAYOUT {
+        return Ok(None);
+    }
+    conn.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0))
+        .map(|n| Some(n as usize))
+}
+
 /// The layout of the database (see [`SCHEMA`]), 0 if it has none yet.
 fn layout(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -1414,13 +1549,18 @@ fn protocol(conn: &Connection) -> rusqlite::Result<Option<i64>> {
 }
 
 fn load_jobs(conn: &Connection) -> Result<Vec<Job>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, task, weight, state, dir, args, command, owner_pid, owner_start,
-                child_pgid, child_start, enqueued_at, parked_at, started_at,
-                capacity, measure_only, checkout, uses, adapt_cpu, stop_signal, granted,
-                state_since
-         FROM jobs ORDER BY id",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT rowid, task, weight, state, dir, args, command, owner_pid, owner_start,
+                    child_pgid, child_start, enqueued_at, parked_at, started_at,
+                    capacity, measure_only, checkout, uses, adapt_cpu, stop_signal, granted,
+                    state_since, {}
+             FROM jobs ORDER BY rowid",
+        if layout(conn)? == LAYOUT {
+            "min_weight"
+        } else {
+            "NULL"
+        }
+    ))?;
     let jobs = stmt
         .query_map([], job_from_row)?
         .collect::<rusqlite::Result<_>>()?;
@@ -1465,6 +1605,7 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         stop_signal: row.get(19)?,
         granted: row.get(20)?,
         state_since: row.get::<_, Option<i64>>(21)?.map(from_unix_ms),
+        min_weight: row.get(22)?,
     })
 }
 

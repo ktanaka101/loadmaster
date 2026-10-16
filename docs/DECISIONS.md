@@ -217,7 +217,8 @@ milliseconds, so it is accepted rather than paid for with a more complex wait.
   test shards. The directory is stored and compared as raw bytes; a lossy
   string could make two different directories look the same.
 - A re-run resumes the place only if it asks for exactly what the parked job
-  did: the same weight, resources and limits, from the same checkout. Jobs
+  did: the same weight and `min_weight`, resources and limits, from the same
+  checkout. Jobs
   behind may have started beside what the parked job would start with, and
   would delay a re-run that needed more; one whose config changed in the
   meantime gets in line again instead.
@@ -236,7 +237,8 @@ milliseconds, so it is accepted rather than paid for with a more complex wait.
 - `--max-wait` takes whole seconds and is a soft limit: it is checked after
   each poll, and a job that finds room on the poll that crosses the limit
   starts instead of giving up, since running is what the caller wanted and
-  giving up would only make it re-run the command. That poll is normally at
+  giving up would only make it re-run the command. So does one that another
+  loadmaster started meanwhile (see [Polling](#polling)). That poll is normally at
   most 100 ms late, but can take longer while the database is busy.
 
 ## Opening the queue
@@ -263,13 +265,16 @@ old file was empty, which a Codex session cannot be asked (clew, 0.12).
 So from 0.12 on the file stays `queue-v4.db`, and the database says what it
 holds: its layout (`PRAGMA user_version`) and the admission protocol its
 writers keep (the `protocol` table). The protocol is what a rule must keep to
-share the queue: a job starts with its weight, or with fewer cores only while
-nothing runs ahead of it; it fits now beside the running jobs ahead, within
-the smallest limit any of them records; and it fits beside every start ahead
-next to every set of the jobs ahead that fits within the limits its members
-record (see [Resources](#resources)). Rules that keep the same protocol may
-work it out differently and run side by side: 0.12, 0.13 and 0.14 do, since
-each fits every job beside every such set. From 0.14 on, every write
+share the queue. In protocol 1 (0.12 to 0.14) a job starts with its weight,
+or with fewer cores only while nothing runs ahead of it; it fits now beside
+the running jobs ahead, within the smallest limit any of them records; and it
+fits beside every start ahead next to every set of the jobs ahead that fits
+within the limits its members record (see [Resources](#resources)). In
+protocol 2 (0.15) a job may start with any number of cores from its
+`min_weight` to its weight that fits, and the jobs behind it leave room for
+that. Rules that keep the same protocol may work it out differently and run
+side by side: 0.12, 0.13 and 0.14 do, since each fits every job beside every
+such set. From 0.14 on, every write
 transaction checks the layout and the protocol first, before it reaps or
 changes anything, so a process that opened the queue before a later
 loadmaster moved it to another protocol writes nothing and stops with an
@@ -280,13 +285,33 @@ process to open it, while older writers go on: 0.14 added when each job
 entered its state (see [Status as JSON](#status-as-json)), kept by triggers so
 that 0.12 and 0.13 keep it too.
 
-A rule that breaks the protocol (letting a job start with fewer cores than its
-weight beside jobs ahead of it, say) cannot share the queue with the old one.
-It will close the queue to new jobs, by a trigger that rejects inserts, which
-binaries that never read the protocol obey too; let the jobs in it finish,
-park and expire; and only then change the protocol, so that two protocols
-never hold allocations at once. That is built with the first protocol that
-needs it, and tested against the binaries it has to stop.
+0.15 moved the queue to protocol 2. A job behind one that may start with fewer
+cores protects that start beside sets that protocol 1 does not count, so the
+two cannot share the queue; two protocols must never hold allocations at once.
+The first 0.15 to open a queue of protocol 1 closes it to new jobs, by a
+trigger that refuses inserts, which binaries that never read the protocol obey
+too: runs of 0.12 to 0.14 fail and say to upgrade. The jobs in it finish,
+park, resume and expire as their own loadmaster has them; runs of 0.15 wait
+without a place in line (giving up as `--max-wait` says, saying that no place
+was kept), and reap. The first 0.15 write transaction that finds the queue
+empty moves it, in that transaction: `jobs.id` becomes `job_id`, which every
+statement of 0.12 to 0.14 names but their insert (0.15 names rows by `rowid`,
+the same before and after), a trigger refuses an insert without a
+`min_weight`, which theirs has not, and the protocol becomes 2. 0.14 then
+stops on its check of the protocol, with a message; 0.12 and 0.13 stop on the
+missing column, as soon as they run a statement (a connection opened before
+prepares it again then). Running jobs are never stopped: new runs pause until
+the jobs in the queue are done, once.
+
+A move that never paused was rejected (Codex): 0.15 admitting its jobs by
+protocol 1 while those of 0.12 to 0.14 finished, and switching once none of
+theirs was left. A job 0.15 admitted then had not protected the starts
+protocol 2 allows: in a queue of 5 cores, a job that started beside a waiting
+one by protocol 1 let that one start with fewer cores after the switch, 6 of
+5. And a run of 0.12 to 0.14 could resume a parked place of 0.15, ignoring its
+`min_weight`. The move is tested against real 0.12, 0.13 and 0.14 binaries:
+their jobs finish, their new runs are refused, 0.15 waits and then runs, and
+afterwards they cannot use the queue.
 
 Rejected with Codex (GPT-6-Astra): counting the jobs of another file as if
 they took the whole machine (both versions can see the other as idle and start
@@ -368,48 +393,70 @@ measure-only job, which started without the rule), so no job is ever
 delayed by jobs that got in line after it: whatever they do, its decisions
 see the same thing. What the rule has to protect is the limits. A job ahead
 decides its own start without looking behind it, so whatever started behind
-it meanwhile must still fit beside it then. A job may therefore start now if:
+it meanwhile must still fit beside it then. A job may start now, with some
+number of cores from the least it may start with (its `min_weight`, else its
+weight) to its weight, if:
 
-1. **it fits now**: beside the running jobs ahead of it and those ahead that
-   the rule lets start now (at what they would start with), within the
-   smallest limit it or any of them records, and on CPU within its own limit
-   lowered by CPU busy outside the queue; and
+1. **it fits now**: beside the running jobs ahead of it, within the smallest
+   limit it or any of them records, and on CPU within its own limit lowered
+   by CPU busy outside the queue (never below its `min_weight`); and
 2. **it fits beside every start ahead**: for every job X ahead of it that has
-   not started (waiting, parked, or able to start now), X plus the most the
-   other jobs ahead could use beside X, plus it, fit within the smallest
-   limit any of them records.
+   not started (waiting or parked), X plus the most the other jobs ahead could
+   use beside X, plus it, fit within the smallest limit any of them records.
+
+It starts with the most cores both allow: each only gets easier with fewer.
 
 "The most the other jobs ahead could use beside X" is over the sets of them
-that fit together with X. A job not started counts with any amount it may
-start with: CPU from one core to its weight if it adapts to CPU outside the
-queue. X itself counts at its weight. One that adapts may start with fewer
-cores, but only while its lowered limit is below its weight, and then only
-with no core in use ahead of it; the jobs behind it that run then each
-started fitting beside it at its weight, so together they fit beside it at
-its weight, and with fewer cores too. (The design checked that start
-separately; taking that check out failed no test, and the argument above is
-why.) Which sets fit is judged within X's own limit where it records one,
-since everything running when X starts fits within it, and elsewhere within
-the largest limit the jobs ahead record; what the job must keep, within the
+that could be running when X starts, which are those that fit beside X at the
+least it may start with: whatever X starts with, what runs beside it then fits
+beside that. A job not started counts with any amount it may start with (CPU
+from its `min_weight` to its weight). X itself counts at its weight, the most
+it takes. Working out the room beside X at its weight instead let a job start
+that X then took past a limit (Codex): on 8 cores, one job running on 6, X
+waiting for a resource another holds and able to start with 1 to 4, and a job
+of 1 behind it that starts since X at its weight never fits beside the 6; once
+the resource is free, X starts with 2 beside the 6, and 9 cores are in use.
+Which sets fit is judged within X's own limit where it records one, since
+everything running when X starts fits within it, and elsewhere within the
+largest limit the jobs ahead record; what the job must keep, within the
 smallest limit it or any of them records. A job that does not fit beside X
-within the limits either of them records never runs with it, and is left
-out. All of that comes from the jobs ahead of the job judged, never from the
-jobs behind it.
+within the limits either of them records never runs with it, and is left out.
+All of that comes from the jobs ahead of the job judged, never from the jobs
+behind it.
 
-When a job Z starts, every job W running behind it started while Z waited,
-and checked that it fits beside Z's start next to any set of the jobs ahead
-of it that could run beside Z; the jobs running at Z's start are such a set
-(by induction over the jobs behind Z in line order), so everything running
-then fits within the smallest limit any of them records. A job that may
-start now counts as running for the jobs behind it, so the order in which
-jobs poll changes nothing; it stays a constraint with its whole range, since
-it may still start later, with more. Measure-only jobs count where they run,
-but start whatever the rule says, so the promises do not cover them: while
-one runs, or after one started, a job ahead may start past a limit, since
-the jobs behind it made room for its start beside what ran then, not beside
-a measure-only job that came later (found in review). A queue that mixes
-them, from processes with different machine configs, is a measurement
-setup, not one to rely on.
+When a job Z starts, every job W running behind it started while Z waited, and
+checked that it fits beside Z's start next to any set of the jobs ahead of it
+that could run beside Z, with Z at its weight; the jobs running at Z's start
+are such a set (by induction over the jobs behind Z in line order: they fit
+beside Z with what it starts with, so beside its least), so everything running
+then fits within the smallest limit any of them records. A waiting job that
+may start counts as running, with the cores it starts with, for the jobs
+behind it: whichever loadmaster takes the write lock starts every such job, in
+line order, in one transaction (see [Polling](#polling)), so what each gets
+does not depend on who polls first. Measure-only jobs count where they run,
+but start whatever the rule says, so the promises do not cover them: while one
+runs, or after one started, a job ahead may start past a limit, since the jobs
+behind it made room for its start beside what ran then, not beside a
+measure-only job that came later (found in review). A queue that mixes them,
+from processes with different machine configs, is a measurement setup, not one
+to rely on.
+
+**Fewer cores than the weight.** Before 0.15 a job started with fewer cores
+than its weight only while CPU outside the queue left fewer, and only with
+nothing running ahead of it; beside the queue's own jobs it waited for its
+whole weight. A task that runs a pool of workers does as well with fewer, only
+longer: in a simulation of a day of agents' checks on 8 cores, letting jobs
+start with what is left cut the mean time from getting in line to the end by
+30 to 45%, with 6 to 15% of the jobs finishing later. But only the task can
+say whether it may: it must size its workers by `LOADMASTER_WEIGHT`, or it
+runs all of them on fewer cores, and one that holds a scarce resource (a
+browser, a database) holds it longer with fewer cores, which can keep others
+waiting longer than it gains. clew's tasks read `LOADMASTER_WEIGHT` nowhere,
+and its unit runs and UI captures hold an exclusive resource. So a task
+consents with `min_weight`, the fewest cores it may start with; without it, it
+starts with its weight. Exempting tasks that use a resource from the rule was
+rejected (Codex): a generous resource and a scarce one differ, and that is the
+task's to say by not setting `min_weight`.
 
 Condition 2 asks no more than it must. Jobs may end and leave the line at any
 time, so any set of the jobs ahead that fits within the limits all its members
@@ -418,12 +465,11 @@ that have not started start in line order (each passes the rule, since the
 whole set fits beside X), and X starts last. A job that condition 2 holds back
 could therefore, in some future, be running when a job ahead of it takes the
 machine past a limit; only knowing how long jobs run would rule that out.
-Where the jobs record the same limits and start with their weights, the rule
-thus starts every job that can start without that risk, as far as its
-computation is exact (below); a test compares it with a search of every set,
-on the lines the rule itself reaches. (A job that starts with fewer cores than
-its weight does so with nothing running ahead of it, so fewer sets can run
-then than the rule assumes.) Where limits disagree it is more careful than
+Where the jobs record the same limits, the rule thus starts every job that
+can start without that risk, with the most cores it safely can, as far as its
+computation is exact (below); a test compares it with a search of every set
+and every number of cores, on the lines the rule itself reaches. Where limits
+disagree it is more careful than
 that: the most the jobs beside X could use and the smallest limit among them
 may come from different sets, and keeping the smallest limit of each set as
 well would make the computation much larger. Codex (GPT-6-Astra) worked out
@@ -701,10 +747,10 @@ limit, was not taken, for three reasons this design answers:
   answers the question.
 - A limit on it lets work outside the line delay every job indefinitely.
   Instead the outside load beyond the cores the capacity leaves free lowers
-  the CPU limit of the jobs that start, to at least one core, and a weight
-  above that counts as all of it, as a weight above the capacity does. The
-  first job in line therefore still starts once the jobs ahead of it are
-  done: outside work can slow the line, but not stop it.
+  the CPU limit of the jobs that start, down to their `min_weight` (a job
+  without one keeps its weight as its limit, so it starts once nothing runs
+  ahead of it). The first job in line therefore still starts once the jobs
+  ahead of it are done: outside work can slow the line, but not stop it.
 - It breaks the guarantee the line gives, in an order nobody can predict.
   Instead the lowered limit only throttles starts: a job that adapts starts
   only if it and the jobs ahead of it fit within it, while what the rule
@@ -723,9 +769,13 @@ A job keeps what it started with: a task cannot be made to use fewer cores
 once it runs, and counting its grant anew would make jobs behind wait for
 cores it does not take. The task learns what it got from `LOADMASTER_WEIGHT`,
 so one that sizes its workers by it runs fewer of them, which is what keeps
-a single heavy check from timing out next to a game. `adapt_to_outside_cpu =
-false` in the machine config turns this off; each job records the setting it
-got in line with, as it does its capacity. GPU and memory are not measured:
+a single heavy check from timing out next to a game. Before 0.15 every job
+could get as few as one core this way, whether its task read
+`LOADMASTER_WEIGHT` or not: clew's ran all their workers on the fewer cores
+anyway (the report's OVER column shows that). Now a task without `min_weight`
+is never given fewer than its weight. `adapt_to_outside_cpu = false` in the
+machine config turns the throttle off; each job records the setting it got in
+line with, as it does its capacity. GPU and memory are not measured:
 there is no portable, unprivileged way to read either per machine, and CPU is
 what checks contend for most.
 
@@ -745,8 +795,12 @@ code 125) that says what to change:
   repository with more than one `.loadmaster.toml` has one checkout per file,
   so a task cannot nest the tasks of another file.
 - The inner task's weight, capped at the capacity the holder got in line
-  with, must not exceed the holder's, and every resource it uses must be in
-  the holder's `uses` with at least the same amount. Otherwise its load would
+  with, must not exceed the cores the holder got (its weight, unless it
+  started with fewer; before 0.15 its weight, so a holder started with 2 of 8
+  let a fixed inner task of 4 run, Codex); an inner task with `min_weight`
+  fits if that does, and runs with the holder's `LOADMASTER_WEIGHT`. Every
+  resource it uses must be in the holder's `uses` with at least the same
+  amount. Otherwise its load would
   run outside the accounting: a heavy check inside a light one would overload
   the machine, and an e2e run inside a task that holds no database would break
   the per-checkout limit that keeps two runs off one database. Amounts are
@@ -857,17 +911,28 @@ task is polled for exit every 20 ms. The waiting message is printed when a
 job starts waiting and then every 10 seconds: often enough to show progress,
 rarely enough not to flood an agent's context.
 
-Each waiting job notices on its own next poll that it may start. A job that
-may start counts as running for the jobs behind it, so jobs that fit together
-start in the same round of polls; one that fits only once a job ahead of it
-has started (as once a job that adapts to CPU outside the queue has fixed its
-cores) waits for that job's next poll. That is negligible for tasks that run
-for seconds or minutes, but visible with tiny ones: 200 simultaneous one-core
-50 ms jobs took 2.8 s at capacity 8, where starting each the moment cores were
-free would take 1.25 s (under 0.11's rule, 16 s on a 14-core Mac; zero
-capacity violations). Admitting every job that may start in one transaction
-would remove the waits for a job ahead to start; it is left out until it
-matters.
+Since 0.15 the loadmaster that takes the write lock to start its own job
+starts every waiting job that may, in line order, each with its cores and
+counting as running for the jobs behind it, in one transaction. A job may
+start with fewer cores than its weight, so what it gets must not depend on
+whether a job ahead of it, which may also start, polled first; and before,
+such a job ahead stayed a start in condition 2, with its whole range, since it
+might start later with more, while once started it is a fixed grant. A job
+another loadmaster started is running from then on, holding its slot as one
+whose task runs, and its own loadmaster finds it so on its next poll, reads
+the cores it got and starts its task. Measure-only jobs start by themselves,
+and parked ones when resumed. A job that is started meanwhile as its
+`--max-wait` runs out runs instead of parking: parking and that check are one
+transaction, and the run writes its `gave_up` line only once it has parked, so
+a run that went on to start never says it gave up (killed between the two, the
+run leaves no line; killed before parking, it is reaped and logged as lost).
+
+Each waiting job's loadmaster notices on its next poll that it may start, or
+that it was started. That is negligible for tasks that run for seconds or
+minutes, but visible with tiny ones: 200 simultaneous one-core 50 ms jobs took
+2.8 s at capacity 8 under 0.14, where starting each the moment cores were free
+would take 1.25 s (under 0.11's rule, 16 s on a 14-core Mac; zero capacity
+violations).
 
 The rule depends on nothing but the jobs and the CPU outside the queue, so a
 poll that finds the database as the last one left it (`PRAGMA data_version`
@@ -920,13 +985,15 @@ job.
   the shared config unusable there. A note on stderr still points out a typo
   such as `weight = 80`. The capped weight is what the job records and what
   the history log shows as its weight; `LOADMASTER_WEIGHT` says the cores it
-  started with, which are fewer while CPU is busy outside the queue (the log
-  then has them as `granted`).
+  started with, which are fewer for a task with `min_weight` when that is
+  what fits (the log then has them as `granted`). A `min_weight` above the
+  capacity is an error, not capped: such a task would never start.
 
 ## History log
 
 `history.jsonl` in the state directory gets one JSON object per queued run:
-job ID, task, weight, resources used, capacity, whether the machine was in
+job ID, task, weight (and `min_weight` if it is less), resources used,
+capacity, whether the machine was in
 measure-only mode,
 caller directory, arguments, outcome (`exited`, `gave_up`, `interrupted`,
 `spawn_failed`, `error`, `lost`, or `canceled` for the extra record
