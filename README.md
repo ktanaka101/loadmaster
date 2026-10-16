@@ -39,7 +39,7 @@ port a checkout has.
 | Measuring | `loadmaster report` shows failures, timeouts, run and wait times and the cores each task really used; a measure-only mode records a baseline to compare with. See [Checking that it helps](#checking-that-it-helps). |
 | Platforms | macOS and Linux. On Windows, WSL2 should work (it runs the Linux binary) but is not tested yet; native Windows is not supported. |
 | Integration cost | One binary, one `.loadmaster.toml` per repository, a few lines of agent instructions. Removing it means deleting those, `~/.local/state/loadmaster` and `~/.config/loadmaster`. |
-| Status | 0.14, new. Verified with tests, soak tests, and real Claude Code and Codex sessions; see [Status](#status). |
+| Status | 0.15, new. Verified with tests, soak tests, and real Claude Code and Codex sessions; see [Status](#status). |
 | License | MIT or Apache-2.0 |
 
 ## Is it for you?
@@ -78,7 +78,7 @@ Not sure? Record a baseline first and compare; see
 
 ## Status
 
-loadmaster is new (0.14). What has been verified:
+loadmaster is new (0.15). What has been verified:
 
 - Integration tests that start real `loadmaster` processes check that the
   capacity is never exceeded (from the tasks' own records), that no job is
@@ -166,7 +166,7 @@ arm64, statically linked) are on the
 mise use -g github:ktanaka101/loadmaster
 ```
 
-Append `@0.14.0` to pin a version. Without mise, download the archive for your
+Append `@0.15.0` to pin a version. Without mise, download the archive for your
 platform, such as `loadmaster-aarch64-apple-darwin.tar.gz`, and put the
 `loadmaster` binary it contains on your `PATH`.
 
@@ -178,7 +178,7 @@ another distribution, are not seen. This has not been tested yet.
 To build from source instead (Rust 1.88 or later):
 
 ```bash
-cargo install --locked --git https://github.com/ktanaka101/loadmaster --tag v0.14.0
+cargo install --locked --git https://github.com/ktanaka101/loadmaster --tag v0.15.0
 ```
 
 ## Quick start
