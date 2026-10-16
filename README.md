@@ -570,9 +570,12 @@ line, the process that later reclaims the job writes one with outcome `lost`.
   not: the second signal ends the process).
 - **Unknown tasks and broken config files** fail immediately instead of
   waiting.
-- **A weight above the capacity** counts as the whole capacity: the task runs
-  alone, with a note on stderr. Weights are committed with the repository, so
-  this keeps them usable on a smaller machine, such as a CI runner.
+- **A weight above the capacity** counts as the whole capacity, and so does a
+  `min_weight`, with a note on stderr: the jobs that got in line after the
+  task wait until it has started, and it runs alone unless its `min_weight`
+  lets it start with fewer cores beside other jobs. Weights are committed
+  with the repository, so this keeps them usable on a smaller machine, such
+  as a CI runner.
 - **CPU busy outside the queue**, such as a game, takes cores from the jobs
   that start. loadmaster measures how busy the machine's CPUs are, over a
   quarter of a second at most every 3 seconds, averaged with the measurement
@@ -582,10 +585,10 @@ line, the process that later reclaims the job writes one with outcome `lost`.
   tell from load outside the queue: `loadmaster status` shows the CPU busy
   beyond what running jobs got, and the CORES column of `loadmaster report`
   shows which tasks use more than their weight. When the rest
-  is more than the cores the capacity leaves free, a job starts with that many
-  fewer cores, but at least one: a weight above that counts as all of it, so
-  the first job in line still starts once the jobs ahead of it are done. The
-  task learns the cores it got from `LOADMASTER_WEIGHT`, and `loadmaster run`
+  is more than the cores the capacity leaves free, a job with `min_weight`
+  starts with that many fewer cores, but never fewer than its `min_weight`; a
+  job without one starts with its weight. So the first job in line still
+  starts once the jobs ahead of it are done. The task learns the cores it got from `LOADMASTER_WEIGHT`, and `loadmaster run`
   says so on stderr; a task that sizes its workers by it
   (`--maxWorkers=$LOADMASTER_WEIGHT`) runs fewer of them rather than crowding
   a busy machine into timeouts. A task that runs keeps what it started with.
@@ -865,9 +868,9 @@ Scripts that go through loadmaster need it wherever they run: on every
 developer's machine, in CI, in containers and in agent sandboxes. Either route
 only the scripts that agents use and let CI call the tools directly, or install
 loadmaster in CI too (a prebuilt binary or mise). On a small CI runner, a
-weight above the capacity simply runs alone. An agent that sandboxes its
-commands must also be allowed to write to the state directory, or loadmaster
-fails with exit code 125 (see [the sandbox settings](#2-let-it-write-the-state-directory)).
+weight or `min_weight` above the capacity simply counts as all of it. An
+agent that sandboxes its commands must also be allowed to write to the state
+directory, or loadmaster fails with exit code 125 (see [the sandbox settings](#2-let-it-write-the-state-directory)).
 
 ### Switching over with existing worktrees
 

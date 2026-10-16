@@ -188,19 +188,14 @@ fn scenario_job(value: &Value) -> Result<Job, String> {
             v => Some(number(v).ok_or_else(|| missing("min_weight"))?),
         },
     })
-    .and_then(|job| {
-        // Its least must be one it could start with, as for a run.
-        let fits = |least: u32| {
-            (1..=job.weight).contains(&least) && (job.measure_only || least <= job.capacity)
-        };
-        match job.min_weight {
-            Some(least) if !fits(least) => Err(format!(
-                "job #{id} has min_weight {least}, which a job of weight {} and capacity {} \
-                 cannot start with",
-                job.weight, job.capacity
-            )),
-            _ => Ok(job),
-        }
+    .and_then(|job| match job.min_weight {
+        // As in a config; above the capacity, like a weight, it counts as
+        // all of it.
+        Some(least) if !(1..=job.weight).contains(&least) => Err(format!(
+            "job #{id} has min_weight {least}, which is not from 1 to its weight {}",
+            job.weight
+        )),
+        _ => Ok(job),
     })
 }
 

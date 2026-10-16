@@ -88,21 +88,20 @@ fn a_nested_run_fits_in_what_its_holder_got() {
 
     sandbox.release("hold");
     assert!(wait(&mut holder).success());
-    // Its least is never lowered to fit: `wide` may not start with 4.
-    let output = sandbox.run(&["run", "outer3"]);
-    assert_ne!(output.status.code(), Some(0));
+    // Like its weight, a least above the capacity counts as all of it: on
+    // its own and nested, `wide` runs with the whole machine.
+    let output = sandbox.run(&["run", "wide"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "4");
     assert!(
         stderr(&output).contains(
-            "`wide` has min_weight 6, above the capacity of 4 that job #4 (`outer3`) got in line \
-             with"
+            "`wide` has weight 8 and min_weight 6, above this machine's capacity of 4, so both \
+             count as 4"
         ),
         "{}",
         stderr(&output)
     );
-    let output = sandbox.run(&["run", "wide"]);
-    assert!(
-        stderr(&output).contains("`wide` has min_weight 6, above this machine's capacity of 4"),
-        "{}",
-        stderr(&output)
-    );
+    let output = sandbox.run(&["run", "outer3"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "4");
 }

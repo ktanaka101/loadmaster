@@ -202,25 +202,13 @@ fn run(args: RunArgs) -> Result<i32> {
 
     let machine = MachineConfig::load()?;
     // Weights belong to the repository and the capacity to the machine, so a
-    // weight can exceed a small machine's capacity: the task then takes all
-    // of it.
+    // weight, or a min_weight, can exceed a small machine's capacity: each
+    // then counts as all of it.
     if task.weight > machine.capacity
         && !machine.measure_only
         && let Some(note) = check::whole_machine(task, machine.capacity)
     {
         say!("loadmaster: {note} (capacity {})", machine.capacity_source);
-    }
-    // Its least is its own to say: one the machine does not have would
-    // never start.
-    if let Some(min) = task.min_weight
-        && min > machine.capacity
-        && !machine.measure_only
-    {
-        return Err(Error::Usage(format!(
-            "`{}` has min_weight {min}, above this machine's capacity of {} ({}): it would \
-             never start",
-            task.name, machine.capacity, machine.capacity_source
-        )));
     }
     let task = &Task {
         weight: task.weight.min(machine.capacity),
@@ -764,20 +752,12 @@ fn run_nested(value: &str, repo: &RepoConfig, task: &Task, mut command: Command)
             ),
         })
     };
-    // Capped at the capacity the holder's slot was granted under, and
-    // against what the holder got: it may have started with fewer cores than
-    // its weight. A task that may start with fewer gets the holder's.
+    // Capped at the capacity the holder's slot was granted under, as on its
+    // own, and against what the holder got: it may have started with fewer
+    // cores than its weight. A task that may start with fewer gets the
+    // holder's.
     let weight = task.weight.min(holder.capacity);
-    // Its least is its own to say, as on its own: one above the capacity the
-    // holder got in line with would never start.
-    if let Some(min) = task.min_weight.filter(|&min| min > holder.capacity) {
-        return Err(Error::Usage(format!(
-            "`{}` has min_weight {min}, above the capacity of {} that job #{} (`{}`) got in \
-             line with: it would never start",
-            task.name, holder.capacity, holder.id, holder.task
-        )));
-    }
-    let least = task.min_weight.unwrap_or(weight);
+    let least = task.min_weight.unwrap_or(weight).min(weight);
     let granted = holder.granted.unwrap_or(holder.weight);
     if least > granted {
         let (what, fix) = if granted < holder.weight {
@@ -986,7 +966,9 @@ fn status(args: StatusArgs) -> Result<i32> {
             outside.busy, outside.cores
         );
         let limit = outside.cpu_limit(machine.capacity);
-        if limit < machine.capacity {
+        // While the queue moves, its jobs start by their own loadmaster's
+        // rule, not this one.
+        if limit < machine.capacity && moving.is_none() {
             out += &format!(
                 ", so jobs start with at most {limit} cores, or the least they may start with \
                  if that is more (their min_weight, else their weight)"

@@ -979,7 +979,7 @@ job.
   where nothing waits, there are none, and a capacity of 1 (a small CI
   runner) does not get one per task.
 - A weight above the capacity counts as the whole capacity, and the task runs
-  alone. Weights are committed with the repository while the capacity belongs
+  alone unless its `min_weight` lets it start with fewer. Weights are committed with the repository while the capacity belongs
   to each machine, so a repository's weights have to work on smaller machines
   too (a CI runner, a laptop); rejecting them, as the first version did, made
   the shared config unusable there. A note on stderr still points out a typo
@@ -987,7 +987,12 @@ job.
   the history log shows as its weight; `LOADMASTER_WEIGHT` says the cores it
   started with, which are fewer for a task with `min_weight` when that is
   what fits (the log then has them as `granted`). A `min_weight` above the
-  capacity is an error, not capped: such a task would never start.
+  capacity counts as all of it too, wherever it is read (a run, a nested
+  run, `check`, a scenario): a task that consents to start with fewer cores
+  must never ask for more than one that does not, which starts with the
+  whole machine here. Rejecting it, as a first draft of 0.15 did, made a
+  repository's `min_weight` of 4 fail on a 2-core CI runner where the same
+  task without it ran (found in review).
 
 ## History log
 

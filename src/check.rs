@@ -119,14 +119,6 @@ pub fn warnings(repo: &RepoConfig, machine: &MachineConfig) -> Vec<String> {
         .filter(|_| machine.capacity > 1)
         .filter_map(|task| whole_machine(task, machine.capacity))
         .collect();
-    warnings.extend(repo.tasks().filter_map(|task| {
-        let least = task.min_weight.filter(|&least| least > machine.capacity)?;
-        Some(format!(
-            "`{}` has min_weight {least}, above this machine's capacity of {}: it never \
-             starts here",
-            task.name, machine.capacity
-        ))
-    }));
     warnings.extend(unlimited_resources(repo, machine));
     warnings.extend(kept_out_while_waiting(repo, machine));
     warnings
@@ -140,11 +132,18 @@ pub fn whole_machine(task: &Task, capacity: u32) -> Option<String> {
             "`{}` has weight {}, this machine's whole capacity",
             task.name, task.weight
         ),
-        Ordering::Greater => format!(
-            "`{}` has weight {}, above this machine's capacity of {capacity}, so it counts \
-             as {capacity}",
-            task.name, task.weight
-        ),
+        Ordering::Greater => match task.min_weight.filter(|&least| least > capacity) {
+            None => format!(
+                "`{}` has weight {}, above this machine's capacity of {capacity}, so it counts \
+                 as {capacity}",
+                task.name, task.weight
+            ),
+            Some(least) => format!(
+                "`{}` has weight {} and min_weight {least}, above this machine's capacity of \
+                 {capacity}, so both count as {capacity}",
+                task.name, task.weight
+            ),
+        },
     };
     // Jobs behind count it at its weight while it waits, and at what it
     // started with once it runs.

@@ -201,7 +201,7 @@ fn a_scenario_starts_measure_only_jobs_at_once_and_refuses_duplicate_ids() {
 }
 
 #[test]
-fn a_scenario_refuses_a_min_weight_its_job_could_not_start_with() {
+fn a_scenario_refuses_a_min_weight_not_from_1_to_its_weight() {
     let sandbox = Sandbox::new(4, "");
     let file = sandbox.path("scenario.json");
     let judge = |min_weight: &str| {
@@ -217,8 +217,9 @@ fn a_scenario_refuses_a_min_weight_its_job_could_not_start_with() {
         .unwrap();
         sandbox.run(&["check", "--scenario", file.to_str().unwrap()])
     };
-    // Without one, as 0.14 wrote it, and with one it may start with.
-    for min_weight in ["", r#", "min_weight": 2"#] {
+    // Without one, as 0.14 wrote it, and with one; above the capacity, like
+    // the weight, it counts as all of it.
+    for min_weight in ["", r#", "min_weight": 2"#, r#", "min_weight": 6"#] {
         let output = judge(min_weight);
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
         assert!(
@@ -227,13 +228,12 @@ fn a_scenario_refuses_a_min_weight_its_job_could_not_start_with() {
             stdout(&output)
         );
     }
-    for least in [0, 6, 9] {
+    for least in [0, 9] {
         let output = judge(&format!(r#", "min_weight": {least}"#));
         assert_ne!(output.status.code(), Some(0));
         assert!(
             stderr(&output).contains(&format!(
-                "job #7 has min_weight {least}, which a job of weight 8 and capacity 4 cannot \
-                 start with"
+                "job #7 has min_weight {least}, which is not from 1 to its weight 8"
             )),
             "{}",
             stderr(&output)
