@@ -96,8 +96,11 @@ fn jobs_start_with_fewer_cores_while_cpu_is_busy_outside_the_queue() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(records[0]["granted"], granted);
+    let of = |task: &str| records.iter().find(|r| r["task"] == task).unwrap();
+    assert_eq!(of("show")["granted"], granted);
+    assert_eq!(of("show")["min_weight"], 1);
+    assert_eq!(of("fixed")["granted"], serde_json::Value::Null);
     // `show` may end before a clock tick: `fail` runs long enough.
-    let busy = records[1]["machine_busy"].as_f64().unwrap();
-    assert!(busy >= 0.95 * f64::from(cores), "{}", records[1]);
+    let busy = of("fail")["machine_busy"].as_f64().unwrap();
+    assert!(busy >= 0.95 * f64::from(cores), "{}", of("fail"));
 }

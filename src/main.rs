@@ -193,7 +193,8 @@ fn run(args: RunArgs) -> Result<i32> {
     let max_wait = match args.max_wait {
         Some(secs) => Some(secs),
         None => max_wait_from_env()?,
-    };
+    }
+    .map(Duration::from_secs);
 
     if let Some(held) = env::var_os(HELD_ENV).filter(|v| !v.is_empty()) {
         return run_nested(&held.to_string_lossy(), &repo, task, command);
@@ -239,6 +240,9 @@ fn run(args: RunArgs) -> Result<i32> {
     }
     let owner = ProcessId::current().map_err(|e| Error::io("cannot identify this process", e))?;
     let display = display_command(&task.cmd, &args.args);
+    // Both clocks start here, so wait times include getting in line, and
+    // `--max-wait` is one budget for both.
+    let (queued_at, wait_started) = (SystemTime::now(), Instant::now());
     let request = JobRequest {
         task: &task.name,
         weight: task.weight,
@@ -252,10 +256,16 @@ fn run(args: RunArgs) -> Result<i32> {
         checkout: &checkout,
         adapt_cpu: machine.adapt_to_outside_cpu,
         stop_signal: task.stop_signal,
+        asked_at: queued_at,
     };
-    // Both clocks start here, so wait times include getting in line.
-    let (queued_at, wait_started) = (SystemTime::now(), Instant::now());
-    let mut ticket = match enqueue_once_moved(&queue, &request, owner, task, max_wait, &signals)? {
+    let mut ticket = match enqueue_once_moved(
+        &queue,
+        &request,
+        owner,
+        task,
+        (wait_started, max_wait),
+        &signals,
+    )? {
         Ok(ticket) => ticket,
         Err(code) => return Ok(code),
     };
@@ -287,8 +297,7 @@ fn run(args: RunArgs) -> Result<i32> {
         min_weight: (min_weight < task.weight).then_some(min_weight),
         uses: task.uses.clone(),
     };
-    // Set once this run's line is written: a place that gave up logs before
-    // it is parked, since a parked job has no owner whose loss would be.
+    // Set once this run's line is written.
     let mut logged = false;
     let log = |record: &Record| {
         if let Err(e) = history::append(&state_dir, record) {
@@ -296,13 +305,12 @@ fn run(args: RunArgs) -> Result<i32> {
         }
     };
     let result = (|| {
-        let max_wait = max_wait.map(Duration::from_secs);
         let turn = if machine.measure_only {
             // Admitted whatever the capacity and place in line: the run
             // behaves as without loadmaster, and is only recorded.
             ticket.admit_now().map(|()| Turn::Admitted)
         } else {
-            wait_turn(&ticket, task, max_wait, &signals)
+            wait_turn(&ticket, task, (wait_started, max_wait), &signals)
         };
         record.wait_ms = millis(wait_started.elapsed());
         match turn? {
@@ -419,17 +427,17 @@ enum Turn {
 
 /// Gets in line, once the queue has moved to this version's admission
 /// protocol: while jobs of 0.12 to 0.14 finish in it, nothing gets in (see
-/// [`Error::QueueMoving`]). Gives up as `--max-wait` says, or on a signal,
-/// with the exit code to end with: no place was kept.
+/// [`Error::QueueMoving`]). Gives up as `--max-wait` says, counted from
+/// `started`, or on a signal, with the exit code to end with: no place was
+/// kept.
 fn enqueue_once_moved<'q>(
     queue: &'q Queue,
     request: &JobRequest,
     owner: ProcessId,
     task: &Task,
-    max_wait: Option<u64>,
+    (started, max_wait): (Instant, Option<Duration>),
     signals: &Signals,
 ) -> Result<std::result::Result<Ticket<'q>, i32>> {
-    let started = Instant::now();
     let mut last_report: Option<Instant> = None;
     loop {
         match queue.enqueue(request, owner) {
@@ -437,7 +445,7 @@ fn enqueue_once_moved<'q>(
                 if let Some(&signal) = signals.take().first() {
                     return Ok(Err(128 + signal));
                 }
-                if max_wait.is_some_and(|max| started.elapsed() >= Duration::from_secs(max)) {
+                if max_wait.is_some_and(|max| started.elapsed() >= max) {
                     say!(
                         "loadmaster: gave up waiting to run `{}` after {}: the queue is still \
                          moving to the admission protocol of 0.15 ({left} job(s) of loadmaster \
@@ -464,13 +472,13 @@ fn enqueue_once_moved<'q>(
     }
 }
 
+/// Waits for `ticket`'s turn, until `--max-wait` has passed since `started`.
 fn wait_turn(
     ticket: &Ticket,
     task: &Task,
-    max_wait: Option<Duration>,
+    (started, max_wait): (Instant, Option<Duration>),
     signals: &Signals,
 ) -> Result<Turn> {
-    let started = Instant::now();
     let mut last_report: Option<Instant> = None;
     loop {
         if let Some(&signal) = signals.take().first() {
@@ -760,7 +768,16 @@ fn run_nested(value: &str, repo: &RepoConfig, task: &Task, mut command: Command)
     // against what the holder got: it may have started with fewer cores than
     // its weight. A task that may start with fewer gets the holder's.
     let weight = task.weight.min(holder.capacity);
-    let least = task.min_weight.unwrap_or(weight).min(weight);
+    // Its least is its own to say, as on its own: one above the capacity the
+    // holder got in line with would never start.
+    if let Some(min) = task.min_weight.filter(|&min| min > holder.capacity) {
+        return Err(Error::Usage(format!(
+            "`{}` has min_weight {min}, above the capacity of {} that job #{} (`{}`) got in \
+             line with: it would never start",
+            task.name, holder.capacity, holder.id, holder.task
+        )));
+    }
+    let least = task.min_weight.unwrap_or(weight);
     let granted = holder.granted.unwrap_or(holder.weight);
     if least > granted {
         let (what, fix) = if granted < holder.weight {
@@ -931,7 +948,7 @@ fn status(args: StatusArgs) -> Result<i32> {
     };
     // While the queue moves to this version's protocol, the jobs in it are
     // those of 0.12 to 0.14, which their own loadmaster admits by its rule.
-    let moving = queue.moving()?;
+    let moving = snapshot.moving;
     let explained = match moving {
         Some(_) => Vec::new(),
         None => queue::explain_with_cores(&snapshot.jobs, outside),
@@ -970,7 +987,10 @@ fn status(args: StatusArgs) -> Result<i32> {
         );
         let limit = outside.cpu_limit(machine.capacity);
         if limit < machine.capacity {
-            out += &format!(", so jobs start with at most {limit} cores");
+            out += &format!(
+                ", so jobs start with at most {limit} cores, or the least they may start with \
+                 if that is more (their min_weight, else their weight)"
+            );
         }
         // The measurement cannot tell a job that uses more than it got from
         // load outside the queue; the history can, per task.

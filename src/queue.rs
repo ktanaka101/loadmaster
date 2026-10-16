@@ -243,6 +243,7 @@ pub struct Job {
     pub owner: Option<ProcessId>,
     /// The task's process group, once started.
     pub child: Option<ProcessGroup>,
+    /// When its run asked for a place (see [`JobRequest::asked_at`]).
     pub enqueued_at: SystemTime,
     pub parked_at: Option<SystemTime>,
     pub started_at: Option<SystemTime>,
@@ -390,6 +391,9 @@ pub struct JobRequest<'a> {
     pub adapt_cpu: bool,
     /// The task's stop signal.
     pub stop_signal: i32,
+    /// When its run asked for a place. Waiting to get one, for the lock or
+    /// while the queue moves, is part of its wait in every record of it.
+    pub asked_at: SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,6 +584,10 @@ pub struct Snapshot {
     pub jobs: Vec<Job>,
     /// Jobs reaped while taking this snapshot.
     pub reaped: Vec<Job>,
+    /// How many jobs of 0.12 to 0.14 were left, if the queue was moving to
+    /// this version's protocol (see [`CLOSE_FOR_PROTOCOL_2`]): then `jobs`
+    /// are theirs, which their own loadmaster admits by its rule.
+    pub moving: Option<usize>,
 }
 
 impl Snapshot {
@@ -614,12 +622,6 @@ impl Queue {
         };
         queue.create_schema()?;
         Ok(queue)
-    }
-
-    /// How many jobs of 0.12 to 0.14 are left in a queue that is moving to
-    /// this version's protocol, if it is (see [`CLOSE_FOR_PROTOCOL_2`]).
-    pub fn moving(&self) -> Result<Option<usize>> {
-        Ok(moving(&self.conn)?)
     }
 
     /// Whether SQLite could only open the database for reading, as it does
@@ -792,10 +794,11 @@ impl Queue {
         let checkout = request.checkout.as_os_str().as_bytes();
         let args = serde_json::to_string(request.args).expect("strings always serialize");
         let uses = serde_json::to_string(request.uses).expect("uses always serialize");
-        let ((id, resumed), _) = self.write(|tx| {
-            // A queue moving to protocol 2 takes no jobs until it has.
+        let (got, _) = self.write(|tx| {
+            // A queue moving to protocol 2 takes no jobs until it has. An
+            // answer, not a failure: what the write reaped stays reaped.
             if let Some(left) = moving(tx)? {
-                return Err(Error::QueueMoving { left });
+                return Ok(Err(left));
             }
             let parked: Option<JobId> = tx
                 .query_row(
@@ -821,7 +824,7 @@ impl Queue {
                     |r| r.get(0),
                 )
                 .optional()?;
-            Ok(match parked {
+            Ok(Ok(match parked {
                 Some(id) => {
                     tx.execute(
                         "UPDATE jobs SET state = 'waiting', weight = ?2, command = ?3,
@@ -860,7 +863,7 @@ impl Queue {
                             request.command,
                             owner.pid,
                             owner.start_time as i64,
-                            unix_ms(SystemTime::now()),
+                            unix_ms(request.asked_at),
                             request.capacity,
                             request.measure_only,
                             checkout,
@@ -872,8 +875,9 @@ impl Queue {
                     )?;
                     (tx.last_insert_rowid(), false)
                 }
-            })
+            }))
         })?;
+        let (id, resumed) = got.map_err(|left| Error::QueueMoving { left })?;
         Ok(Ticket {
             queue: self,
             id,
@@ -944,8 +948,12 @@ impl Queue {
 
     /// Reaps dead jobs and returns everything left.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let (jobs, reaped) = self.write(|tx| load_jobs(tx))?;
-        Ok(Snapshot { jobs, reaped })
+        let ((jobs, left), reaped) = self.write(|tx| Ok((load_jobs(tx)?, moving(tx)?)))?;
+        Ok(Snapshot {
+            jobs,
+            reaped,
+            moving: left,
+        })
     }
 
     /// Removes jobs nobody holds any more and returns them.

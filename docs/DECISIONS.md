@@ -1008,12 +1008,11 @@ got in line writes exactly one line, whatever happened afterwards: a
 `loadmaster` killed with SIGKILL cannot write its own, so the process that
 reaps its job writes a `lost` line for it, after the reaping is committed.
 That needs the capacity and mode of the job, which are therefore kept in the
-queue database. A run that gives up writes its line before it parks its
-job: a parked job has no owner whose loss could be logged, so a `loadmaster`
-killed after parking (while its message to a full stderr blocks, say) would
-otherwise leave no line. Killed before parking, its job is reaped and logged
-as `lost`, and the report joins that line to the `gave_up` one as a single
-check. JSON Lines is easy to analyze with `jq`. It is not rotated.
+queue database. A run that gives up parks its job first and then writes
+its line: the process admitting jobs may have started it meanwhile (see
+"Admission"), and then it runs, so a line written first could say it gave up
+while it went on to run. Killed before parking, its job is reaped and logged
+as `lost`. JSON Lines is easy to analyze with `jq`. It is not rotated.
 `loadmaster report` reads only records of the format this version writes, and
 says how many lines it skipped: a record of an older format may lack what the
 report judges by (whether a task passed, or had started), and guessing would
@@ -1023,12 +1022,13 @@ Known gaps, each needing an unusual combination of events, accepted rather
 than paid for with per-attempt IDs and logging inside the queue's
 transactions:
 
-- A `loadmaster` killed right after removing or handing over its job but
-  before writing its line leaves no line.
+- A `loadmaster` killed right after removing, handing over or parking its
+  job but before writing its line leaves no line: a parked job has no owner
+  whose loss could be logged.
 - If parking a job that gave up fails (the database stayed locked for the
-  whole 60-second busy timeout), its `gave_up` line is already written and
-  its job is later logged as `lost` before it started: `report` counts a
-  check that left the line, though `loadmaster` exited with 125.
+  whole 60-second busy timeout), `loadmaster` exits with an error and logs
+  an `error` line; if releasing the job fails too, it is later also logged
+  as `lost`.
 - If releasing or handing over a finished job fails (the database stayed
   locked for the whole 60-second busy timeout), `loadmaster` warns, exits with
   the task's code and logs its result, and the job is later also logged as

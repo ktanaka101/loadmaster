@@ -63,6 +63,8 @@ fn a_nested_run_fits_in_what_its_holder_got() {
     let tasks = sh_task("hold", 2, &probe.hold_script("hold"))
         + &with_least(sh_task("outer", 4, &nested("fixed")), 1)
         + &with_least(sh_task("outer2", 4, &nested("some")), 1)
+        + &sh_task("outer3", 4, &nested("wide"))
+        + &with_least(sh_task("wide", 8, "echo $LOADMASTER_WEIGHT"), 6)
         + &sh_task("fixed", 4, "echo $LOADMASTER_WEIGHT")
         + &with_least(sh_task("some", 4, "echo $LOADMASTER_WEIGHT"), 2);
     std::fs::write(probe.repo.join(".loadmaster.toml"), tasks).unwrap();
@@ -86,4 +88,21 @@ fn a_nested_run_fits_in_what_its_holder_got() {
 
     sandbox.release("hold");
     assert!(wait(&mut holder).success());
+    // Its least is never lowered to fit: `wide` may not start with 4.
+    let output = sandbox.run(&["run", "outer3"]);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(
+        stderr(&output).contains(
+            "`wide` has min_weight 6, above the capacity of 4 that job #4 (`outer3`) got in line \
+             with"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    let output = sandbox.run(&["run", "wide"]);
+    assert!(
+        stderr(&output).contains("`wide` has min_weight 6, above this machine's capacity of 4"),
+        "{}",
+        stderr(&output)
+    );
 }

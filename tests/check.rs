@@ -199,3 +199,44 @@ fn a_scenario_starts_measure_only_jobs_at_once_and_refuses_duplicate_ids() {
         stderr(&output)
     );
 }
+
+#[test]
+fn a_scenario_refuses_a_min_weight_its_job_could_not_start_with() {
+    let sandbox = Sandbox::new(4, "");
+    let file = sandbox.path("scenario.json");
+    let judge = |min_weight: &str| {
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"format": 2, "cpu": null, "jobs": [{{"id": 7, "state": "waiting",
+                    "task": "test", "weight": 8, "cores": null, "uses": {{}},
+                    "checkout": "/repo", "capacity": 4, "adapts_to_outside_cpu": true,
+                    "measure_only": false{min_weight}}}]}}"#
+            ),
+        )
+        .unwrap();
+        sandbox.run(&["check", "--scenario", file.to_str().unwrap()])
+    };
+    // Without one, as 0.14 wrote it, and with one it may start with.
+    for min_weight in ["", r#", "min_weight": 2"#] {
+        let output = judge(min_weight);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(
+            stdout(&output).contains("#7 `test` starts now with 4 cores\n"),
+            "{}",
+            stdout(&output)
+        );
+    }
+    for least in [0, 6, 9] {
+        let output = judge(&format!(r#", "min_weight": {least}"#));
+        assert_ne!(output.status.code(), Some(0));
+        assert!(
+            stderr(&output).contains(&format!(
+                "job #7 has min_weight {least}, which a job of weight 8 and capacity 4 cannot \
+                 start with"
+            )),
+            "{}",
+            stderr(&output)
+        );
+    }
+}

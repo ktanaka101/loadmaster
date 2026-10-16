@@ -31,6 +31,7 @@ fn request<'a>(task: &'a str, weight: u32, args: &'a [String]) -> JobRequest<'a>
         checkout: Path::new("/repo"),
         adapt_cpu: false,
         stop_signal: libc::SIGTERM,
+        asked_at: SystemTime::now(),
     }
 }
 
@@ -451,6 +452,19 @@ fn a_detached_job_is_not_logged_when_reaped() {
 }
 
 #[test]
+fn a_job_got_in_line_when_its_run_asked_for_a_place() {
+    // It may have waited for one, while the queue moved, say.
+    let f = fixture();
+    let asked_at = from_unix_ms(unix_ms(SystemTime::now() - Duration::from_secs(300)));
+    let request = JobRequest {
+        asked_at,
+        ..request("test", 4, &[])
+    };
+    let _ticket = f.queue.enqueue(&request, f.me).unwrap();
+    assert_eq!(f.queue.snapshot().unwrap().jobs[0].enqueued_at, asked_at);
+}
+
+#[test]
 fn admit_now_ignores_the_line_and_the_capacity() {
     let f = fixture();
     let big = f.queue.enqueue(&request("e2e", 8, &[]), f.me).unwrap();
@@ -542,6 +556,11 @@ fn a_queue_of_0_12_to_0_14_moves_to_protocol_2_once_their_jobs_are_done() {
         queue.enqueue(&request("new", 1, &[]), me),
         Err(Error::QueueMoving { left: 2 })
     ));
+    // Refused, but what it reaped stays reaped.
+    let rows: i64 = old
+        .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
     let refused = old
         .execute(
             "INSERT INTO jobs (task, weight, state, dir, args, command, enqueued_at, capacity,

@@ -146,10 +146,20 @@ pub fn whole_machine(task: &Task, capacity: u32) -> Option<String> {
             task.name, task.weight
         ),
     };
+    // Jobs behind count it at its weight while it waits, and at what it
+    // started with once it runs.
+    let alone = match task.min_weight.filter(|&least| least < capacity) {
+        None => "it runs alone, and every job that gets in line after it waits until it has \
+                 finished"
+            .to_owned(),
+        Some(least) => format!(
+            "every job that gets in line after it waits until it has started, though it may \
+             start beside other jobs with as few as {least} cores (min_weight)"
+        ),
+    };
     Some(format!(
-        "{what}: it runs alone, and every job that gets in line after it waits until it has \
-         finished. If the point is to keep its runs from overlapping, give it a resource with \
-         capacity 1 instead"
+        "{what}: {alone}. If the point is to keep its runs from overlapping, give it a \
+         resource with capacity 1 instead"
     ))
 }
 
