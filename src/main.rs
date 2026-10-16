@@ -926,12 +926,15 @@ fn status(args: StatusArgs) -> Result<i32> {
     } else {
         None
     };
-    // While the queue moves to this version's protocol, the jobs in it are
-    // those of 0.12 to 0.14, which their own loadmaster admits by its rule.
+    // Until the queue has moved to this version's protocol, the jobs in it
+    // are those of 0.12 to 0.14, which their own loadmaster admits by its
+    // rule.
     let moving = snapshot.moving;
-    let explained = match moving {
-        Some(_) => Vec::new(),
-        None => queue::explain_with_cores(&snapshot.jobs, outside),
+    let ours = snapshot.protocol == queue::PROTOCOL;
+    let explained = if ours {
+        queue::explain_with_cores(&snapshot.jobs, outside)
+    } else {
+        Vec::new()
     };
     if args.json {
         let others = queue::jobs_in_other_queues(&state_dir);
@@ -966,9 +969,9 @@ fn status(args: StatusArgs) -> Result<i32> {
             outside.busy, outside.cores
         );
         let limit = outside.cpu_limit(machine.capacity);
-        // While the queue moves, its jobs start by their own loadmaster's
-        // rule, not this one.
-        if limit < machine.capacity && moving.is_none() {
+        // Until the queue has moved, its jobs start by their own
+        // loadmaster's rule, not this one.
+        if limit < machine.capacity && ours {
             out += &format!(
                 ", so jobs start with at most {limit} cores, or the least they may start with \
                  if that is more (their min_weight, else their weight)"
@@ -989,12 +992,24 @@ fn status(args: StatusArgs) -> Result<i32> {
     if let Some(others) = other_queues(&state_dir) {
         out += &format!("{others}\n");
     }
-    if let Some(left) = moving {
-        out += &format!(
-            "the queue is moving to the admission protocol of loadmaster 0.15 and later: new \
-             runs wait until the {left} job(s) of loadmaster 0.12 to 0.14 in it are done, which \
-             their own loadmaster admits; give every agent 0.15 or later\n"
-        );
+    match moving {
+        Some(left) => {
+            out += &format!(
+                "the queue is moving to the admission protocol of loadmaster 0.15 and later: \
+                 new runs wait until the {left} job(s) of loadmaster 0.12 to 0.14 in it are \
+                 done, which their own loadmaster admits; give every agent 0.15 or later\n"
+            );
+        }
+        None if !ours => {
+            out += &format!(
+                "the queue keeps the admission protocol of loadmaster 0.12 to 0.14, which admits \
+                 the {} job(s) in it: the first `loadmaster run` of this version moves it to \
+                 that of 0.15 and later, once they are done, and from then on runs of 0.12 to \
+                 0.14 fail; give every agent 0.15 or later at once\n",
+                snapshot.jobs.len()
+            );
+        }
+        None => {}
     }
     if machine.measure_only {
         out += "measure-only: jobs start at once and are only recorded (see `loadmaster report`)\n";

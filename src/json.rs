@@ -53,7 +53,7 @@ pub fn status(status: &Status) -> Value {
         .collect();
     json!({
         "format": FORMAT,
-        "protocol": if status.moving.is_some() { 1 } else { 2 },
+        "protocol": status.snapshot.protocol,
         "moving": status.moving.map(|left| json!({ "left": left })),
         "capacity": machine.capacity,
         "capacity_source": machine.capacity_source.to_string(),

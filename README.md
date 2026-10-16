@@ -509,12 +509,15 @@ of one protocol count each other's jobs and may run side by side, and a
 version that does not know the protocol a later one moved the queue to stops
 with an error instead of starting work. 0.15 moved it from the protocol of
 0.12 to 0.14 to its own, which lets a job start with fewer cores than its
-weight: the first 0.15 to open the queue closes it to new jobs, so that runs
-of 0.12 to 0.14 fail and say why, and runs of 0.15 wait without a place in
-line; the jobs in it finish, their own loadmaster admitting them; then the
-first 0.15 that writes finds it empty and moves it, and the runs of 0.15 get
-in line. From then on 0.12 to 0.14 cannot use it. So upgrade every agent on a
-machine at once, when few checks run. Versions up to 0.11 kept separate files
+weight: the first `loadmaster run` of 0.15 to get in line closes the queue
+to new jobs, so that runs of 0.12 to 0.14 fail and say why, and runs of 0.15
+wait without a place in line; the jobs in it finish, their own loadmaster
+admitting them; then the first 0.15 that writes finds it empty and moves it,
+and the runs of 0.15 get in line (at once, if it was empty). From then on
+0.12 to 0.14 cannot use it. Other commands of 0.15 (`status`, `held`,
+`cancel`, `clean`) leave such a queue as it is, so trying 0.15 out with them
+stops nobody; `status` says what its first run would do. So upgrade every
+agent on a machine at once, when few checks run. Versions up to 0.11 kept separate files
 (`queue-v3.db` and before) and do not count the jobs of later ones, or the
 other way round: `loadmaster status` and `loadmaster run` say when such a
 file holds jobs.
@@ -735,10 +738,11 @@ type or unit changed, and a new value of `state`, `need` or `reason`. The
 table above, and every `text`, may change in any release.
 
 - `format`: 2.
-- `protocol`: the admission protocol of the queue (2 from 0.15 on), and
-  `moving`: while the queue moves to it from protocol 1, `{left}`, the jobs
-  of 0.12 to 0.14 still in it (whose waits are their own loadmaster's to
-  explain: `wait` is `null`), else `null`.
+- `protocol`: the admission protocol of the queue: 1 while it holds the
+  jobs of 0.12 to 0.14 (whose waits are their own loadmaster's to explain:
+  `wait` is `null`), 2 once a run of 0.15 or later has moved it; and
+  `moving`: once such a run has started the move, until it is done, `{left}`,
+  the jobs of 0.12 to 0.14 still in it, else `null`.
 - `capacity`, `capacity_source`, `measure_only`, and `cores_in_use` by
   running jobs.
 - `cpu`: if the CPU busy outside the queue was measured (jobs adapt to it),

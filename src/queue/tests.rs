@@ -516,6 +516,42 @@ fn insert_as_0_13(conn: &Connection, state: &str, owner: Option<ProcessId>, at: 
 }
 
 #[test]
+fn looking_at_a_queue_of_0_12_to_0_14_leaves_it_to_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(QUEUE_DB_FILE);
+    let me = ProcessId::current().unwrap();
+    let old = Connection::open(&path).unwrap();
+    old.execute_batch(SCHEMA).unwrap();
+    insert_as_0_13(&old, "running", Some(me), 1_000);
+    insert_as_0_13(&old, "running", None, 3_000);
+    insert_as_0_13(&old, "waiting", Some(me), 0);
+
+    // Shown, reaped and canceled as they are, by their own protocol.
+    let queue = Queue::open(&path).unwrap();
+    let snapshot = queue.snapshot().unwrap();
+    assert_eq!((snapshot.protocol, snapshot.moving), (1, None));
+    assert_eq!(snapshot.reaped.len(), 1);
+    assert!(matches!(queue.stop(3, false), Ok(Canceled::Requested(_))));
+    assert!(queue.holder(1).unwrap().is_some());
+    assert!(!closed(&queue.conn).unwrap());
+    // Opened again, now in 0.14's layout, it stays open too.
+    drop(Queue::open(&path).unwrap());
+    assert!(!closed(&queue.conn).unwrap());
+    // 0.12 to 0.14 go on getting in line.
+    insert_as_0_13(&old, "waiting", Some(me), 0);
+    assert_eq!(queue.snapshot().unwrap().jobs.len(), 3);
+
+    // Once empty it stays theirs, until a run of this version gets in line:
+    // then it moves at once.
+    old.execute("DELETE FROM jobs", []).unwrap();
+    queue.snapshot().unwrap();
+    assert_eq!(layout(&queue.conn).unwrap(), 2);
+    let ticket = queue.enqueue(&request("new", 1, &[]), me).unwrap();
+    assert_eq!(layout(&queue.conn).unwrap(), LAYOUT);
+    assert_eq!(ticket.id(), 5);
+}
+
+#[test]
 fn a_queue_of_0_12_to_0_14_moves_to_protocol_2_once_their_jobs_are_done() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(QUEUE_DB_FILE);
@@ -529,11 +565,11 @@ fn a_queue_of_0_12_to_0_14_moves_to_protocol_2_once_their_jobs_are_done() {
     insert_as_0_13(&old, "waiting", Some(me), 0);
     old.execute("DELETE FROM jobs WHERE id = 5", []).unwrap();
 
-    // Brought up to 0.14's layout, and closed to new jobs.
+    // Brought up to 0.14's layout, and left open to 0.12 to 0.14.
     let queue = Queue::open(&path).unwrap();
     assert_eq!(layout(&queue.conn).unwrap(), 2);
     assert_eq!(protocol(&queue.conn).unwrap(), Some(1));
-    assert!(closed(&queue.conn).unwrap());
+    assert!(!closed(&queue.conn).unwrap());
     let since: Vec<Option<SystemTime>> = load_jobs(&queue.conn)
         .unwrap()
         .iter()
@@ -550,12 +586,14 @@ fn a_queue_of_0_12_to_0_14_moves_to_protocol_2_once_their_jobs_are_done() {
             None
         ]
     );
-    // Nothing gets in meanwhile, whoever asks. Getting in line reaps first:
-    // the expired place and the job nobody holds are gone, two are left.
+    // Getting in line closes it, and nothing gets in meanwhile, whoever
+    // asks. It reaps first: the expired place and the job nobody holds are
+    // gone, two are left.
     assert!(matches!(
         queue.enqueue(&request("new", 1, &[]), me),
         Err(Error::QueueMoving { left: 2 })
     ));
+    assert!(closed(&queue.conn).unwrap());
     // Refused, but what it reaped stays reaped.
     let rows: i64 = old
         .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))

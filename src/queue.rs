@@ -163,7 +163,8 @@ INSERT INTO protocol (id, version) VALUES (1, 1);
 PRAGMA user_version = 2;
 ";
 
-/// Closes a queue of protocol 1 to new jobs, for its move to protocol 2: a
+/// Closes a queue of protocol 1 to new jobs, for its move to protocol 2, once
+/// a run of this version asks for a place in it (see [`Queue::enqueue`]): a
 /// trigger, which the writers of 0.12 to 0.14 obey too, though they do not
 /// read the protocol. They finish the jobs they hold; once none is left the
 /// queue moves (see [`LAYOUT_3`]).
@@ -202,7 +203,7 @@ const LAYOUT: i64 = 3;
 /// with fewer cores than its weight wherever that fits, which protocol 1
 /// does not protect. Every write transaction checks it first: a queue a later
 /// loadmaster moved to another protocol is an error, never another file.
-const PROTOCOL: i64 = 2;
+pub const PROTOCOL: i64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
@@ -590,9 +591,13 @@ pub struct Snapshot {
     pub jobs: Vec<Job>,
     /// Jobs reaped while taking this snapshot.
     pub reaped: Vec<Job>,
-    /// How many jobs of 0.12 to 0.14 were left, if the queue was moving to
-    /// this version's protocol (see [`CLOSE_FOR_PROTOCOL_2`]): then `jobs`
-    /// are theirs, which their own loadmaster admits by its rule.
+    /// The admission protocol of the queue: 1 while it holds the jobs of
+    /// 0.12 to 0.14, which their own loadmaster admits by its rule, else
+    /// [`PROTOCOL`].
+    pub protocol: i64,
+    /// How many jobs of 0.12 to 0.14 were left, if a run of this version had
+    /// started to move the queue to its protocol (see
+    /// [`CLOSE_FOR_PROTOCOL_2`]).
     pub moving: Option<usize>,
 }
 
@@ -637,25 +642,21 @@ impl Queue {
     }
 
     fn create_schema(&self) -> Result<()> {
-        // Usually it is there, or closed for the move already; don't take
-        // the write lock then. One this process may not write is for the
-        // caller to report.
-        if self.is_read_only() {
-            return Ok(());
-        }
-        if layout(&self.conn)? == LAYOUT || closed(&self.conn)? {
+        // Usually it is there; don't take the write lock then. One this
+        // process may not write is for the caller to report. A queue of
+        // protocol 1 is opened as it is: only getting in line moves it (see
+        // [`Queue::enqueue`]), so that looking at it with this version never
+        // stops 0.12 to 0.14.
+        if self.is_read_only() || matches!(layout(&self.conn)?, 2 | LAYOUT) {
             return Ok(());
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // Again under the lock: another process may have made it since.
         match layout(&tx)? {
             0 => tx.execute_batch(&format!("{SCHEMA}{LAYOUT_2}{LAYOUT_3}"))?,
-            1 => {
-                tx.execute_batch(LAYOUT_2)?;
-                move_or_close(&tx)?;
-            }
-            2 if protocol(&tx)? == Some(1) => move_or_close(&tx)?,
-            LAYOUT => {}
+            // Brought up to date in place, as 0.14 does; 0.12 and 0.13 go on.
+            1 => tx.execute_batch(LAYOUT_2)?,
+            2 | LAYOUT => {}
             _ => return Err(self.unknown_layout(&tx)),
         }
         tx.commit()?;
@@ -686,27 +687,27 @@ impl Queue {
     /// version's layout and protocol: before anything is reaped or changed,
     /// so that a process that opened it before a later loadmaster changed it
     /// writes nothing.
-    /// A queue of protocol 1 that this version closed for the move to
-    /// protocol 2 counts too: the writers of 0.12 to 0.14 finish their jobs in
-    /// it, and this version reaps them.
+    /// A queue of protocol 1 counts too: the writers of 0.12 to 0.14 admit
+    /// their jobs in it, and this version reaps, shows and cancels them, but
+    /// gets none of its own in line until it has moved it.
     fn begin(&self) -> Result<Transaction<'_>> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         match (layout(&tx)?, protocol(&tx)?) {
-            (LAYOUT, Some(PROTOCOL)) => {}
-            (2, Some(1)) if closed(&tx)? => {}
+            (LAYOUT, Some(PROTOCOL)) | (2, Some(1)) => {}
             _ => return Err(self.unknown_layout(&tx)),
         }
         Ok(tx)
     }
 
     /// Runs `f` in a write transaction, after reaping dead jobs, and once a
-    /// queue closed for the move to protocol 2 is empty, after moving it.
-    /// Once that is committed, logs the reaped jobs that were lost, and
-    /// returns them all.
+    /// queue closed for the move to protocol 2 is empty, after moving it:
+    /// whichever write finds it so ends a move that a run started. Once that
+    /// is committed, logs the reaped jobs that were lost, and returns them
+    /// all.
     fn write<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<(T, Vec<Job>)> {
         let tx = self.begin()?;
         let reaped = reap(&tx)?;
-        if layout(&tx)? != LAYOUT {
+        if layout(&tx)? != LAYOUT && closed(&tx)? {
             move_or_close(&tx)?;
         }
         let value = f(&tx)?;
@@ -801,8 +802,13 @@ impl Queue {
         let args = serde_json::to_string(request.args).expect("strings always serialize");
         let uses = serde_json::to_string(request.uses).expect("uses always serialize");
         let (got, _) = self.write(|tx| {
-            // A queue moving to protocol 2 takes no jobs until it has. An
-            // answer, not a failure: what the write reaped stays reaped.
+            // Getting in line is what moves a queue of protocol 1 to this
+            // version's: at once if it is empty, else it is closed to new
+            // jobs, and takes none until it has moved. An answer, not a
+            // failure: what the write reaped stays reaped.
+            if layout(tx)? != LAYOUT {
+                move_or_close(tx)?;
+            }
             if let Some(left) = moving(tx)? {
                 return Ok(Err(left));
             }
@@ -954,10 +960,17 @@ impl Queue {
 
     /// Reaps dead jobs and returns everything left.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let ((jobs, left), reaped) = self.write(|tx| Ok((load_jobs(tx)?, moving(tx)?)))?;
+        let ((jobs, protocol, left), reaped) = self.write(|tx| {
+            Ok((
+                load_jobs(tx)?,
+                protocol(tx)?.unwrap_or(PROTOCOL),
+                moving(tx)?,
+            ))
+        })?;
         Ok(Snapshot {
             jobs,
             reaped,
+            protocol,
             moving: left,
         })
     }
@@ -1538,11 +1551,12 @@ fn closed(conn: &Connection) -> rusqlite::Result<bool> {
     )
 }
 
-/// The jobs of a queue that is moving to protocol 2 and has not yet: all of
-/// 0.12 to 0.14, which hold their places by protocol 1. `None` if the queue
-/// has moved.
+/// The jobs of a queue that a run of this version started to move to
+/// protocol 2 and that has not moved yet: all of 0.12 to 0.14, which hold
+/// their places by protocol 1. `None` if the queue has moved, or no run has
+/// started to move it.
 pub fn moving(conn: &Connection) -> rusqlite::Result<Option<usize>> {
-    if layout(conn)? == LAYOUT {
+    if layout(conn)? == LAYOUT || !closed(conn)? {
         return Ok(None);
     }
     conn.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0))

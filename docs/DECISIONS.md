@@ -288,9 +288,9 @@ that 0.12 and 0.13 keep it too.
 0.15 moved the queue to protocol 2. A job behind one that may start with fewer
 cores protects that start beside sets that protocol 1 does not count, so the
 two cannot share the queue; two protocols must never hold allocations at once.
-The first 0.15 to open a queue of protocol 1 closes it to new jobs, by a
-trigger that refuses inserts, which binaries that never read the protocol obey
-too: runs of 0.12 to 0.14 fail and say to upgrade. The jobs in it finish,
+The first run of 0.15 to get in line in a queue of protocol 1 closes it to
+new jobs, by a trigger that refuses inserts, which binaries that never read
+the protocol obey too: runs of 0.12 to 0.14 fail and say to upgrade. The jobs in it finish,
 park, resume and expire as their own loadmaster has them; runs of 0.15 wait
 without a place in line (giving up as `--max-wait` says, saying that no place
 was kept), and reap. The first 0.15 write transaction that finds the queue
@@ -302,6 +302,17 @@ stops on its check of the protocol, with a message; 0.12 and 0.13 stop on the
 missing column, as soon as they run a statement (a connection opened before
 prepares it again then). Running jobs are never stopped: new runs pause until
 the jobs in the queue are done, once.
+
+Only getting in line starts the move: it is what needs the new protocol.
+Every other command of 0.15 (`status`, `held`, `cancel`, `clean`, a nested
+run) works with a queue of protocol 1 as it is: it reaps, shows and cancels
+the jobs of 0.12 to 0.14, which those admit by their rule, and `status` says
+what the first run of 0.15 would do. Nothing of 0.15 runs before the move, so
+waiting for a run to start it costs nothing; 0.15.0 closed the queue on
+opening it, so that looking at it with `mise exec ...@0.15.0 -- loadmaster
+status` before upgrading made every run of the older agents fail (found by
+clew). Making the move a command of its own was rejected: an upgrade that
+forgot it would leave the runs of 0.15 waiting for good.
 
 A move that never paused was rejected (Codex): 0.15 admitting its jobs by
 protocol 1 while those of 0.12 to 0.14 finished, and switching once none of
