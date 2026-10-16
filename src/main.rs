@@ -1331,6 +1331,11 @@ fn check_scenario(path: &Path) -> Result<i32> {
             .map(|(_, a)| a);
         out += &match (job.state, decision) {
             (JobState::Running, _) => format!("{who} holds {}\n", cores(start)),
+            // It starts at once, whatever the line and the capacity.
+            (JobState::Waiting, _) if job.measure_only => format!(
+                "{who} is measure-only: it starts at once with {}\n",
+                cores(job.weight)
+            ),
             (JobState::Parked, Some(Admission::Admitted)) => {
                 format!(
                     "{who} is parked; resumed now, it would start with {}\n",

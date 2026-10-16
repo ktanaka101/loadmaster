@@ -151,3 +151,42 @@ fn a_scenario_gives_the_cpu_busy_outside_the_queue() {
         stderr(&output)
     );
 }
+
+#[test]
+fn a_scenario_starts_measure_only_jobs_at_once_and_refuses_duplicate_ids() {
+    let sandbox = Sandbox::new(4, "");
+    let file = sandbox.path("scenario.json");
+    let job = |id: u32, weight: u32, measure_only: bool| {
+        format!(
+            r#"{{"id": {id}, "state": "waiting", "task": "t{id}", "weight": {weight},
+                "cores": null, "uses": {{}}, "checkout": "/repo", "capacity": 8,
+                "adapts_to_outside_cpu": true, "measure_only": {measure_only}}}"#
+        )
+    };
+    let judge = |jobs: &[String]| {
+        let cpu = r#"{"cores": 8, "busy_beyond_running_jobs": 6}"#;
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"format": 2, "cpu": {cpu}, "jobs": [{}]}}"#,
+                jobs.join(",")
+            ),
+        )
+        .unwrap();
+        sandbox.run(&["check", "--scenario", file.to_str().unwrap()])
+    };
+    // Whatever the CPU outside the queue and the jobs ahead.
+    let output = judge(&[job(1, 8, false), job(2, 4, true)]);
+    assert!(
+        stdout(&output).contains("#2 `t2` is measure-only: it starts at once with 4 cores\n"),
+        "{}",
+        stdout(&output)
+    );
+    let output = judge(&[job(1, 8, false), job(1, 1, false)]);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(
+        stderr(&output).contains("two jobs have the ID 1"),
+        "{}",
+        stderr(&output)
+    );
+}

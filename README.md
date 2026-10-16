@@ -505,8 +505,10 @@ The queue lives in `~/.local/state/loadmaster/queue-v4.db` (`$XDG_STATE_HOME`,
 `LOADMASTER_STATE_DIR`), and stays there: from 0.12 on every version shares
 it. The database records the admission protocol its writers keep; versions
 of one protocol (0.12 to 0.14 so far) count each other's jobs and may run
-side by side, and a version that does not know the protocol a later one
-moved the queue to stops with an error instead of starting work. Versions
+side by side, and from 0.14 on a version that does not know the protocol a
+later one moved the queue to stops with an error instead of starting work
+(0.12 and 0.13 do not read it: a later protocol will close the queue to new
+jobs before it changes, which stops them too). Versions
 up to 0.11 kept separate files (`queue-v3.db` and before) and do not count
 the jobs of 0.12 and later, or the other way round: `loadmaster status` and
 `loadmaster run` say when such a file holds jobs. Give every agent on a
@@ -669,6 +671,8 @@ loadmaster held [--uses RESOURCE]
   file gives: capture a real queue, change what you want to try (the CPU
   outside, a job's weight), and see what would start and why the rest wait.
   It reads no config and no queue; the jobs' states are taken as they are.
+  Paths are compared as `status --json` writes them, so two checkouts whose
+  paths differ only in bytes that are not UTF-8 count as one.
 - `clean`: reclaim places and slots whose processes are gone. Every update
   already does this, so you should rarely need it.
 - `report`: summarize the history log per task. `--since` and `--until`

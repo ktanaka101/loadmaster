@@ -106,6 +106,9 @@ pub fn scenario(value: &Value) -> Result<(Vec<Job>, Option<Outside>), String> {
         .map(scenario_job)
         .collect::<Result<Vec<Job>, String>>()?;
     jobs.sort_by_key(|job| job.id);
+    if let Some(pair) = jobs.windows(2).find(|pair| pair[0].id == pair[1].id) {
+        return Err(format!("two jobs have the ID {}", pair[0].id));
+    }
     Ok((jobs, outside))
 }
 

@@ -269,10 +269,12 @@ the smallest limit any of them records; and it fits beside every start ahead
 next to every set of the jobs ahead that fits within the limits its members
 record (see [Resources](#resources)). Rules that keep the same protocol may
 work it out differently and run side by side: 0.12, 0.13 and 0.14 do, since
-each fits every job beside every such set. Every write transaction checks the
-layout and the protocol first, before it reaps or changes anything, so a
-process that opened the queue before a later loadmaster moved it to another
-protocol writes nothing and stops with an error, never with a new file. A
+each fits every job beside every such set. From 0.14 on, every write
+transaction checks the layout and the protocol first, before it reaps or
+changes anything, so a process that opened the queue before a later
+loadmaster moved it to another protocol writes nothing and stops with an
+error, never with a new file. 0.12 and 0.13 do not read them; what stops
+those is the closing of the queue below. A
 layout extended compatibly is brought up to date in place by the first newer
 process to open it, while older writers go on: 0.14 added when each job
 entered its state (see [Status as JSON](#status-as-json)), kept by triggers so
