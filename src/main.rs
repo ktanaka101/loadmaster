@@ -1003,9 +1003,9 @@ fn status(args: StatusArgs) -> Result<i32> {
         None if !ours => {
             out += &format!(
                 "the queue keeps the admission protocol of loadmaster 0.12 to 0.14, which admits \
-                 the {} job(s) in it: the first `loadmaster run` of this version moves it to \
-                 that of 0.15 and later, once they are done, and from then on runs of 0.12 to \
-                 0.14 fail; give every agent 0.15 or later at once\n",
+                 the {} job(s) in it: the first `loadmaster run` of this version closes it to \
+                 new jobs, so runs of 0.12 to 0.14 fail from then on, and moves it to that of \
+                 0.15 and later once they are done; give every agent 0.15 or later at once\n",
                 snapshot.jobs.len()
             );
         }

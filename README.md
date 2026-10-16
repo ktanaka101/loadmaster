@@ -738,9 +738,10 @@ type or unit changed, and a new value of `state`, `need` or `reason`. The
 table above, and every `text`, may change in any release.
 
 - `format`: 2.
-- `protocol`: the admission protocol of the queue: 1 while it holds the
-  jobs of 0.12 to 0.14 (whose waits are their own loadmaster's to explain:
-  `wait` is `null`), 2 once a run of 0.15 or later has moved it; and
+- `protocol`: the admission protocol of the queue: 1 for one that 0.12 to
+  0.14 made, until a run of 0.15 or later has moved it, even while empty
+  (the waits of their jobs are their own loadmaster's to explain: `wait` is
+  `null`); 2 once moved, or for a queue made by 0.15 or later; and
   `moving`: once such a run has started the move, until it is done, `{left}`,
   the jobs of 0.12 to 0.14 still in it, else `null`.
 - `capacity`, `capacity_source`, `measure_only`, and `cores_in_use` by
