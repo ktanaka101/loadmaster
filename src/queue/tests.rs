@@ -475,12 +475,168 @@ fn processes_opening_a_new_database_at_once_make_its_schema_once() {
         }
     });
     let queue = Queue::open(&path).unwrap();
-    let version: i64 = queue
-        .conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(layout(&queue.conn).unwrap(), LAYOUT);
+    assert_eq!(protocol(&queue.conn).unwrap(), Some(PROTOCOL));
     assert!(queue.snapshot().unwrap().jobs.is_empty());
+}
+
+/// A job row as 0.12 and 0.13 write it, which know nothing of `state_since`.
+fn insert_as_0_13(conn: &Connection, state: &str, owner: Option<ProcessId>, at: i64) {
+    conn.execute(
+        "INSERT INTO jobs (task, weight, state, dir, args, command, owner_pid, owner_start,
+             enqueued_at, parked_at, started_at, capacity, measure_only, checkout, uses,
+             adapt_cpu, stop_signal, granted)
+         VALUES ('t', 1, ?1, x'2f72', '[]', 't', ?2, ?3, 1, ?4, ?5, 8, 0, x'2f72', '[]', 0, 15,
+             ?6)",
+        params![
+            state,
+            owner.map(|o| o.pid),
+            owner.map(|o| o.start_time as i64),
+            (state == "parked").then_some(at),
+            (state == "running").then_some(at),
+            (state == "running").then_some(1),
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_queue_of_0_12_and_0_13_is_brought_up_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(QUEUE_DB_FILE);
+    let me = ProcessId::current().unwrap();
+    let old = Connection::open(&path).unwrap();
+    old.execute_batch(SCHEMA).unwrap();
+    insert_as_0_13(&old, "running", Some(me), 1_000);
+    insert_as_0_13(&old, "parked", None, 2_000);
+    insert_as_0_13(&old, "waiting", Some(me), 0);
+    insert_as_0_13(&old, "running", None, 3_000);
+    insert_as_0_13(&old, "waiting", Some(me), 0);
+    old.execute("DELETE FROM jobs WHERE id = 5", []).unwrap();
+    drop(old);
+
+    let queue = Queue::open(&path).unwrap();
+    assert_eq!(layout(&queue.conn).unwrap(), LAYOUT);
+    assert_eq!(protocol(&queue.conn).unwrap(), Some(PROTOCOL));
+    let since: Vec<Option<SystemTime>> = load_jobs(&queue.conn)
+        .unwrap()
+        .iter()
+        .map(|job| job.state_since)
+        .collect();
+    // Running since it started, parked since it parked; when a waiting one
+    // (it may have resumed) or a handed-over one got there is not known.
+    assert_eq!(
+        since,
+        [
+            Some(from_unix_ms(1_000)),
+            Some(from_unix_ms(2_000)),
+            None,
+            None
+        ]
+    );
+    // IDs go on from the highest ever given, not from the jobs left.
+    let next = queue.enqueue(&request("next", 1, &[]), me).unwrap();
+    assert_eq!(next.id(), 6);
+}
+
+#[test]
+fn every_write_checks_the_queue_is_of_this_layout_and_protocol() {
+    let f = fixture();
+    let ticket = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
+    // A later loadmaster moved the queue to another admission protocol.
+    f.queue
+        .conn
+        .execute("UPDATE protocol SET version = 2", [])
+        .unwrap();
+    assert!(matches!(
+        ticket.try_admit(),
+        Err(Error::QueueTooNew {
+            layout: LAYOUT,
+            protocol: Some(2),
+            ..
+        })
+    ));
+    assert!(matches!(f.queue.snapshot(), Err(Error::QueueTooNew { .. })));
+    assert!(matches!(
+        f.queue.enqueue(&request("lint", 1, &[]), f.me),
+        Err(Error::QueueTooNew { .. })
+    ));
+    // Or to another layout: it cannot even be opened.
+    f.queue
+        .conn
+        .execute_batch("UPDATE protocol SET version = 1; PRAGMA user_version = 3;")
+        .unwrap();
+    let path = f._dir.path().join(QUEUE_DB_FILE);
+    assert!(matches!(
+        Queue::open(&path),
+        Err(Error::QueueTooNew { layout: 3, .. })
+    ));
+    f.queue
+        .conn
+        .execute_batch(&format!("PRAGMA user_version = {LAYOUT};"))
+        .unwrap();
+    drop(ticket);
+}
+
+#[test]
+fn the_database_records_when_a_job_entered_its_state_whoever_writes_it() {
+    let f = fixture();
+    let since = |id: JobId| {
+        load_jobs(&f.queue.conn)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == id)
+            .unwrap()
+            .state_since
+            .unwrap()
+    };
+    let later = |before: SystemTime, id: JobId| {
+        let after = since(id);
+        assert!(after > before, "{after:?} after {before:?}");
+        after
+    };
+    let pause = || std::thread::sleep(Duration::from_millis(5));
+    let ticket = f.queue.enqueue(&request("lint", 1, &[]), f.me).unwrap();
+    let id = ticket.id();
+    let enqueued = since(id);
+    pause();
+    ticket.park().unwrap();
+    let parked = later(enqueued, id);
+    pause();
+    // As 0.13 resumes a place, starts the job and hands it over.
+    f.queue
+        .conn
+        .execute(
+            "UPDATE jobs SET state = 'waiting', owner_pid = ?2, owner_start = ?3, parked_at = NULL
+             WHERE id = ?1",
+            params![id, f.me.pid, f.me.start_time as i64],
+        )
+        .unwrap();
+    let resumed = later(parked, id);
+    pause();
+    f.queue
+        .conn
+        .execute(
+            "UPDATE jobs SET state = 'running', started_at = 1, granted = 1 WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    let started = later(resumed, id);
+    pause();
+    // Recording its task's group is no change of state.
+    f.queue
+        .conn
+        .execute("UPDATE jobs SET child_pgid = 1 WHERE id = ?1", [id])
+        .unwrap();
+    assert_eq!(since(id), started);
+    f.queue
+        .conn
+        .execute(
+            "UPDATE jobs SET owner_pid = NULL, owner_start = NULL WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    later(started, id);
 }
 
 /// Whether a stop has been asked for job `id` that nobody has done yet.
@@ -618,6 +774,7 @@ fn job(id: JobId, state: JobState, weight: u32, uses: Vec<Use>, checkout: &str) 
         adapt_cpu: true,
         stop_signal: libc::SIGTERM,
         granted: (state == JobState::Running).then_some(weight),
+        state_since: None,
     }
 }
 
@@ -1516,7 +1673,7 @@ fn a_measurement_taken_earlier_does_not_replace_a_later_one() {
 }
 
 #[test]
-fn running_jobs_of_other_layouts_are_found_by_the_columns_every_layout_keeps() {
+fn jobs_of_other_layouts_are_found_by_the_columns_every_layout_keeps() {
     let dir = tempfile::tempdir().unwrap();
     let me = ProcessId::current().unwrap();
     let gone = ProcessId {
@@ -1553,9 +1710,12 @@ fn running_jobs_of_other_layouts_are_found_by_the_columns_every_layout_keeps() {
     insert("lost", "running", Some(gone), None);
     insert("orphaned", "running", None, Some(me));
     insert("waits", "waiting", Some(me), None);
+    insert("left", "waiting", Some(gone), None);
+    insert("kept", "parked", None, None);
     insert("e2e", "running", Some(me), None);
     drop(other);
-    // Not another layout's queue, or not readable: nothing is said of them.
+    // Not readable: it may hold jobs. Not another layout's queue: nothing is
+    // said of them.
     std::fs::write(dir.path().join("queue-v9.db"), "not a database").unwrap();
     std::fs::write(dir.path().join("queue-vx.db"), "").unwrap();
     std::fs::write(dir.path().join("history.jsonl"), "").unwrap();
@@ -1564,12 +1724,23 @@ fn running_jobs_of_other_layouts_are_found_by_the_columns_every_layout_keeps() {
     let running = own.enqueue(&request("own", 1, &[]), me).unwrap();
     running.admit_now().unwrap();
 
+    let tasks = |names: &[&str]| names.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
     assert_eq!(
-        running_in_other_queues(dir.path()),
-        [OtherQueue {
-            file: "queue-v2.db".to_owned(),
-            running: vec!["e2e".to_owned(), "orphaned".to_owned(), "e2e".to_owned()],
-        }]
+        jobs_in_other_queues(dir.path()),
+        [
+            OtherQueue {
+                file: "queue-v2.db".to_owned(),
+                jobs: Some(OtherJobs {
+                    running: tasks(&["e2e", "orphaned", "e2e"]),
+                    waiting: tasks(&["waits"]),
+                    parked: tasks(&["kept"]),
+                }),
+            },
+            OtherQueue {
+                file: "queue-v9.db".to_owned(),
+                jobs: None,
+            },
+        ]
     );
     // Read as another loadmaster would, nothing is left beside it.
     let mut files: Vec<_> = std::fs::read_dir(dir.path())

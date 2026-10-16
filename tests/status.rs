@@ -138,16 +138,28 @@ fn jobs_running_in_another_versions_queue_are_told_of() {
         ))
         .unwrap();
     drop(other);
-    let told = "1 job(s) run in the queue of another loadmaster version, which this one does \
-                not count (queue-v2.db: `e2e`)";
+    let told = "2 job(s) in the queue of another loadmaster version, which this one does not \
+                count (queue-v2.db: running `e2e`, waiting `e2e`)";
 
     let out = stdout(&sandbox.run(&["status"]));
     assert!(out.contains(&format!("\n{told}\n")), "{out}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&sandbox.run(&["status", "--json"]).stdout).unwrap();
+    assert_eq!(
+        json["other_queues"],
+        serde_json::json!([{
+            "file": "queue-v2.db",
+            "readable": true,
+            "running": ["e2e"],
+            "waiting": ["e2e"],
+            "parked": [],
+        }])
+    );
     let output = sandbox.run(&["run", "lint"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
         stderr(&output).contains(&format!(
-            "loadmaster: warning: {told}; give every agent on this machine the same version\n"
+            "loadmaster: warning: {told}; give every agent on this machine 0.12 or later\n"
         )),
         "{}",
         stderr(&output)
@@ -177,7 +189,7 @@ fn status_as_json_says_what_the_table_says() {
     let output = sandbox.run(&["status", "--json"]);
     assert!(output.status.success(), "{}", stderr(&output));
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(status["format"], 1);
+    assert_eq!(status["format"], 2);
     assert_eq!(status["capacity"], 4);
     assert_eq!(status["cores_in_use"], 3);
     let jobs = status["jobs"].as_array().unwrap();
@@ -187,6 +199,14 @@ fn status_as_json_says_what_the_table_says() {
     assert_eq!(jobs[0]["cores"], 3);
     assert_eq!(jobs[0]["wait"], serde_json::Value::Null);
     assert_eq!(jobs[1]["state"], "waiting");
+    // When each got there, as the database recorded it.
+    let near = |job: &serde_json::Value, field: &str| {
+        let since = job["state_since_ms"].as_u64().unwrap();
+        let at = job[field].as_u64().unwrap();
+        assert!(since.abs_diff(at) < 1_000, "{since} vs {at}");
+    };
+    near(&jobs[0], "started_at_ms");
+    near(&jobs[1], "enqueued_at_ms");
     let why = &jobs[1]["wait"];
     assert_eq!(why["starts_now"], false);
     assert_eq!(why["ahead"], 0);

@@ -24,6 +24,8 @@ pub struct Check {
     pub task: String,
     /// The caller's directory (lossy).
     pub dir: String,
+    /// The extra arguments of its last run.
+    pub args: Vec<String>,
     pub weight: u32,
     pub capacity: u32,
     pub measure_only: bool,
@@ -159,6 +161,7 @@ fn join(first: &Entry, last: &Entry) -> Check {
         job: last.job,
         task: last.task.clone(),
         dir: last.dir.clone(),
+        args: last.args.clone(),
         weight: last.weight,
         capacity: last.capacity,
         measure_only: last.measure_only,
@@ -253,6 +256,8 @@ pub struct Options<'a> {
     pub until: Option<u64>,
     /// Only checks run from a directory whose path contains this.
     pub dir: Option<&'a str>,
+    /// Only checks with an extra argument that contains this.
+    pub args: Option<&'a str>,
     /// Lines of the log that could not be read.
     pub unreadable: usize,
     pub cpus: Option<usize>,
@@ -266,6 +271,11 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
         .filter(|c| options.since.is_none_or(|since| c.queued_at >= since))
         .filter(|c| options.until.is_none_or(|until| c.queued_at < until))
         .filter(|c| options.dir.is_none_or(|dir| c.dir.contains(dir)))
+        .filter(|c| {
+            options
+                .args
+                .is_none_or(|text| c.args.iter().any(|a| a.contains(text)))
+        })
         .collect();
     let (canceled, checks): (Vec<Check>, Vec<Check>) = checks
         .into_iter()
@@ -293,6 +303,9 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
     if let Some(dir) = options.dir {
         out += &format!("only checks run from directories containing `{dir}`\n");
     }
+    if let Some(text) = options.args {
+        out += &format!("only checks with an argument containing `{text}`\n");
+    }
     if options.unreadable > 0 {
         out += &format!(
             "skipped {} line(s) that are not records of this version's format (cut short, \
@@ -309,8 +322,12 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
     if checks.is_empty() {
         out += if options.since.is_some() || options.until.is_some() {
             "no checks in this period\n"
+        } else if options.dir.is_some() && options.args.is_some() {
+            "no such checks\n"
         } else if options.dir.is_some() {
             "no checks run from such directories\n"
+        } else if options.args.is_some() {
+            "no checks with such arguments\n"
         } else {
             "no checks recorded yet\n"
         };
@@ -325,12 +342,13 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
             .or_default()
             .push(check);
     }
-    let mut flagged = false;
+    let mut flagged = Flags::default();
     for ((admission, capacity), checks) in &sections {
         out += "\n";
-        let (text, any) = section(!admission, *capacity, checks, options.cpus);
+        let (text, flags) = section(!admission, *capacity, checks, options.cpus);
         out += &text;
-        flagged |= any;
+        flagged.weight |= flags.weight;
+        flagged.grant |= flags.grant;
     }
     out += "\nA check is one request, re-runs after exit code 75 included. KILLED: ended by a \
             signal while it\nran (usually a timeout) or loadmaster was killed meanwhile. \
@@ -338,7 +356,14 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
             it gave up and was not re-run). NOT RUN: could not\nbe started. CORES: CPU time / \
             run time of passed checks. RUN: passed checks. WAIT: from first\ngetting in line \
             to starting (or to the end, if it never started).\n";
-    if flagged {
+    if flagged.grant {
+        out += &format!(
+            "OVER: passed checks that kept more than {OVER_WEIGHT} times the cores they got \
+             busy (their weight,\nor fewer while CPU was busy outside the queue): they do not \
+             size themselves by LOADMASTER_WEIGHT,\nor their weight is too low.\n"
+        );
+    }
+    if flagged.weight {
         out += &format!(
             "!: at least a tenth of the runs kept more than {OVER_WEIGHT} times their weight in \
              cores busy:\nthey use more than their slot accounts for; raise the weight.\n"
@@ -348,8 +373,17 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
 }
 
 /// CORES P90 above this many times the weight is flagged: the task often
-/// keeps more cores busy than its slot accounts for.
+/// keeps more cores busy than its slot accounts for. So is a check that kept
+/// more than this many times the cores it got busy.
 const OVER_WEIGHT: f64 = 1.2;
+
+/// What a table flags: tasks that often use more cores than their weight,
+/// and checks that used more than they got.
+#[derive(Default, Clone, Copy)]
+struct Flags {
+    weight: bool,
+    grant: bool,
+}
 
 /// One section of the report, and whether its table flags a task.
 fn section(
@@ -357,7 +391,7 @@ fn section(
     capacity: u32,
     checks: &[Check],
     cpus: Option<usize>,
-) -> (String, bool) {
+) -> (String, Flags) {
     let mode = if measure_only {
         "measure-only"
     } else {
@@ -395,9 +429,9 @@ fn section(
     }
     out += &saturated_line(checks, cpus);
     out += "\n";
-    let (table, flagged) = task_table(checks);
+    let (table, flags) = task_table(checks);
     out += &table;
-    (out, flagged)
+    (out, flags)
 }
 
 /// How many of the checks that failed or were killed ran while the machine's
@@ -433,9 +467,8 @@ pub const SATURATED: f64 = 0.95;
 /// A task with one weight and one set of resources: a row of the table.
 type Setting<'a> = (&'a str, u32, &'a BTreeMap<String, u32>);
 
-/// The per-task table, and whether it flags a task for using more cores than
-/// its weight.
-fn task_table(checks: &[Check]) -> (String, bool) {
+/// The per-task table, and what it flags.
+fn task_table(checks: &[Check]) -> (String, Flags) {
     // One row per setting of a task: during a switch-over, old branches run
     // it with another weight or other resources.
     let mut by_task: BTreeMap<Setting, Vec<&Check>> = BTreeMap::new();
@@ -451,6 +484,7 @@ fn task_table(checks: &[Check]) -> (String, bool) {
         "USES",
         "CORES MED",
         "CORES P90",
+        "OVER",
         "CHECKS",
         "PASSED",
         "FAILED",
@@ -464,7 +498,7 @@ fn task_table(checks: &[Check]) -> (String, bool) {
         "WAIT MAX",
     ];
     let mut rows = vec![header.map(String::from).to_vec()];
-    let mut flagged = false;
+    let mut flags = Flags::default();
     for ((task, weight, uses), checks) in by_task {
         let count = |result| {
             checks
@@ -475,13 +509,20 @@ fn task_table(checks: &[Check]) -> (String, bool) {
         };
         let passed = || checks.iter().filter(|c| c.result == CheckResult::Passed);
         let runs: Vec<u64> = passed().filter_map(|c| c.run_ms).collect();
-        let cores: Vec<f64> = passed()
-            .filter_map(|c| Some((c.cpu_ms?, c.run_ms.filter(|&run| run > 0)?)))
-            .map(|(cpu, run)| cpu as f64 / run as f64)
+        let measured: Vec<(f64, u32)> = passed()
+            .filter_map(|c| Some((c.cpu_ms?, c.run_ms.filter(|&run| run > 0)?, c)))
+            .map(|(cpu, run, c)| (cpu as f64 / run as f64, c.granted.unwrap_or(c.weight)))
             .collect();
+        let cores: Vec<f64> = measured.iter().map(|&(cores, _)| cores).collect();
         let cores_p90 = percentile(&cores, 0.9);
         let over = cores_p90.is_some_and(|cores| cores > OVER_WEIGHT * f64::from(weight));
-        flagged |= over;
+        flags.weight |= over;
+        // Each against the cores it got.
+        let over_grant = measured
+            .iter()
+            .filter(|&&(cores, got)| cores > OVER_WEIGHT * f64::from(got))
+            .count();
+        flags.grant |= over_grant > 0;
         let waits: Vec<u64> = checks.iter().map(|c| c.wait_ms).collect();
         let ms = |v: Option<u64>| {
             v.map_or("-".to_owned(), |ms| {
@@ -503,6 +544,11 @@ fn task_table(checks: &[Check]) -> (String, bool) {
             cores_p90.map_or("-".to_owned(), |c| {
                 format!("{c:.1}{}", if over { "!" } else { "" })
             }),
+            if measured.is_empty() {
+                "-".to_owned()
+            } else {
+                over_grant.to_string()
+            },
             checks.len().to_string(),
             count(CheckResult::Passed),
             count(CheckResult::Failed),
@@ -541,7 +587,7 @@ fn task_table(checks: &[Check]) -> (String, bool) {
         out += &cells.join("  ");
         out += "\n";
     }
-    (out, flagged)
+    (out, flags)
 }
 
 /// A point in time for `--since` and `--until`.
@@ -732,6 +778,7 @@ mod tests {
             since: None,
             until: None,
             dir: None,
+            args: None,
             unreadable: 0,
             cpus: None,
         }
@@ -985,7 +1032,8 @@ mod tests {
             .filter(|l| l.starts_with("test "))
             .map(|l| l.split_whitespace().take(5).collect())
             .collect();
-        // TASK WEIGHT USES CORES-MED CORES-P90 ... CHECKS is the 6th cell.
+        // TASK WEIGHT USES CORES-MED CORES-P90 OVER ... CHECKS is the 7th
+        // cell.
         assert_eq!(
             rows.iter().map(|r| r[..3].to_vec()).collect::<Vec<_>>(),
             [
@@ -998,7 +1046,7 @@ mod tests {
         let checks: Vec<&str> = text
             .lines()
             .filter(|l| l.starts_with("test "))
-            .map(|l| l.split_whitespace().nth(5).unwrap())
+            .map(|l| l.split_whitespace().nth(6).unwrap())
             .collect();
         assert_eq!(checks, ["1", "2", "1"], "{text}");
     }
@@ -1116,13 +1164,13 @@ mod tests {
             .nth(1)
             .unwrap();
         let cells: Vec<&str> = row.split_whitespace().collect();
-        // TASK WEIGHT USES CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED
-        // LEFT-LINE NOT-RUN RUN-MED RUN-P90 WAIT-MED WAIT-P90 WAIT-MAX
+        // TASK WEIGHT USES CORES-MED CORES-P90 OVER CHECKS PASSED FAILED
+        // KILLED LEFT-LINE NOT-RUN RUN-MED RUN-P90 WAIT-MED WAIT-P90 WAIT-MAX
         assert_eq!(
             cells,
             [
-                "test", "4", "-", "3.8", "3.8", "1", "1", "0", "0", "0", "0", "10s", "10s", "5.0s",
-                "5.0s", "5.0s"
+                "test", "4", "-", "3.8", "3.8", "0", "1", "1", "0", "0", "0", "0", "10s", "10s",
+                "5.0s", "5.0s", "5.0s"
             ]
         );
     }
@@ -1156,6 +1204,32 @@ mod tests {
         let close: Vec<Entry> = (1..=10).map(|job| run(job, 46_000)).collect();
         assert_eq!(cells(&close)[4], "4.6");
         assert!(!render(&close, &options()).contains("!:"));
+    }
+
+    #[test]
+    fn runs_that_use_more_cores_than_they_got_are_counted() {
+        // Weight 4: one run got 4 cores and used 4, two got 2 while CPU was
+        // busy outside the queue and used 4 all the same; one used 6 of 4.
+        let run = |job, cpu_ms, granted| Entry {
+            cpu_ms: Some(cpu_ms),
+            granted,
+            ..exited(job, 0, 0, 10_000, 0)
+        };
+        let entries = [
+            run(1, 40_000, None),
+            run(2, 40_000, Some(2)),
+            run(3, 40_000, Some(2)),
+            run(4, 60_000, None),
+        ];
+        let text = render(&entries, &options());
+        let row = text.lines().find(|l| l.starts_with("test ")).unwrap();
+        assert_eq!(row.split_whitespace().nth(5), Some("3"), "{text}");
+        assert!(
+            text.contains("OVER: passed checks that kept more than 1.2 times the cores they got"),
+            "{text}"
+        );
+        let fine = render(&entries[..1], &options());
+        assert!(!fine.contains("OVER:"), "{fine}");
     }
 
     #[test]
@@ -1204,6 +1278,23 @@ mod tests {
         );
         assert!(text.contains("directories containing `app-wt`"), "{text}");
         assert!(text.contains("1 check(s)"), "{text}");
+        let tried = Entry {
+            args: vec!["--maxWorkers=4".to_owned()],
+            ..exited(3, 9_000, 0, 10, 0)
+        };
+        let entries = [exited(1, 1_000, 0, 10, 0), tried];
+        let args = |text| Options {
+            args: Some(text),
+            ..options()
+        };
+        let text = render(&entries, &args("maxWorkers"));
+        assert!(
+            text.contains("an argument containing `maxWorkers`"),
+            "{text}"
+        );
+        assert!(text.contains("1 check(s)"), "{text}");
+        let text = render(&entries, &args("--watch"));
+        assert!(text.contains("no checks with such arguments"), "{text}");
     }
 
     #[test]

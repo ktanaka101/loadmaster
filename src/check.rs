@@ -199,6 +199,7 @@ fn kept_out_while_waiting(repo: &RepoConfig, machine: &MachineConfig) -> Vec<Str
             adapt_cpu: false,
             stop_signal: libc::SIGTERM,
             granted: (state == JobState::Running).then_some(weight),
+            state_since: None,
         }
     };
     // In u64: sums of u32 amounts cannot overflow it.

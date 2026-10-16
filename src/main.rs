@@ -73,12 +73,21 @@ enum Cmd {
     Report(ReportArgs),
     /// Validate .loadmaster.toml and the machine config, and show what they
     /// mean on this machine; does not touch the queue
-    Check,
+    Check(CheckArgs),
     /// Stop jobs, waiting or running, and wait until they have left the queue
     Cancel(CancelArgs),
     /// Exit 0 if this process runs inside a loadmaster job started from this
     /// checkout, 1 if not; for scripts that must only run through the queue
     Held(HeldArgs),
+}
+
+#[derive(Args)]
+struct CheckArgs {
+    /// Instead, judge the queue FILE describes, written as `status --json`
+    /// writes it (`-` for stdin), by the admission rule, with the CPU busy
+    /// outside the queue it gives; reads no config and no queue
+    #[arg(long, value_name = "FILE")]
+    scenario: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -130,6 +139,10 @@ struct ReportArgs {
     /// project name shared by its worktrees
     #[arg(long, value_name = "TEXT")]
     dir: Option<String>,
+    /// Only checks with an extra argument (after `--`) that contains TEXT,
+    /// e.g. a flag tried with a task
+    #[arg(long, value_name = "TEXT")]
+    args: Option<String>,
 }
 
 #[derive(Args)]
@@ -158,7 +171,10 @@ fn main() {
         Cmd::Status(args) => status(args),
         Cmd::Clean => clean(),
         Cmd::Report(args) => report(args),
-        Cmd::Check => check(),
+        Cmd::Check(args) => match args.scenario {
+            Some(path) => check_scenario(&path),
+            None => check(),
+        },
         Cmd::Cancel(args) => cancel(args),
         Cmd::Held(args) => held(args),
     };
@@ -206,7 +222,7 @@ fn run(args: RunArgs) -> Result<i32> {
     if !machine.measure_only
         && let Some(others) = other_queues(&state_dir)
     {
-        say!("loadmaster: warning: {others}; give every agent on this machine the same version");
+        say!("loadmaster: warning: {others}; give every agent on this machine 0.12 or later");
     }
     let owner = ProcessId::current().map_err(|e| Error::io("cannot identify this process", e))?;
     let display = display_command(&task.cmd, &args.args);
@@ -821,11 +837,11 @@ fn status(args: StatusArgs) -> Result<i32> {
     };
     if args.json {
         let explained = queue::explain(&snapshot.jobs, outside);
-        let others = queue::running_in_other_queues(&state_dir);
+        let others = queue::jobs_in_other_queues(&state_dir);
         let value = json::status(&json::Status {
             machine: &machine,
             snapshot: &snapshot,
-            outside: outside.filter(|_| adapting),
+            outside,
             resources: &resources_in_use(&snapshot.jobs, &machine),
             others: &others,
             explained: &explained,
@@ -893,21 +909,40 @@ fn status(args: StatusArgs) -> Result<i32> {
 /// The jobs that run in the queues of other loadmaster versions, which this
 /// one does not count, if any.
 fn other_queues(state_dir: &Path) -> Option<String> {
-    let others = queue::running_in_other_queues(state_dir);
-    let count: usize = others.iter().map(|other| other.running.len()).sum();
-    if count == 0 {
+    let others = queue::jobs_in_other_queues(state_dir);
+    if others.is_empty() {
         return None;
     }
+    let count: usize = others
+        .iter()
+        .filter_map(|other| Some(other.jobs.as_ref()?.count()))
+        .sum();
     let list: Vec<String> = others
         .iter()
         .map(|other| {
-            let tasks: Vec<String> = other.running.iter().map(|t| format!("`{t}`")).collect();
-            format!("{}: {}", other.file, tasks.join(", "))
+            let Some(jobs) = &other.jobs else {
+                return format!("{}: could not be read, so it may hold some", other.file);
+            };
+            let named = |what: &str, tasks: &[String]| {
+                (!tasks.is_empty()).then(|| {
+                    let tasks: Vec<String> = tasks.iter().map(|t| format!("`{t}`")).collect();
+                    format!("{what} {}", tasks.join(", "))
+                })
+            };
+            let parts: Vec<String> = [
+                named("running", &jobs.running),
+                named("waiting", &jobs.waiting),
+                named("parked (may resume)", &jobs.parked),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            format!("{}: {}", other.file, parts.join(", "))
         })
         .collect();
     Some(format!(
-        "{count} job(s) run in the queue of another loadmaster version, which this one does \
-         not count ({})",
+        "{count} job(s) in the queue of another loadmaster version, which this one does not \
+         count ({})",
         list.join("; ")
     ))
 }
@@ -982,13 +1017,18 @@ fn resources_in_use<'j>(
 /// hold the slot.
 fn shown_state(job: &Job) -> (&'static str, Option<SystemTime>) {
     match job.state {
-        JobState::Running if job.is_orphaned() => match job.child {
-            Some(group) if group.leader_exited() => ("lingering", job.started_at),
-            _ => ("orphaned", job.started_at),
-        },
-        JobState::Running => ("running", job.started_at),
-        JobState::Waiting => ("waiting", Some(job.enqueued_at)),
-        JobState::Parked => ("parked", job.parked_at),
+        JobState::Running if job.is_orphaned() => {
+            // Handed over to its task's group, it got there then; when a
+            // loadmaster that died left it so, nobody saw.
+            let since = job.state_since.filter(|_| job.owner.is_none());
+            match job.child {
+                Some(group) if group.leader_exited() => ("lingering", since),
+                _ => ("orphaned", since),
+            }
+        }
+        JobState::Running => ("running", job.state_since),
+        JobState::Waiting => ("waiting", job.state_since),
+        JobState::Parked => ("parked", job.state_since),
     }
 }
 
@@ -1259,6 +1299,61 @@ fn check() -> Result<i32> {
     Ok(0)
 }
 
+/// `check --scenario`: what the admission rule makes of the queue a file
+/// describes, job by job in line order.
+fn check_scenario(path: &Path) -> Result<i32> {
+    let text = if path == Path::new("-") {
+        io::read_to_string(io::stdin()).map_err(|e| Error::io("cannot read stdin", e))?
+    } else {
+        fs::read_to_string(path)
+            .map_err(|e| Error::io(format!("cannot read {}", path.display()), e))?
+    };
+    let invalid =
+        |message: String| Error::Usage(format!("{} is not a scenario: {message}", path.display()));
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
+    let (jobs, outside) = json::scenario(&value).map_err(invalid)?;
+    let mut out = match outside {
+        Some(o) => format!(
+            "CPU busy beyond what running jobs got: {} of {} cores\n",
+            o.busy, o.cores
+        ),
+        None => "no CPU busy outside the queue given: jobs start with their weight\n".to_owned(),
+    };
+    let explained = queue::explain(&jobs, outside);
+    for job in &jobs {
+        let who = format!("#{} `{}`", job.id, job.task);
+        let cores = |n: u32| format!("{n} core{}", if n == 1 { "" } else { "s" });
+        let start = queue::start_cores(job, outside);
+        let decision = explained
+            .iter()
+            .find(|(id, _)| *id == job.id)
+            .map(|(_, a)| a);
+        out += &match (job.state, decision) {
+            (JobState::Running, _) => format!("{who} holds {}\n", cores(start)),
+            (JobState::Parked, Some(Admission::Admitted)) => {
+                format!(
+                    "{who} is parked; resumed now, it would start with {}\n",
+                    cores(start)
+                )
+            }
+            (JobState::Parked, Some(Admission::Waiting(wait))) => format!(
+                "{who} is parked; resumed now, it would wait for {}\n",
+                wait.waits_for()
+            ),
+            (_, Some(Admission::Admitted)) => {
+                format!("{who} starts now with {}\n", cores(start))
+            }
+            (_, Some(Admission::Waiting(wait))) => {
+                format!("{who} waits for {}\n", wait.waits_for())
+            }
+            (_, None) => String::new(),
+        };
+    }
+    print(&out);
+    Ok(0)
+}
+
 fn report(args: ReportArgs) -> Result<i32> {
     let path = config::state_dir()?.join(HISTORY_FILE);
     let (entries, unreadable) = match history::read(&path) {
@@ -1279,6 +1374,7 @@ fn report(args: ReportArgs) -> Result<i32> {
         since,
         until,
         dir: args.dir.as_deref(),
+        args: args.args.as_deref(),
         unreadable,
         cpus: process::online_cpus(),
     };

@@ -77,3 +77,77 @@ fn a_broken_machine_config_fails() {
     assert_eq!(output.status.code(), Some(125));
     assert!(stderr(&output).contains("unknown field `capasity`"));
 }
+
+#[test]
+fn a_scenario_is_judged_as_the_queue_it_was_captured_from() {
+    let sandbox = Sandbox::new(4, "");
+    std::fs::write(
+        sandbox.repo.join(".loadmaster.toml"),
+        sh_task("hold", 3, &sandbox.hold_script("hold"))
+            + &task("e2e", 4, &["true"])
+            + &task("lint", 1, &["true"]),
+    )
+    .unwrap();
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    let mut waiter = sandbox.spawn(&["run", "e2e"]);
+    wait_until("e2e to wait", || {
+        sandbox
+            .job("e2e")
+            .is_some_and(|j| j.state == loadmaster::queue::JobState::Waiting)
+    });
+    let captured = sandbox.path("status.json");
+    std::fs::write(&captured, sandbox.run(&["status", "--json"]).stdout).unwrap();
+    let status = stdout(&sandbox.run(&["status"]));
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+    assert!(wait(&mut waiter).success());
+
+    // The queue is empty now; the scenario is the queue as captured.
+    let output = sandbox.run(&["check", "--scenario", captured.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("#1 `hold` holds 3 cores\n"), "{out}");
+    let waits = "#2 `e2e` waits for all 4 cores (3 in use)";
+    assert!(out.contains(&format!("{waits}\n")), "{out}");
+    assert!(status.contains(waits), "{status}");
+}
+
+#[test]
+fn a_scenario_gives_the_cpu_busy_outside_the_queue() {
+    // Nothing runs; `lint` adapts. With 12 of 14 cores busy outside the
+    // queue, of a capacity of 8 that leaves 2 (the 6 cores it leaves free
+    // are busy, and 6 more).
+    let scenario = |cpu: &str| {
+        format!(
+            r#"{{"format": 2, "cpu": {cpu}, "jobs": [{{"id": 7, "state": "waiting",
+                "task": "lint", "weight": 4, "cores": null, "uses": {{}},
+                "checkout": "/repo", "capacity": 8, "adapts_to_outside_cpu": true,
+                "measure_only": false, "pid": 1}}]}}"#
+        )
+    };
+    let sandbox = Sandbox::new(4, "");
+    let file = sandbox.path("scenario.json");
+    let judge = |cpu: &str| {
+        std::fs::write(&file, scenario(cpu)).unwrap();
+        let output = sandbox.run(&["check", "--scenario", file.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        stdout(&output)
+    };
+    assert!(judge("null").contains("#7 `lint` starts now with 4 cores\n"));
+    let busy = judge(r#"{"cores": 14, "busy_beyond_running_jobs": 12}"#);
+    assert!(busy.contains("12 of 14 cores"), "{busy}");
+    assert!(
+        busy.contains("#7 `lint` starts now with 2 cores\n"),
+        "{busy}"
+    );
+
+    std::fs::write(&file, r#"{"format": 1, "jobs": []}"#).unwrap();
+    let output = sandbox.run(&["check", "--scenario", file.to_str().unwrap()]);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(
+        stderr(&output).contains("is not a scenario: it is not a status of format 2"),
+        "{}",
+        stderr(&output)
+    );
+}

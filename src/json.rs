@@ -1,7 +1,9 @@
 //! `loadmaster status --json`: the queue for tools, in a documented format
-//! (README, "Status as JSON") whose changes are listed as breaking ones. The
-//! table `status` prints for people may change in any release.
+//! (README, "Status as JSON"). Fields may be added; any other change is a new
+//! format, listed as a breaking change. The table `status` prints for people
+//! may change in any release.
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -10,17 +12,18 @@ use loadmaster::config::MachineConfig;
 use loadmaster::process;
 use loadmaster::queue::{
     Admission, Cause, Job, JobId, JobRef, JobState, Need, OtherQueue, Outside, Shortage, Snapshot,
-    Wait,
+    Use, Wait,
 };
 
 /// The version of the format, in its `format` field.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// What `status --json` prints.
 pub struct Status<'a> {
     pub machine: &'a MachineConfig,
     pub snapshot: &'a Snapshot,
-    /// The CPU busy beyond what running jobs got, if jobs adapt to it.
+    /// The CPU busy beyond what running jobs got, if it was measured: the
+    /// rule's input for jobs that adapt to it.
     pub outside: Option<Outside>,
     /// Each machine-wide resource in use: name, used, capacity.
     pub resources: &'a [(&'a str, u64, Option<u32>)],
@@ -52,7 +55,7 @@ pub fn status(status: &Status) -> Value {
         "cores_in_use": status.snapshot.used(),
         "cpu": status.outside.map(|outside| json!({
             "cores": outside.cores,
-            "busy_beyond_running_jobs": (outside.busy * 10.0).round() / 10.0,
+            "busy_beyond_running_jobs": outside.busy,
             "start_limit": outside.cpu_limit(machine.capacity),
         })),
         "load_average": process::load_average(),
@@ -63,10 +66,113 @@ pub fn status(status: &Status) -> Value {
         })).collect::<Vec<_>>(),
         "other_queues": status.others.iter().map(|other| json!({
             "file": other.file,
-            "running": other.running,
+            "readable": other.jobs.is_some(),
+            "running": other.jobs.as_ref().map(|jobs| &jobs.running),
+            "waiting": other.jobs.as_ref().map(|jobs| &jobs.waiting),
+            "parked": other.jobs.as_ref().map(|jobs| &jobs.parked),
         })).collect::<Vec<_>>(),
         "reclaimed": status.snapshot.reaped.len(),
         "jobs": jobs,
+    })
+}
+
+/// The queue a status of this format describes, as the admission rule sees
+/// it, for `check --scenario`: its jobs in line order and the CPU busy
+/// outside the queue (`cpu`, or none). Only what the rule reads is needed of
+/// each job: `id`, `state`, `task`, `weight`, `cores` (of a running one),
+/// `uses`, `checkout`, `capacity`, `adapts_to_outside_cpu` and
+/// `measure_only`; anything else is ignored. Its states are as they are: no
+/// process is looked at, no place expires.
+pub fn scenario(value: &Value) -> Result<(Vec<Job>, Option<Outside>), String> {
+    if value["format"] != json!(FORMAT) {
+        return Err(format!(
+            "it is not a status of format {FORMAT} (`format` is {})",
+            value["format"]
+        ));
+    }
+    let outside = match &value["cpu"] {
+        Value::Null => None,
+        cpu => Some(Outside {
+            busy: cpu["busy_beyond_running_jobs"]
+                .as_f64()
+                .ok_or("`cpu` has no number `busy_beyond_running_jobs`")?,
+            cores: number(&cpu["cores"]).ok_or("`cpu` has no number `cores`")?,
+        }),
+    };
+    let mut jobs = value["jobs"]
+        .as_array()
+        .ok_or("it has no list `jobs`")?
+        .iter()
+        .map(scenario_job)
+        .collect::<Result<Vec<Job>, String>>()?;
+    jobs.sort_by_key(|job| job.id);
+    Ok((jobs, outside))
+}
+
+fn number(value: &Value) -> Option<u32> {
+    u32::try_from(value.as_u64()?).ok()
+}
+
+fn scenario_job(value: &Value) -> Result<Job, String> {
+    let id: JobId = value["id"].as_i64().ok_or("a job has no number `id`")?;
+    let missing = |field: &str| format!("job #{id} has no valid `{field}`");
+    let get = |field: &str| number(&value[field]).ok_or_else(|| missing(field));
+    let flag = |field: &str| value[field].as_bool().ok_or_else(|| missing(field));
+    let state = match value["state"].as_str() {
+        Some("running" | "orphaned" | "lingering") => JobState::Running,
+        Some("waiting") => JobState::Waiting,
+        Some("parked") => JobState::Parked,
+        _ => return Err(missing("state")),
+    };
+    let uses = value["uses"]
+        .as_object()
+        .ok_or_else(|| missing("uses"))?
+        .iter()
+        .map(|(name, u)| {
+            let limit = |field: &str| match &u[field] {
+                Value::Null => Ok(None),
+                v => number(v).map(Some).ok_or_else(|| missing("uses")),
+            };
+            Ok(Use {
+                name: name.clone(),
+                amount: number(&u["amount"]).ok_or_else(|| missing("uses"))?,
+                capacity: limit("capacity")?,
+                per_checkout: limit("per_checkout")?,
+            })
+        })
+        .collect::<Result<Vec<Use>, String>>()?;
+    let checkout = PathBuf::from(
+        value["checkout"]
+            .as_str()
+            .ok_or_else(|| missing("checkout"))?,
+    );
+    Ok(Job {
+        id,
+        task: value["task"]
+            .as_str()
+            .ok_or_else(|| missing("task"))?
+            .to_owned(),
+        weight: get("weight")?,
+        state,
+        dir: checkout.clone(),
+        args: Vec::new(),
+        command: String::new(),
+        owner: None,
+        child: None,
+        enqueued_at: UNIX_EPOCH,
+        parked_at: None,
+        started_at: None,
+        capacity: get("capacity")?,
+        measure_only: flag("measure_only")?,
+        uses,
+        checkout,
+        adapt_cpu: flag("adapts_to_outside_cpu")?,
+        stop_signal: libc::SIGTERM,
+        granted: match state {
+            JobState::Running => Some(get("cores")?),
+            _ => None,
+        },
+        state_since: None,
     })
 }
 
@@ -77,7 +183,7 @@ fn unix_ms(t: SystemTime) -> Option<u64> {
 }
 
 fn job_value(job: &Job, admission: Option<&Admission>) -> Value {
-    let (state, _) = super::shown_state(job);
+    let (state, since) = super::shown_state(job);
     let processes: Option<Vec<Value>> =
         (state == "lingering")
             .then_some(job.child)
@@ -106,6 +212,7 @@ fn job_value(job: &Job, admission: Option<&Admission>) -> Value {
         "args": job.args,
         "pid": job.owner.map(|o| o.pid),
         "pgid": job.child.map(|c| c.pgid),
+        "state_since_ms": since.and_then(unix_ms),
         "enqueued_at_ms": unix_ms(job.enqueued_at),
         "started_at_ms": job.started_at.and_then(unix_ms),
         "parked_at_ms": job.parked_at.and_then(unix_ms),

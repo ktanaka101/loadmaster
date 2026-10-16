@@ -90,6 +90,18 @@ pub enum Error {
     #[error("cannot write to the queue database {}: check its permissions", path.display())]
     QueueReadOnly { path: PathBuf },
 
+    #[error(
+        "the queue {} has layout {layout} and admission protocol {}, which loadmaster {} does \
+         not know: a later loadmaster changed it; give every agent on this machine that version",
+        path.display(),
+        protocol.map_or("none".to_owned(), |p| p.to_string()),
+        env!("CARGO_PKG_VERSION")
+    )]
+    QueueTooNew {
+        path: PathBuf,
+        layout: i64,
+        protocol: Option<i64>,
+    },
     #[error("job #{0} disappeared from the queue")]
     JobVanished(JobId),
 

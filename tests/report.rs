@@ -82,7 +82,7 @@ fn report_summarizes_results_per_task() {
             .unwrap_or_else(|| panic!("no row for {task}: {text}"));
         // Everything but CORES, which depends on the machine.
         let cells: Vec<&str> = line.split_whitespace().collect();
-        [0, 1, 5, 6, 7, 8, 9, 10]
+        [0, 1, 6, 7, 8, 9, 10, 11]
             .map(|i| cells[i].to_owned())
             .to_vec()
     };
@@ -139,8 +139,8 @@ fn a_run_whose_loadmaster_is_killed_is_still_logged() {
     let text = stdout(&sandbox.run(&["report"]));
     let row = text.lines().find(|l| l.starts_with("hold ")).unwrap();
     let cells: Vec<&str> = row.split_whitespace().collect();
-    // TASK WEIGHT USES CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED
-    assert_eq!(cells[5..9], ["1", "0", "0", "1"], "{text}");
+    // TASK WEIGHT USES CORES-MED CORES-P90 OVER CHECKS PASSED FAILED KILLED
+    assert_eq!(cells[6..10], ["1", "0", "0", "1"], "{text}");
     assert_eq!(records[0]["started"], true);
 }
 
@@ -174,8 +174,9 @@ fn a_run_killed_while_waiting_left_the_line() {
     let text = stdout(&sandbox.run(&["report"]));
     let row = text.lines().find(|l| l.starts_with("waits ")).unwrap();
     let cells: Vec<&str> = row.split_whitespace().collect();
-    // TASK WEIGHT USES CORES-MED CORES-P90 CHECKS PASSED FAILED KILLED LEFT-LINE
-    assert_eq!(cells[5..10], ["1", "0", "0", "0", "1"], "{text}");
+    // TASK WEIGHT USES CORES-MED CORES-P90 OVER CHECKS PASSED FAILED KILLED
+    // LEFT-LINE
+    assert_eq!(cells[6..11], ["1", "0", "0", "0", "1"], "{text}");
 }
 
 #[test]
@@ -192,7 +193,7 @@ fn a_signal_is_told_apart_from_an_exit_code() {
     let text = stdout(&sandbox.run(&["report"]));
     let killed = |task: &str| {
         let row = text.lines().find(|l| l.starts_with(task)).unwrap();
-        row.split_whitespace().nth(8).unwrap().to_owned()
+        row.split_whitespace().nth(9).unwrap().to_owned()
     };
     assert_eq!(killed("killed "), "1", "{text}");
     assert_eq!(killed("exits "), "0", "{text}");
@@ -223,7 +224,7 @@ fn a_task_can_count_other_exit_codes_as_passed() {
             .unwrap();
         let cells: Vec<&str> = row.split_whitespace().collect();
         // PASSED FAILED
-        (cells[6].to_owned(), cells[7].to_owned())
+        (cells[7].to_owned(), cells[8].to_owned())
     };
     assert_eq!(counts("diff"), ("1".to_owned(), "0".to_owned()), "{text}");
     assert_eq!(counts("broken"), ("0".to_owned(), "1".to_owned()), "{text}");

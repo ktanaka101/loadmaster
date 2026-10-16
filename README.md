@@ -502,11 +502,15 @@ defaults. Like `.loadmaster.toml`, the file can name the oldest loadmaster
 that reads it with `min_version`, for a file shared across machines.
 
 The queue lives in `~/.local/state/loadmaster/queue-v4.db` (`$XDG_STATE_HOME`,
-`LOADMASTER_STATE_DIR`). The number is the version of its layout: loadmaster
-versions with different layouts keep separate queues and do not count each
-other's jobs, so give every agent on a machine the same version (as one
-`mise use -g` does). `loadmaster status` and `loadmaster run` say when jobs
-run in the queue of another version (0.7 or later) and are not counted.
+`LOADMASTER_STATE_DIR`), and stays there: from 0.12 on every version shares
+it. The database records the admission protocol its writers keep; versions
+of one protocol (0.12 to 0.14 so far) count each other's jobs and may run
+side by side, and a version that does not know the protocol a later one
+moved the queue to stops with an error instead of starting work. Versions
+up to 0.11 kept separate files (`queue-v3.db` and before) and do not count
+the jobs of 0.12 and later, or the other way round: `loadmaster status` and
+`loadmaster run` say when such a file holds jobs. Give every agent on a
+machine 0.12 or later.
 Next to it, `history.jsonl` gets one line per job
 (task, weight and the cores it got if fewer, resources, capacity, wait and run
 time, CPU time, load average, the machine's CPU busy while it ran, signal,
@@ -627,16 +631,16 @@ happens to exit with 75 by the `loadmaster: gave up waiting` line on stderr.
 loadmaster run [--max-wait SECONDS] <TASK> [-- ARGS...]
 loadmaster status
 loadmaster cancel [--kill] (<ID>... | --here)
-loadmaster check
+loadmaster check [--scenario FILE]
 loadmaster clean
-loadmaster report [--since TIME] [--until TIME] [--dir TEXT]
+loadmaster report [--since TIME] [--until TIME] [--dir TEXT] [--args TEXT]
 loadmaster held [--uses RESOURCE]
 ```
 
 - `run`: run a task once its weight and resources fit.
 - `status`: show used/total capacity, resources in use, the load average,
-  the CPU busy beyond what running jobs got, jobs running in another
-  version's queue, every running, waiting or parked job, and what each
+  the CPU busy beyond what running jobs got, jobs in the queue of a version
+  up to 0.11, every running, waiting or parked job, and what each
   waiting job waits for. `--json` prints it for tools; see
   [Status as JSON](#status-as-json).
 - `cancel`: stop jobs, by ID or (`--here`) every job started from this
@@ -659,7 +663,12 @@ loadmaster held [--uses RESOURCE]
   capacity leaves for CPU busy outside the queue, and warn about weights that
   take the whole machine or crowd out other tasks while waiting for a
   resource. It does not touch the queue. Exits with 0 if the configs are
-  valid, warnings or not, and with 125 if not.
+  valid, warnings or not, and with 125 if not. `--scenario FILE` instead
+  judges the queue a file describes, as `status --json` writes it (`-` for
+  stdin), by the same admission rule, with the CPU busy outside the queue the
+  file gives: capture a real queue, change what you want to try (the CPU
+  outside, a job's weight), and see what would start and why the rest wait.
+  It reads no config and no queue; the jobs' states are taken as they are.
 - `clean`: reclaim places and slots whose processes are gone. Every update
   already does this, so you should rarely need it.
 - `report`: summarize the history log per task. `--since` and `--until`
@@ -701,34 +710,45 @@ directly.
 ### Status as JSON
 
 `loadmaster status --json` prints the same as one JSON object, for tools. Its
-format is versioned, and any change to it is listed as a breaking change of a
-release; the table above may change in any release.
+format is versioned (`format`); within a version, fields may be added, so
+ignore the ones you do not know. Any other change is a new version, listed as
+a breaking change of a release: a field removed or renamed, or its meaning,
+type or unit changed, and a new value of `state`, `need` or `reason`. The
+table above, and every `text`, may change in any release.
 
-- `format`: 1.
+- `format`: 2.
 - `capacity`, `capacity_source`, `measure_only`, and `cores_in_use` by
   running jobs.
-- `cpu`: if jobs adapt to CPU outside the queue, `{cores,
-  busy_beyond_running_jobs, start_limit}`, `start_limit` being the most cores
-  a job starts with now; else `null`.
+- `cpu`: if the CPU busy outside the queue was measured (jobs adapt to it),
+  `{cores, busy_beyond_running_jobs, start_limit}`: the machine's CPUs, the
+  cores busy beyond what running jobs got, as measured, and the most cores a
+  job of this machine's capacity starts with now; else `null`.
 - `load_average` over the last minute, or `null`.
 - `resources`: `{name, in_use, capacity}` for each machine-wide resource a job
   uses (`capacity` is `null` if nothing limits it).
-- `other_queues`: `{file, running}` for each queue of another loadmaster
-  version with jobs running, `running` being their tasks.
+- `other_queues`: `{file, readable, running, waiting, parked}` for each queue
+  of a version up to 0.11 that holds jobs or could not be read: the tasks of
+  its jobs that run, wait, or keep a parked place they may resume (`null`
+  where the file could not be read).
 - `reclaimed`: how many jobs whose processes were gone were reclaimed.
 - `jobs`, in line order, each with:
   - `id`, `task`, `weight`, `cores` (what it started with, once it runs, else
     `null`), `uses` (for each resource, `{amount, capacity, per_checkout}` as
     the job got in line with them, the limits `null` where it had none),
     `dir` and `checkout` (bytes that are not UTF-8 replaced), `args`, `pid`
-    (of its `loadmaster`) and `pgid` (of its task), or `null`;
-    `enqueued_at_ms`, `started_at_ms` and `parked_at_ms` (milliseconds since
-    the Unix epoch, or `null`); `capacity`, `adapts_to_outside_cpu`,
-    `measure_only`;
+    (of its `loadmaster`) and `pgid` (of its task), or `null`; `capacity`,
+    `adapts_to_outside_cpu`, `measure_only`;
   - `state`: `running`; `waiting`; `parked` (gave up waiting, keeps its place
     for a re-run); `orphaned` (its `loadmaster` is gone, its task still runs);
     or `lingering` (its task's command exited, and processes it left in its
     process group hold the slot);
+  - `state_since_ms`: when it entered that state (milliseconds since the
+    Unix epoch), as the table's FOR counts from: when it got in line or
+    resumed its place, parked, started, or was handed over to its task's
+    process group. `null` where that was not seen, as for a job left orphaned
+    by a `loadmaster` that died, or one waiting from before 0.14. Also
+    `enqueued_at_ms` (when it first got in line), `started_at_ms` and
+    `parked_at_ms`, or `null`;
   - `processes`: for a lingering job, `{pid, name}` of each process in its
     group; else `null`;
   - `wait`: `null` for a job that runs. For one that waits or is parked,
@@ -747,6 +767,10 @@ release; the table above may change in any release.
       `null` when the amount is only a bound;
     - `limit_set_by`: the ID of the job ahead whose record set a limit
       smaller than this job's own, or `null`.
+
+Format 1 (0.12 and 0.13) had no `state_since_ms`, rounded
+`busy_beyond_running_jobs` to a tenth, left `cpu` out when the machine
+config turned adapting off, and gave `other_queues` as `{file, running}`.
 
 ### Exit codes
 
@@ -1061,7 +1085,8 @@ The report has one section per setting (measure-only or admission, and the
 capacity), and one row per task and setting: a task run with another weight
 or other resources, as by an old branch during a switch-over, gets a row of
 its own. Tasks are grouped by name across all repositories; if two projects
-both have a `test` task, look at one at a time with `--dir`. To compare the
+both have a `test` task, look at one at a time with `--dir`; to see the runs
+of a task given some argument, such as a flag you tried, use `--args`. To compare the
 time before and after a change, use `--until` and `--since` with the time of
 the change. Checks stopped with `loadmaster cancel` are left out and only
 counted: they were stopped on purpose. This report comes
@@ -1075,17 +1100,17 @@ history: /Users/you/.local/state/loadmaster/history.jsonl
 weight in use: above capacity 35% of the time checks ran, peak 20
 load average when tasks ended: median 10.7, p90 16.3 (14 CPUs)
 
-TASK  WEIGHT  USES  CORES MED  CORES P90  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
-e2e        2     -        1.3        1.4       5       5       0       0          0        0      24s      25s      0.0s      0.0s      0.0s
-test       4     -        2.2        2.2       5       5       0       0          0        0      13s      13s      0.1s      0.2s      0.2s
+TASK  WEIGHT  USES  CORES MED  CORES P90  OVER  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
+e2e        2     -        1.3        1.4     0       5       5       0       0          0        0      24s      25s      0.0s      0.0s      0.0s
+test       4     -        2.2        2.2     0       5       5       0       0          0        0      13s      13s      0.1s      0.2s      0.2s
 
 == admission (capacity 12): 10 check(s), 2026-10-11 11:41 to 2026-10-11 11:42
 demand: above capacity 23% of the time checks ran, peak 20 (held back by loadmaster; in use peaked at 12)
 load average when tasks ended: median 13.0, p90 17.0 (14 CPUs)
 
-TASK  WEIGHT  USES  CORES MED  CORES P90  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
-e2e        2     -        1.3        1.3       5       5       0       0          0        0      24s      25s      0.2s       10s       10s
-test       4     -        2.9        2.9       5       5       0       0          0        0      10s      10s      0.1s       10s       10s
+TASK  WEIGHT  USES  CORES MED  CORES P90  OVER  CHECKS  PASSED  FAILED  KILLED  LEFT LINE  NOT RUN  RUN MED  RUN P90  WAIT MED  WAIT P90  WAIT MAX
+e2e        2     -        1.3        1.3     0       5       5       0       0          0        0      24s      25s      0.2s       10s       10s
+test       4     -        2.9        2.9     0       5       5       0       0          0        0      10s      10s      0.1s       10s       10s
 ```
 
 What to compare between the two periods:
@@ -1114,6 +1139,10 @@ What to compare between the two periods:
   times its weight busy: those runs use more than their slot accounts for, so
   the machine can run above its capacity; raise the weight. Read them from the admission
   period; under contention they read low.
+- **OVER**: passed checks that kept more than 1.2 times the cores they got
+  busy, each against its own: its weight, or fewer while CPU was busy outside
+  the queue. A task that does not size itself by `LOADMASTER_WEIGHT` shows up
+  here when it got fewer, even if it stays within its weight.
 - **above capacity ... of the time checks ran**: how often the weights of the
   checks running at once (measure-only) or asking to run (admission) added up
   to more than the capacity. It is only as meaningful as the weights are; the

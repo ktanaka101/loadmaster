@@ -47,7 +47,7 @@ pub type JobId = i64;
 /// is the version of its layout and of the admission rule, the protocol
 /// between the processes that share it: a loadmaster that changes either
 /// uses a new file, never one another version made (but to tell of the jobs
-/// that run there, see [`running_in_other_queues`]).
+/// that run there, see [`jobs_in_other_queues`]).
 pub const QUEUE_DB_FILE: &str = "queue-v4.db";
 
 /// How long to wait for another process's lock on the database.
@@ -72,7 +72,7 @@ const CPU_SMOOTH: Duration = Duration::from_secs(10);
 // holds its slot), `owner_pid` and `owner_start` (its loadmaster), and
 // `child_pgid` and `child_start` (its task's process group), as they are
 // here: loadmaster reads them from the queues of other layouts, to tell of
-// the jobs that run there (see [`running_in_other_queues`]).
+// the jobs that run there (see [`jobs_in_other_queues`]).
 //
 // `cancel_requests` holds the requests from `loadmaster cancel`, for the
 // job's own loadmaster to act on: in an agent's sandbox, a process may not
@@ -84,6 +84,11 @@ const CPU_SMOOTH: Duration = Duration::from_secs(10);
 //
 // `cpu` holds the last measurement of the cores busy outside the queue (see
 // [`Queue::outside`]), so that the processes that wait take turns measuring.
+//
+// `PRAGMA user_version` is the layout: 1 is the one above (0.12 and 0.13),
+// 2 adds what [`LAYOUT_2`] does. A database of layout 1 is brought up to 2 in
+// place; the queue file itself never changes (see `docs/DECISIONS.md`, "The
+// queue file").
 const SCHEMA: &str = "
 CREATE TABLE jobs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,6 +127,52 @@ CREATE TABLE cpu (
 );
 PRAGMA user_version = 1;
 ";
+
+/// From layout 1 to 2: when each job entered its state (`state_since`, Unix
+/// milliseconds, null where that is not known), kept by triggers so that the
+/// writers of 0.12 and 0.13, which share the file, keep it too; and the
+/// admission protocol the queue's writers keep (see [`PROTOCOL`]).
+///
+/// A job enters its state when it gets in line, parks, resumes, starts, or
+/// is handed over to its task's process group (its loadmaster gives it up).
+/// Of jobs already there, a running job entered it when it started, a parked
+/// one when it parked; when a waiting one did (it may have resumed) is not
+/// known, nor when a handed-over one was.
+const LAYOUT_2: &str = "
+ALTER TABLE jobs ADD COLUMN state_since INTEGER;
+UPDATE jobs SET state_since = CASE
+    WHEN state = 'running' AND owner_pid IS NOT NULL THEN started_at
+    WHEN state = 'parked' THEN parked_at
+END;
+CREATE TRIGGER jobs_enter_state_on_insert AFTER INSERT ON jobs
+BEGIN
+    UPDATE jobs SET state_since = CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER jobs_enter_state AFTER UPDATE OF state, owner_pid ON jobs
+WHEN NEW.state IS NOT OLD.state OR (NEW.owner_pid IS NULL AND OLD.owner_pid IS NOT NULL)
+BEGIN
+    UPDATE jobs SET state_since = CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)
+    WHERE id = NEW.id;
+END;
+CREATE TABLE protocol (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    version      INTEGER NOT NULL
+);
+INSERT INTO protocol (id, version) VALUES (1, 1);
+PRAGMA user_version = 2;
+";
+
+/// The layout of the database this version reads and writes (see
+/// [`SCHEMA`]).
+const LAYOUT: i64 = 2;
+
+/// The admission protocol every writer of this queue keeps: what a job may
+/// start with and what it must fit beside (see `docs/DECISIONS.md`, "The
+/// queue file"). 1 is that of 0.12 to 0.14, whose rules may share a queue.
+/// Every write transaction checks it first: a queue a later loadmaster moved
+/// to another protocol is an error, never another file.
+const PROTOCOL: i64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
@@ -182,6 +233,8 @@ pub struct Job {
     /// The cores it started with: its weight, or fewer while CPU was busy
     /// outside the queue. `None` until it starts.
     pub granted: Option<u32>,
+    /// When it entered its state, if that is known (see [`LAYOUT_2`]).
+    pub state_since: Option<SystemTime>,
 }
 
 /// The CPU busy outside the queue, in cores: all the machine's busy CPU time
@@ -525,17 +578,31 @@ impl Queue {
     }
 
     fn create_schema(&self) -> Result<()> {
-        // Usually it is there; don't take the write lock then.
-        if created(&self.conn)? {
+        // Usually it is there; don't take the write lock then. One this
+        // process may not write is for the caller to report.
+        if layout(&self.conn)? == LAYOUT || self.is_read_only() {
             return Ok(());
         }
-        let tx = self.begin()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // Again under the lock: another process may have made it since.
-        if !created(&tx)? {
-            tx.execute_batch(SCHEMA)?;
+        match layout(&tx)? {
+            0 => tx.execute_batch(&format!("{SCHEMA}{LAYOUT_2}"))?,
+            1 => tx.execute_batch(LAYOUT_2)?,
+            LAYOUT => {}
+            _ => return Err(self.unknown_layout(&tx)),
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The error for a queue of a layout or protocol this version does not
+    /// know: a later loadmaster changed it.
+    fn unknown_layout(&self, conn: &Connection) -> Error {
+        Error::QueueTooNew {
+            path: self.path.clone(),
+            layout: layout(conn).unwrap_or(-1),
+            protocol: protocol(conn).ok().flatten(),
+        }
     }
 
     /// What changes whenever the database does: `PRAGMA data_version`
@@ -548,8 +615,16 @@ impl Queue {
         Ok((data, self.conn.total_changes()))
     }
 
-    fn begin(&self) -> rusqlite::Result<Transaction<'_>> {
-        Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+    /// A write transaction, once the queue is checked to be of this
+    /// version's layout and protocol: before anything is reaped or changed,
+    /// so that a process that opened it before a later loadmaster changed it
+    /// writes nothing.
+    fn begin(&self) -> Result<Transaction<'_>> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if layout(&tx)? != LAYOUT || protocol(&tx)? != Some(PROTOCOL) {
+            return Err(self.unknown_layout(&tx));
+        }
+        Ok(tx)
     }
 
     /// Runs `f` in a write transaction, after reaping dead jobs. Once that is
@@ -1218,6 +1293,11 @@ fn demands(job: &Job, outside: Option<Outside>) -> Vec<(Dim<'_>, u64, u64)> {
 /// judged by: a running job keeps what it was granted, whatever the CPU
 /// outside the queue has done since; a waiting one is judged by its
 /// capacity lowered by the CPU busy outside the queue now.
+/// The cores `job` holds if it runs, or would start with now.
+pub fn start_cores(job: &Job, outside: Option<Outside>) -> u32 {
+    cpu_demand(job, outside).0
+}
+
 fn cpu_demand(job: &Job, outside: Option<Outside>) -> (u32, u32) {
     if job.state == JobState::Running {
         return (job.granted.unwrap_or(job.weight), job.capacity);
@@ -1320,16 +1400,25 @@ fn read_cpu(conn: &Connection) -> Result<Option<CpuRow>> {
 
 /// Whether the schema has been made: the last statement of [`SCHEMA`] marks
 /// it.
-fn created(conn: &Connection) -> rusqlite::Result<bool> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    Ok(version != 0)
+/// The layout of the database (see [`SCHEMA`]), 0 if it has none yet.
+fn layout(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+}
+
+/// The admission protocol of the queue, if it records one.
+fn protocol(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    conn.query_row("SELECT version FROM protocol WHERE id = 1", [], |r| {
+        r.get(0)
+    })
+    .optional()
 }
 
 fn load_jobs(conn: &Connection) -> Result<Vec<Job>> {
     let mut stmt = conn.prepare(
         "SELECT id, task, weight, state, dir, args, command, owner_pid, owner_start,
                 child_pgid, child_start, enqueued_at, parked_at, started_at,
-                capacity, measure_only, checkout, uses, adapt_cpu, stop_signal, granted
+                capacity, measure_only, checkout, uses, adapt_cpu, stop_signal, granted,
+                state_since
          FROM jobs ORDER BY id",
     )?;
     let jobs = stmt
@@ -1375,6 +1464,7 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         adapt_cpu: row.get(18)?,
         stop_signal: row.get(19)?,
         granted: row.get(20)?,
+        state_since: row.get::<_, Option<i64>>(21)?.map(from_unix_ms),
     })
 }
 
@@ -1393,7 +1483,7 @@ fn from_unix_ms(ms: i64) -> SystemTime {
 
 mod admission;
 mod other_queues;
-pub use other_queues::{OtherQueue, running_in_other_queues};
+pub use other_queues::{OtherJobs, OtherQueue, jobs_in_other_queues};
 
 #[cfg(test)]
 mod tests;

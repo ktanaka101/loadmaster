@@ -1,9 +1,9 @@
-//! The jobs that run in the queues of other layouts: another loadmaster
-//! version's, beside this one's in the state directory. This queue does not
-//! count them, so a machine runs beyond its capacity while both are in use
-//! (for the minutes of an upgrade, or for as long as an agent runs an older
-//! version); a loadmaster only tells of them. It reads nothing but the
-//! columns every layout keeps (see [`SCHEMA`](super::SCHEMA)).
+//! The jobs in the queues of other layouts: those of loadmaster 0.11 and
+//! before, beside this one's in the state directory (0.12 and later keep
+//! `queue-v4.db`; see `docs/DECISIONS.md`, "The queue file"). This queue
+//! does not count them, so a machine runs beyond its capacity while both are
+//! in use; a loadmaster only tells of them. It reads nothing but the columns
+//! every layout keeps (see [`SCHEMA`](super::SCHEMA)).
 
 use std::fs;
 use std::path::Path;
@@ -14,22 +14,38 @@ use rusqlite::{Connection, OpenFlags};
 use super::QUEUE_DB_FILE;
 use crate::process::{ProcessGroup, ProcessId};
 
-/// The running jobs of the queue of another layout.
+/// The queue of another layout, and the jobs it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtherQueue {
     /// Its file name, as `queue-v2.db`.
     pub file: String,
-    /// The tasks of its running jobs, in its order.
+    /// Its jobs, if it could be read.
+    pub jobs: Option<OtherJobs>,
+}
+
+/// The tasks of another queue's jobs, in its order: those that run, those
+/// that wait, and those that keep a parked place, which they may resume (when
+/// a place expires is not among the columns every layout keeps).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OtherJobs {
     pub running: Vec<String>,
+    pub waiting: Vec<String>,
+    pub parked: Vec<String>,
+}
+
+impl OtherJobs {
+    pub fn count(&self) -> usize {
+        self.running.len() + self.waiting.len() + self.parked.len()
+    }
 }
 
 /// A reader waits for a writer only in rare moments (as when the file is
 /// first opened after a crash); a notice is not worth waiting long for.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The queues of other layouts in `dir` that have jobs running, by file
-/// name. A file that cannot be read has none, as far as this goes.
-pub fn running_in_other_queues(dir: &Path) -> Vec<OtherQueue> {
+/// The queues of other layouts in `dir` that hold jobs, or could not be read
+/// (they may), by file name.
+pub fn jobs_in_other_queues(dir: &Path) -> Vec<OtherQueue> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -41,8 +57,10 @@ pub fn running_in_other_queues(dir: &Path) -> Vec<OtherQueue> {
     files
         .into_iter()
         .filter_map(|file| {
-            let running = running_in(&dir.join(&file)).ok()?;
-            (!running.is_empty()).then_some(OtherQueue { file, running })
+            let jobs = jobs_in(&dir.join(&file)).ok();
+            jobs.as_ref()
+                .is_none_or(|jobs| jobs.count() > 0)
+                .then_some(OtherQueue { file, jobs })
         })
         .collect()
 }
@@ -54,10 +72,11 @@ fn is_queue_file(name: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The tasks of the jobs running in the queue at `path`: those whose
-/// loadmaster or task still runs, as for this queue's own (see
-/// [`Job::is_live`](super::Job)).
-fn running_in(path: &Path) -> rusqlite::Result<Vec<String>> {
+/// The jobs in the queue at `path` that someone still holds, as for this
+/// queue's own (see [`Job::is_live`](super::Job)): a running one while its
+/// loadmaster or task runs, a waiting one while its loadmaster does; every
+/// parked one.
+fn jobs_in(path: &Path) -> rusqlite::Result<OtherJobs> {
     // Opened as its own version opens it, so that the last connection to
     // close it folds its write-ahead log into it and removes it, as a
     // read-only one would not; but never created, and its rows only read.
@@ -67,15 +86,14 @@ fn running_in(path: &Path) -> rusqlite::Result<Vec<String>> {
     )?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     let mut stmt = conn.prepare(
-        "SELECT task, owner_pid, owner_start, child_pgid, child_start
-         FROM jobs WHERE state = 'running' ORDER BY id",
+        "SELECT task, state, owner_pid, owner_start, child_pgid, child_start
+         FROM jobs ORDER BY id",
     )?;
-    let jobs = stmt.query_map([], |row| {
-        let task: String = row.get(0)?;
-        let owner_pid: Option<u32> = row.get(1)?;
-        let owner_start: Option<i64> = row.get(2)?;
-        let child_pgid: Option<u32> = row.get(3)?;
-        let child_start: Option<i64> = row.get(4)?;
+    let rows = stmt.query_map([], |row| {
+        let owner_pid: Option<u32> = row.get(2)?;
+        let owner_start: Option<i64> = row.get(3)?;
+        let child_pgid: Option<u32> = row.get(4)?;
+        let child_start: Option<i64> = row.get(5)?;
         let owner = owner_pid.zip(owner_start).map(|(pid, start)| ProcessId {
             pid,
             start_time: start as u64,
@@ -84,8 +102,24 @@ fn running_in(path: &Path) -> rusqlite::Result<Vec<String>> {
             pgid,
             leader_start_time: child_start.map(|t| t as u64),
         });
-        let live = owner.is_some_and(|o| o.is_alive()) || child.is_some_and(|c| c.is_alive());
-        Ok(live.then_some(task))
+        let owner_alive = owner.is_some_and(|o| o.is_alive());
+        let state: String = row.get(1)?;
+        let live = match state.as_str() {
+            "running" => owner_alive || child.is_some_and(|c| c.is_alive()),
+            "waiting" => owner_alive,
+            _ => true,
+        };
+        Ok(live.then(|| (row.get::<_, String>(0), state)))
     })?;
-    jobs.filter_map(Result::transpose).collect()
+    let mut jobs = OtherJobs::default();
+    for row in rows {
+        let Some((task, state)) = row? else { continue };
+        let task = task?;
+        match state.as_str() {
+            "running" => jobs.running.push(task),
+            "waiting" => jobs.waiting.push(task),
+            _ => jobs.parked.push(task),
+        }
+    }
+    Ok(jobs)
 }

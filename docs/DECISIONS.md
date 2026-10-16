@@ -247,44 +247,76 @@ same moment on a fresh state directory occasionally got "database is locked"
 (found in the real-tools demo, about 1 run in 300). The switch is retried for
 up to the busy timeout; everything else relies on SQLite's busy handler.
 
-The version of the database's layout and of the admission rule is in its file
-name (`queue-v4.db`): the rule is the protocol between the processes that
-share a queue, so a `loadmaster` that changes the layout, or a rule in a way
-that breaks the promises beside the old one, uses a new file, and never
-changes the schema or the rows of one of another layout. 0.12 moved to
-`queue-v4.db` with the rule of [Resources](#resources), although the schema
-stayed: 0.11's rule does not keep the smaller capacity of a running job ahead,
-so the promises are for the new queue only. 0.13 works the rule out
-differently and starts a few more jobs, but keeps the file: the promises need
-of a job only that it fit beside every start ahead next to every set of the
-jobs ahead that fits within the limits its members record (see
-[Resources](#resources)), and both versions check that. A queue only holds the
-jobs that run now, so nothing in it is worth carrying over. Versions with
-different layouts keep separate queues and do not count each other's jobs, so
-while both run, the machine and its resources can be used beyond their
-capacity: for the minutes of an upgrade, or for as long as an agent runs an
-older version (pinned by a project's tool versions, say). Beyond a resource's
-capacity is not only slower: two at a time for their ports, clew's end-to-end
-tests would have started a third and a fourth during an upgrade. So every
-layout keeps six columns of `jobs` as they are (the task, its state, and the
-processes of its loadmaster and of its task), and `status` and `run` read them
-from the other `queue-v<N>.db` files beside their own, to say how many jobs
-run there and for which tasks. They are not counted: two files cannot be
-changed in one transaction, so jobs in both would still race to start, and the
-other version would not count this one's anyway. A file is opened as its own
-version opens it, so that the last connection to close it folds its
-write-ahead log into it and removes it, as that version's would (read-only,
-SQLite leaves the log behind); but it is never created, and its rows are only
-read. Every layout from 0.7 on has the columns; the `state.db` of 0.5 and 0.6
-is not looked at. The schema is made once, in a write transaction, by the
-first process to open the file; `PRAGMA user_version` marks it as made.
+## The queue file
+
+One machine has one place where admission is decided. Until 0.11 the queue's
+file name carried the version of its layout and rule (`queue-v3.db` and
+before), and a version that changed either started a new file: during an
+upgrade, or for as long as an agent ran an older version (pinned by a
+project's tool versions, say), two queues admitted jobs without counting each
+other's, and the machine and its resources were used beyond their capacity.
+Beyond a resource's capacity is not only slower: two at a time for their
+ports, clew's end-to-end tests would have started a third and a fourth during
+an upgrade. Upgrading safely meant asking every other agent to wait until the
+old file was empty, which a Codex session cannot be asked (clew, 0.12).
+
+So from 0.12 on the file stays `queue-v4.db`, and the database says what it
+holds: its layout (`PRAGMA user_version`) and the admission protocol its
+writers keep (the `protocol` table). The protocol is what a rule must keep to
+share the queue: a job starts with its weight, or with fewer cores only while
+nothing runs ahead of it; it fits now beside the running jobs ahead, within
+the smallest limit any of them records; and it fits beside every start ahead
+next to every set of the jobs ahead that fits within the limits its members
+record (see [Resources](#resources)). Rules that keep the same protocol may
+work it out differently and run side by side: 0.12, 0.13 and 0.14 do, since
+each fits every job beside every such set. Every write transaction checks the
+layout and the protocol first, before it reaps or changes anything, so a
+process that opened the queue before a later loadmaster moved it to another
+protocol writes nothing and stops with an error, never with a new file. A
+layout extended compatibly is brought up to date in place by the first newer
+process to open it, while older writers go on: 0.14 added when each job
+entered its state (see [Status as JSON](#status-as-json)), kept by triggers so
+that 0.12 and 0.13 keep it too.
+
+A rule that breaks the protocol (letting a job start with fewer cores than its
+weight beside jobs ahead of it, say) cannot share the queue with the old one.
+It will close the queue to new jobs, by a trigger that rejects inserts, which
+binaries that never read the protocol obey too; let the jobs in it finish,
+park and expire; and only then change the protocol, so that two protocols
+never hold allocations at once. That is built with the first protocol that
+needs it, and tested against the binaries it has to stop.
+
+Rejected with Codex (GPT-6-Astra): counting the jobs of another file as if
+they took the whole machine (both versions can see the other as idle and start
+at once, the older one never counts the newer one's jobs, and an older agent
+that keeps starting jobs starves the newer ones); keeping more columns the
+same in every layout, so that versions could weigh each other's jobs (an older
+rule still does not account for what a newer one lets start); and a rule
+version per job (an older process cannot judge a job of a rule it does not
+know).
+
+The files of 0.11 and before stay separate. Every layout from 0.7 on keeps six
+columns of `jobs` as they are (the task, its state, and the processes of its
+loadmaster and of its task), and `status` and `run` read them from the other
+`queue-v<N>.db` files beside their own, to say which tasks run, wait or keep a
+parked place there (a parked place may resume: when it expires is not among
+the six); a file that cannot be read may hold jobs, and is reported as such.
+They are not counted: two files cannot be changed in one transaction, so jobs
+in both would still race to start, and the other version would not count this
+one's anyway. A file is opened as its own version opens it, so that the last
+connection to close it folds its write-ahead log into it and removes it, as
+that version's would (read-only, SQLite leaves the log behind); but it is
+never created, and its rows are only read. The `state.db` of 0.5 and 0.6 is
+not looked at. The schema is made once, in a write transaction, by the first
+process to open the file.
 
 ## Job IDs are never reused
 
 The `jobs` table uses `INTEGER PRIMARY KEY AUTOINCREMENT`. A plain
 `INTEGER PRIMARY KEY` would also preserve arrival order, but it can hand out an
 old ID again once the table empties, and then a leaked `LOADMASTER_HELD` could
-validate against an unrelated new job.
+validate against an unrelated new job. Bringing a layout up to date in place
+keeps the highest ID ever given (`sqlite_sequence`), whatever jobs are left.
 
 ## Resources
 
@@ -485,18 +517,57 @@ measured cores cover most of the need; replaying the recorded history against
 other settings would answer the rest from real inputs, and is the form to
 build if it is needed.
 
+`check --scenario` (0.14) is the part of that which needs no durations: it
+judges the queue a file describes (a `status --json` captured from a real
+queue, changed by hand) by the same function `run` and `status` use, with the
+CPU busy outside the queue the file gives, and says what would start, with how
+many cores, and why the rest wait. It answers a question about the rule, not
+about run times. clew asked for it after checking admission in a state
+directory of its own: with adapting on, the real queue's jobs and the rest of
+the machine counted as outside, the limit fell to 2 cores and the check showed
+nothing; with adapting off, it missed what only happens with adapting on
+(0.11's count of a job ahead not started as one core). Pinning the measurement
+with an environment variable was rejected (Codex): the measurement is a row
+that every process of a queue shares and smooths, so one process's pinned
+value would become the others' input, and a state directory of its own
+isolates the accounting, not the machine.
+
 ## Status as JSON
 
 Tools read the queue too. clew's list of the pull requests whose checks were
 in line parsed the table `status` prints, and stopped working the day a new
 state (`lingering`) appeared in it (0.11). The table is for people and keeps
-changing with the explanations, so `status --json` prints the same
-information in a format of its own, with a `format` number: its fields and
-the values of `state` and of a wait's `reason` are documented in the README,
-and any change to them is a breaking change of a release. Why a job waits
-comes as data (the reason, the dimension, what is used and the limit, the jobs
-by ID, and whether the jobs beside a start are a found set or only a bound),
-with the sentence the table shows beside it.
+changing with the explanations, so `status --json` prints the same information
+in a format of its own, with a `format` number, documented in the README. Why
+a job waits comes as data (the reason, the dimension, what is used and the
+limit, the jobs by ID, and whether the jobs beside a start are a found set or
+only a bound), with the sentence the table shows beside it.
+
+Format 1 (0.12) said that any change to it was breaking, so adding a field
+would have needed a new format each time. Format 2 (0.14) says what a tool may
+rely on: fields may be added, and tools ignore the ones they do not know; a
+field removed or renamed, a change of its meaning, type or unit, and a new
+value of `state`, `need` or `reason` are a new format. The values of those
+three are closed, so that a tool need not guess what an unknown state means;
+texts may change in any release.
+
+clew mapped each state to the field its time was in (`enqueued_at_ms` for a
+waiting job, and so on), and had to follow each new state. `state_since_ms`
+gives when the job entered the state shown, as the table's FOR column counts
+it, and only a time that was seen: when it got in line or resumed its place,
+parked, started, or was handed over to its task's process group. A job left
+orphaned by a `loadmaster` that died got there at a time nobody saw, so its
+time is `null`, as is that of a job that waited from before 0.14 (it may have
+resumed). Before, a resumed job's FOR counted from when it first got in line,
+and an orphaned one's from when it started. The database records the time by
+triggers, so that the writers of 0.12 and 0.13, which share the queue and know
+nothing of it, keep it as well.
+
+`status --json` is also the input of `check --scenario`, which judges the
+queue a file describes by the admission rule (see [Why a job
+waits](#why-a-job-waits)), so it carries the rule's inputs as they are: the
+CPU busy outside the queue unrounded, and whenever it was measured, not only
+when the machine config of the process that prints it adapts to it.
 
 ## Canceling jobs
 
@@ -639,7 +710,12 @@ limit, was not taken, for three reasons this design answers:
   before may keep the machine above the lowered limit, never above the
   capacity. A job is still judged by the jobs ahead of it alone, so jobs
   behind never delay it, however the CPU outside the queue changes; a
-  simulation with outside load that changes on its own checks that.
+  simulation with outside load that changes on its own checks that. That
+  holds for the measurements as they come: the measurement itself counts
+  what a job uses beyond its grant, and what a job that started and ended
+  between two readings used, as outside, so a job behind that uses more than
+  it got can lower the limit a job ahead starts with (Codex). The OVER column
+  of `report` shows the runs that do.
 
 A job keeps what it started with: a task cannot be made to use fewer cores
 once it runs, and counting its grant anew would make jobs behind wait for
@@ -932,7 +1008,12 @@ so users need a way to find out from their own use.
   each passed run's CPU time divided by its run time. A median alone hid a
   task that sometimes used far more than its weight (10.7 cores against 8 in
   the first real use, while the load average peaked); a P90 above 1.2 times
-  the weight is marked with `!`.
+  the weight is marked with `!`. That compares with the weight, not with
+  what each run got: a run that got fewer cores while CPU was busy outside
+  the queue and used its whole weight anyway passed unseen (Codex), and clew's
+  tasks, which none of them read `LOADMASTER_WEIGHT`, did just that. OVER
+  counts the passed runs that kept more than 1.2 times the cores they got
+  busy, each against its own grant.
 - **Demand** replays the checks as if each had started the moment it got in
   line, with its real run time. Runs under contention would have been longer,
   so this underestimates the overload loadmaster prevented; it still shows
@@ -948,6 +1029,11 @@ so users need a way to find out from their own use.
   with other settings, and one row with a range of weights hid which was
   which. `--dir TEXT` keeps only checks run from directories whose path
   contains TEXT, which usually picks out one project with all its worktrees.
+  Arguments do not make rows of their own: they are free text, rows would
+  split into samples too small to read, and a run's setting is what it
+  declared. `--args TEXT` keeps only checks with an extra argument that
+  contains TEXT, to look at the runs that tried a flag (clew ran `unit` with
+  `--maxWorkers=4` at weight 2, and its row rightly got `!`).
 - **Periods**: `--since` and `--until` take a time ago or a local time, and
   keep the checks that got in line in between, so the time around a change of
   settings can be compared directly. A day that does not exist (February 30)
