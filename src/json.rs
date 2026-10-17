@@ -206,7 +206,7 @@ fn unix_ms(t: SystemTime) -> Option<u64> {
 }
 
 fn job_value(job: &Job, decision: Option<(&Admission, Option<u32>)>) -> Value {
-    let (state, since) = super::shown_state(job);
+    let (state, since) = crate::cli::status::shown_state(job);
     let processes: Option<Vec<Value>> =
         (state == "lingering")
             .then_some(job.child)
