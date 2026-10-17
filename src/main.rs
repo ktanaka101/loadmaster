@@ -87,6 +87,10 @@ struct Cli {
 enum Cmd {
     /// How AI agents run checks here: the rules, and this repository's tasks
     Guide,
+    /// Whether loadmaster works for agents here (their tool's sandbox and
+    /// timeouts, the configs, the queue), and what to change where not; exit
+    /// code 1 if something does not work
+    Doctor(DoctorArgs),
     /// Run a task from .loadmaster.toml once its weight fits in the machine's capacity
     Run(RunArgs),
     /// Show running and waiting jobs
@@ -112,6 +116,13 @@ struct CheckArgs {
     /// outside the queue it gives; reads no config and no queue
     #[arg(long, value_name = "FILE")]
     scenario: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct DoctorArgs {
+    /// Print the findings as JSON, for tools
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -192,6 +203,7 @@ fn main() {
     });
     let result = match cli.command {
         Cmd::Guide => cli::guide::guide(),
+        Cmd::Doctor(args) => cli::doctor::doctor(args),
         Cmd::Run(args) => cli::run::run(args),
         Cmd::Status(args) => cli::status::status(args),
         Cmd::Clean => cli::cancel::clean(),

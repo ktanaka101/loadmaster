@@ -692,7 +692,7 @@ fn run_nested(value: &str, repo: &RepoConfig, task: &Task, mut command: Command)
 
 /// `$LOADMASTER_MAX_WAIT`, where empty means unset, as for LOADMASTER_HELD:
 /// a script can turn the limit off for its steps by setting it to "".
-fn max_wait_from_env() -> Result<Option<u64>> {
+pub(crate) fn max_wait_from_env() -> Result<Option<u64>> {
     let Some(value) = env::var_os(MAX_WAIT_ENV) else {
         return Ok(None);
     };

@@ -1578,6 +1578,60 @@ pub fn moving(conn: &Connection) -> rusqlite::Result<Option<usize>> {
         .map(|n| Some(n as usize))
 }
 
+/// What a queue file is, as [`inspect`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueFile {
+    /// Its layout (see [`SCHEMA`]), 0 if it has none yet.
+    pub layout: i64,
+    /// The admission protocol it records, if any.
+    pub protocol: Option<i64>,
+    /// Whether a run of this version closed it for its move to protocol 2.
+    pub closed: bool,
+    /// How many jobs are in it, live or not.
+    pub jobs: usize,
+}
+
+impl QueueFile {
+    /// Whether this version uses it as it is.
+    pub fn is_current(&self) -> bool {
+        self.layout == LAYOUT && self.protocol == Some(PROTOCOL)
+    }
+
+    /// Whether it is one of 0.12 to 0.14, which this version's first run
+    /// moves to its protocol.
+    pub fn is_older(&self) -> bool {
+        matches!(self.layout, 1 | 2) && self.protocol.is_none_or(|p| p == 1)
+    }
+}
+
+/// The queue file at `path`, read without changing it: it is not created,
+/// brought up to date, moved or reaped. `None` if there is none.
+pub fn inspect(path: &Path) -> rusqlite::Result<Option<QueueFile>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    // Not read-only: the last connection to close a file in WAL mode folds
+    // its log into it, as a read-only one would not.
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(1))?;
+    let layout = layout(&conn)?;
+    let protocol = if layout >= 2 { protocol(&conn)? } else { None };
+    let jobs = if layout >= 1 {
+        conn.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0))? as usize
+    } else {
+        0
+    };
+    Ok(Some(QueueFile {
+        layout,
+        protocol,
+        closed: closed(&conn)?,
+        jobs,
+    }))
+}
+
 /// The layout of the database (see [`SCHEMA`]), 0 if it has none yet.
 fn layout(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("PRAGMA user_version", [], |r| r.get(0))

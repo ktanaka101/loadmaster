@@ -5,6 +5,7 @@
 
 pub mod check;
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub mod history;
 pub mod process;
