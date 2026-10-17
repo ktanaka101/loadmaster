@@ -67,6 +67,11 @@ pub struct Record<'a> {
     /// other workloads, though they may share a name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkout: Option<Cow<'a, str>>,
+    /// What its checkout is one workload with: its repository and place in
+    /// it (see [`crate::config::workload`]), shared by the repository's
+    /// worktrees, which run the same tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload: Option<String>,
     pub args: &'a [String],
     pub outcome: Outcome,
     /// When this invocation got in line, in Unix milliseconds.
@@ -125,6 +130,9 @@ pub struct Entry {
     /// Not in records of 0.15 and before.
     #[serde(default)]
     pub checkout: Option<String>,
+    /// Not in records of 0.15 and before.
+    #[serde(default)]
+    pub workload: Option<String>,
     pub args: Vec<String>,
     pub capacity: u32,
     pub measure_only: bool,
@@ -242,6 +250,7 @@ mod tests {
                 measure_only: false,
                 dir: Cow::Borrowed("/repo"),
                 checkout: None,
+                workload: None,
                 args: &args,
                 outcome: Outcome::Exited,
                 queued_at: 1_000,
@@ -293,6 +302,7 @@ mod tests {
             measure_only: true,
             dir: Cow::Borrowed("/repo"),
             checkout: None,
+            workload: None,
             args: &args,
             outcome: Outcome::Exited,
             queued_at: 1_000,
@@ -359,6 +369,7 @@ mod tests {
                 weight: 4,
                 dir: "/repo".into(),
                 checkout: None,
+                workload: None,
                 args: vec!["a".into()],
                 capacity: 8,
                 measure_only: true,

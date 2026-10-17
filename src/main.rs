@@ -99,6 +99,9 @@ enum Cmd {
     Clean,
     /// Summarize the history log: results, run and wait times, load
     Report(ReportArgs),
+    /// What other weights or min_weights of this checkout's tasks would have
+    /// done to this machine's checks, replayed through the admission rule
+    Tune(TuneArgs),
     /// Validate .loadmaster.toml and the machine config, and show what they
     /// mean on this machine; does not touch the queue
     Check(CheckArgs),
@@ -181,6 +184,23 @@ struct ReportArgs {
 }
 
 #[derive(Args)]
+struct TuneArgs {
+    /// Only checks that got in line from this time on, as for `report`
+    #[arg(long, value_name = "TIME", value_parser = report::parse_time)]
+    since: Option<report::Time>,
+    /// Only checks that got in line before this time, as for `report`
+    #[arg(long, value_name = "TIME", value_parser = report::parse_time)]
+    until: Option<report::Time>,
+    /// Also replay a change of your own: TASK.weight=N or TASK.min_weight=N
+    /// (or `none`); can be repeated, the changes taken together
+    #[arg(long, value_name = "TASK.KEY=VALUE")]
+    set: Vec<String>,
+    /// Print it as JSON, for tools
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct RunArgs {
     /// Task name, as defined under [tasks] in .loadmaster.toml
     task: String,
@@ -208,6 +228,7 @@ fn main() {
         Cmd::Status(args) => cli::status::status(args),
         Cmd::Clean => cli::cancel::clean(),
         Cmd::Report(args) => cli::report::report(args),
+        Cmd::Tune(args) => cli::tune::tune(args),
         Cmd::Check(args) => match args.scenario {
             Some(path) => cli::check::check_scenario(&path),
             None => cli::check::check(),

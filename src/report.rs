@@ -26,6 +26,8 @@ pub struct Check {
     pub dir: String,
     /// Its checkout (see [`Entry::checkout`]).
     pub checkout: String,
+    /// Its workload, if recorded (see [`crate::config::workload`]).
+    pub workload: Option<String>,
     /// The extra arguments of its last run.
     pub args: Vec<String>,
     pub weight: u32,
@@ -171,6 +173,7 @@ fn join(first: &Entry, last: &Entry) -> Check {
         task: last.task.clone(),
         dir: last.dir.clone(),
         checkout: last.checkout().to_owned(),
+        workload: last.workload.clone(),
         args: last.args.clone(),
         weight: last.weight,
         capacity: last.capacity,
@@ -254,7 +257,7 @@ fn stacking(intervals: impl Iterator<Item = (u64, u64, u32)>, capacity: u32) -> 
 }
 
 /// Nearest-rank percentile of an unsorted sample.
-fn percentile<T: Copy + PartialOrd>(values: &[T], p: f64) -> Option<T> {
+pub fn percentile<T: Copy + PartialOrd>(values: &[T], p: f64) -> Option<T> {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let rank = (p * sorted.len() as f64).ceil() as usize;
@@ -729,7 +732,7 @@ pub fn format_duration(d: Duration) -> String {
 }
 
 /// Unix milliseconds as local time, `2026-10-11 09:12`.
-fn format_time(unix_ms: u64) -> String {
+pub fn format_time(unix_ms: u64) -> String {
     // libc deprecates `time_t` on musl ahead of a change in its size; this
     // works with either size.
     #[allow(deprecated)]
@@ -761,6 +764,7 @@ mod tests {
             weight: 4,
             dir: "/src/app-wt1".to_owned(),
             checkout: None,
+            workload: None,
             args: Vec::new(),
             capacity: 8,
             measure_only: false,

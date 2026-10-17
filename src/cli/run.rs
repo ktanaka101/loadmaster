@@ -105,6 +105,7 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
         measure_only: machine.measure_only,
         dir: cwd.to_string_lossy(),
         checkout: Some(checkout.to_string_lossy()),
+        workload: Some(config::workload(&checkout)),
         args: &args.args,
         outcome: Outcome::Exited,
         queued_at: history::unix_ms(queued_at),

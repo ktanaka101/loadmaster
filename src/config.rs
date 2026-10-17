@@ -358,6 +358,68 @@ impl Task {
     }
 }
 
+/// What a checkout's tasks are one workload with: its repository's git
+/// directory (the main one, which every worktree of it shares) and the
+/// place of its `.loadmaster.toml` in the worktree, as
+/// `/repo/.git` or `/repo/.git:web` for one in `web/`. Worktrees of one
+/// repository share the committed `.loadmaster.toml` and run the same
+/// tasks; a checkout outside git is a workload of its own (its path). Read
+/// from `.git` alone, without running git.
+pub fn workload(checkout: &Path) -> String {
+    let mut dir = checkout;
+    loop {
+        let git = dir.join(".git");
+        if let Some(common) = common_git_dir(&git) {
+            let inner = checkout.strip_prefix(dir).unwrap_or(Path::new(""));
+            return if inner.as_os_str().is_empty() {
+                common.display().to_string()
+            } else {
+                format!("{}:{}", common.display(), inner.display())
+            };
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return checkout.display().to_string(),
+        }
+    }
+}
+
+/// Workloads of checkouts, each worked out once: for records of 0.15 and
+/// before, which do not say theirs.
+#[derive(Debug, Default)]
+pub struct Workloads(std::collections::HashMap<String, String>);
+
+impl Workloads {
+    /// `recorded`, or else the workload of `checkout`.
+    pub fn of(&mut self, recorded: Option<&str>, checkout: &str) -> String {
+        if let Some(workload) = recorded {
+            return workload.to_owned();
+        }
+        self.0
+            .entry(checkout.to_owned())
+            .or_insert_with(|| workload(Path::new(checkout)))
+            .clone()
+    }
+}
+
+/// The main git directory of the worktree whose `.git` is `git`: the
+/// directory itself, or, for a linked worktree's `.git` file, the one its
+/// `gitdir:` and that dir's `commondir` lead to.
+fn common_git_dir(git: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(git).ok()?;
+    if meta.is_dir() {
+        return std::fs::canonicalize(git).ok();
+    }
+    let text = std::fs::read_to_string(git).ok()?;
+    let gitdir = PathBuf::from(text.strip_prefix("gitdir:")?.trim());
+    let gitdir = git.parent()?.join(gitdir);
+    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(rel) => gitdir.join(rel.trim()),
+        Err(_) => gitdir,
+    };
+    std::fs::canonicalize(common).ok()
+}
+
 /// Where the capacity came from, for messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapacitySource {
@@ -581,6 +643,41 @@ fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {
     }
     let home = env_path("HOME").ok_or(Error::NoHome)?;
     Ok(home.join(fallback))
+}
+
+#[cfg(test)]
+mod workload_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn worktrees_of_one_repository_are_one_workload() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+        let wt = dir.path().join("elsewhere/wt");
+        fs::create_dir_all(wt.join("web")).unwrap();
+        fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        fs::create_dir_all(main.join("web")).unwrap();
+        let common = fs::canonicalize(main.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(workload(&main), common);
+        assert_eq!(workload(&wt), common);
+        // A config in a subdirectory is its own workload, in every worktree.
+        assert_eq!(workload(&wt.join("web")), format!("{common}:web"));
+        assert_eq!(workload(&main.join("web")), format!("{common}:web"));
+        // Outside git: the checkout itself.
+        let plain = dir.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert!(!workload(&plain).ends_with(".git"));
+    }
 }
 
 #[cfg(test)]

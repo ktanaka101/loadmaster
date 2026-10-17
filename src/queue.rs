@@ -1089,6 +1089,7 @@ fn record(job: &Job, outcome: Outcome, waited_until: SystemTime) -> Record<'_> {
         measure_only: job.measure_only,
         dir: job.dir.to_string_lossy(),
         checkout: Some(job.checkout.to_string_lossy()),
+        workload: Some(crate::config::workload(&job.checkout)),
         args: &job.args,
         outcome,
         queued_at: history::unix_ms(job.enqueued_at),

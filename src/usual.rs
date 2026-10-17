@@ -17,14 +17,15 @@ const RECENT_BYTES: u64 = 4 << 20;
 /// Fewer passed runs than this say too little to be called usual.
 const LEAST_RUNS: usize = 3;
 
-/// A task as it was run: its checkout, name, weight (as it counts on the
-/// machine), `min_weight` (if fewer than its weight), resources and extra
-/// arguments. A task of another checkout is another workload, though it may
-/// share the name, and a run of one file of a suite says little about the
-/// whole suite.
+/// A task as it was run: its workload (its repository, whose worktrees run
+/// the same tasks; see [`crate::config::workload`]), name, weight (as it
+/// counts on the machine), `min_weight` (if fewer than its weight),
+/// resources and extra arguments. A task of another repository is another
+/// workload, though it may share the name, and a run of one file of a
+/// suite says little about the whole suite.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Setting {
-    pub checkout: String,
+    pub workload: String,
     pub task: String,
     pub weight: u32,
     pub min_weight: Option<u32>,
@@ -36,7 +37,7 @@ impl Setting {
     pub fn of_job(job: &Job) -> Setting {
         let least = job.least();
         Setting {
-            checkout: job.checkout.to_string_lossy().into_owned(),
+            workload: crate::config::workload(&job.checkout),
             task: job.task.clone(),
             weight: job.weight,
             min_weight: (least < job.weight).then_some(least),
@@ -56,7 +57,7 @@ impl Setting {
         let weight = task.weight.min(capacity);
         let least = task.min_weight.unwrap_or(weight).min(weight);
         Setting {
-            checkout: checkout.to_string_lossy().into_owned(),
+            workload: crate::config::workload(checkout),
             task: task.name.clone(),
             weight,
             min_weight: (least < weight).then_some(least),
@@ -95,13 +96,14 @@ impl Usual {
 
     pub fn of(entries: &[Entry]) -> Usual {
         let mut runs: HashMap<Setting, (Vec<u64>, u64)> = HashMap::new();
+        let mut workloads = crate::config::Workloads::default();
         for check in report::checks(entries) {
             let (CheckResult::Passed, Some(run_ms)) = (check.result, check.run_ms) else {
                 continue;
             };
             let ended = check.queued_at + check.wait_ms + run_ms;
             let setting = Setting {
-                checkout: check.checkout,
+                workload: workloads.of(check.workload.as_deref(), &check.checkout),
                 task: check.task,
                 weight: check.weight,
                 min_weight: check.min_weight,
@@ -149,6 +151,7 @@ mod tests {
             weight,
             dir: "/repo".to_owned(),
             checkout: None,
+            workload: None,
             args: Vec::new(),
             capacity: 8,
             measure_only: false,
@@ -174,7 +177,7 @@ mod tests {
     #[test]
     fn the_usual_run_time_is_the_median_of_passed_runs_of_one_setting() {
         let setting = |weight, args: &[&str]| Setting {
-            checkout: "/repo".to_owned(),
+            workload: "/repo".to_owned(),
             task: "test".to_owned(),
             weight,
             min_weight: None,
@@ -199,7 +202,7 @@ mod tests {
             ..passed(job, "test", 4, 10)
         }));
         entries.extend((40..45).map(|job| Entry {
-            checkout: Some("/other".to_owned()),
+            workload: Some("/other".to_owned()),
             ..passed(job, "test", 4, 77)
         }));
         let usual = Usual::of(&entries);
