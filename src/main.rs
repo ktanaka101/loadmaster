@@ -181,6 +181,9 @@ struct ReportArgs {
     /// e.g. a flag tried with a task
     #[arg(long, value_name = "TEXT")]
     args: Option<String>,
+    /// Print it as JSON, for tools
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]

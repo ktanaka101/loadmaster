@@ -95,6 +95,10 @@ fn doctor_says_what_works_and_what_to_change() {
 
 #[test]
 fn a_state_directory_it_may_not_write_is_a_problem() {
+    // Permissions do not stop root.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
     let sandbox = Sandbox::new(4, &sh_task("lint", 1, "true"));
     let home = sandbox.path("home");
     std::fs::create_dir_all(&home).unwrap();

@@ -660,7 +660,7 @@ loadmaster cancel [--kill] (<ID>... | --here)
 loadmaster doctor [--json]
 loadmaster check [--scenario FILE]
 loadmaster tune [--since TIME] [--until TIME] [--set TASK.KEY=VALUE]... [--json]
-loadmaster report [--since TIME] [--until TIME] [--dir TEXT] [--args TEXT]
+loadmaster report [--since TIME] [--until TIME] [--dir TEXT] [--args TEXT] [--json]
 loadmaster clean
 loadmaster held [--uses RESOURCE]
 ```
@@ -775,8 +775,11 @@ written, briefly, in the same words each time.
   limit it to checks that got in line in a period, given as a time ago
   (`12h`, `7d`, `2w`) or a local time (`2026-10-12T16:44`, `2026-10-12`), for
   example around a change of settings; `--dir myapp` keeps checks run from
-  directories whose path contains `myapp`. See
-  [Checking that it helps](#checking-that-it-helps).
+  directories whose path contains `myapp`. `--json` gives the same as data:
+  each section (`mode`, `capacity`, `checks`, the demand and use over
+  capacity, the load average) with its `tasks`, one per setting, with their
+  counts, cores kept busy, `over_weight`, `over_grant`, and run and wait
+  times. See [Checking that it helps](#checking-that-it-helps).
 - `clean`: reclaim places and slots whose processes are gone. Every update
   already does this, so you should rarely need it.
 - `held`: exit with 0 if this process runs inside a loadmaster job started

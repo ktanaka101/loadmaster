@@ -26,6 +26,10 @@ pub(crate) fn report(args: ReportArgs) -> Result<i32> {
         unreadable,
         cpus: process::online_cpus(),
     };
-    print(&report::render(&entries, &options));
+    if args.json {
+        print(&format!("{:#}\n", report::json(&entries, &options)));
+    } else {
+        print(&report::render(&entries, &options));
+    }
     Ok(0)
 }

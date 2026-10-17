@@ -279,10 +279,10 @@ pub struct Options<'a> {
     pub cpus: Option<usize>,
 }
 
-/// The whole report, as printed by `loadmaster report`.
-pub fn render(entries: &[Entry], options: &Options) -> String {
-    let all = checks(entries);
-    let checks: Vec<Check> = all
+/// The checks `options` keep, and those of them stopped with `loadmaster
+/// cancel`, which are left out of the counts.
+fn selected(entries: &[Entry], options: &Options) -> (Vec<Check>, Vec<Check>) {
+    let (canceled, checks): (Vec<Check>, Vec<Check>) = checks(entries)
         .into_iter()
         .filter(|c| options.since.is_none_or(|since| c.queued_at >= since))
         .filter(|c| options.until.is_none_or(|until| c.queued_at < until))
@@ -292,10 +292,76 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
                 .args
                 .is_none_or(|text| c.args.iter().any(|a| a.contains(text)))
         })
-        .collect();
-    let (canceled, checks): (Vec<Check>, Vec<Check>) = checks
-        .into_iter()
         .partition(|c| c.result == CheckResult::Canceled);
+    (checks, canceled)
+}
+
+/// Measure-only first: it is the baseline to compare against.
+fn sections(checks: Vec<Check>) -> BTreeMap<(bool, u32), Vec<Check>> {
+    let mut sections: BTreeMap<(bool, u32), Vec<Check>> = BTreeMap::new();
+    for check in checks {
+        sections
+            .entry((!check.measure_only, check.capacity))
+            .or_default()
+            .push(check);
+    }
+    sections
+}
+
+/// The report as JSON, for tools: what the text says, as data.
+pub fn json(entries: &[Entry], options: &Options) -> serde_json::Value {
+    use serde_json::json;
+    let (checks, canceled) = selected(entries, options);
+    let sections: Vec<serde_json::Value> = sections(checks)
+        .iter()
+        .map(|((admission, capacity), checks)| {
+            let o = overlap(checks, *capacity);
+            let share = |s: Stacking| s.over_ms as f64 / s.busy_ms.max(1) as f64;
+            let loads: Vec<f64> = checks.iter().filter_map(|c| c.load).collect();
+            json!({
+                "mode": if *admission { "admission" } else { "measure_only" },
+                "capacity": capacity,
+                "checks": checks.len(),
+                "from_ms": checks.iter().map(|c| c.queued_at).min(),
+                "to_ms": checks.iter().map(Check::end).max(),
+                "demand": {"over_capacity": share(o.demand), "peak": o.demand.peak},
+                "in_use": {"over_capacity": share(o.in_use), "peak": o.in_use.peak},
+                "load_average": {"median": percentile(&loads, 0.5), "p90": percentile(&loads, 0.9)},
+                "tasks": rows(checks).iter().map(|r| json!({
+                    "task": r.task,
+                    "weight": r.weight,
+                    "min_weight": r.min_weight,
+                    "uses": r.uses,
+                    "checks": r.checks,
+                    "passed": r.passed,
+                    "failed": r.failed,
+                    "killed": r.killed,
+                    "left_line": r.left_line,
+                    "not_run": r.not_run,
+                    "cores": {"median": r.cores_median, "p90": r.cores_p90},
+                    "over_weight": r.over_weight,
+                    "over_grant": r.over_grant,
+                    "run_ms": {"median": r.run_median_ms, "p90": r.run_p90_ms},
+                    "wait_ms": {"median": r.wait_median_ms, "p90": r.wait_p90_ms, "max": r.wait_max_ms},
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "history": options.source.display().to_string(),
+        "since_ms": options.since,
+        "until_ms": options.until,
+        "dir": options.dir,
+        "args": options.args,
+        "skipped_lines": options.unreadable,
+        "canceled": canceled.len(),
+        "sections": sections,
+    })
+}
+
+/// The whole report, as printed by `loadmaster report`.
+pub fn render(entries: &[Entry], options: &Options) -> String {
+    let (checks, canceled) = selected(entries, options);
     let mut out = format!("history: {}\n", options.source.display());
     match (options.since, options.until) {
         (Some(since), Some(until)) => {
@@ -350,16 +416,8 @@ pub fn render(entries: &[Entry], options: &Options) -> String {
         return out;
     }
 
-    // Measure-only first: it is the baseline to compare against.
-    let mut sections: BTreeMap<(bool, u32), Vec<Check>> = BTreeMap::new();
-    for check in checks {
-        sections
-            .entry((!check.measure_only, check.capacity))
-            .or_default()
-            .push(check);
-    }
     let mut flagged = Flags::default();
-    for ((admission, capacity), checks) in &sections {
+    for ((admission, capacity), checks) in &sections(checks) {
         out += "\n";
         let (text, flags) = section(!admission, *capacity, checks, options.cpus);
         out += &text;
@@ -484,10 +542,39 @@ pub const SATURATED: f64 = 0.95;
 /// resources: a row of the table.
 type Setting<'a> = (&'a str, u32, Option<u32>, &'a BTreeMap<String, u32>);
 
-/// The per-task table, and what it flags.
-fn task_table(checks: &[Check]) -> (String, Flags) {
-    // One row per setting of a task: during a switch-over, old branches run
-    // it with another weight or other resources.
+/// One row of the per-task table: a task with one setting, and how its
+/// checks fared. The table and `report --json` both show these.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Row {
+    pub task: String,
+    pub weight: u32,
+    /// The least it may start with, if fewer than its weight.
+    pub min_weight: Option<u32>,
+    pub uses: BTreeMap<String, u32>,
+    pub checks: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub killed: usize,
+    pub left_line: usize,
+    pub not_run: usize,
+    /// The cores its passed runs kept busy: median and 90th percentile.
+    pub cores_median: Option<f64>,
+    pub cores_p90: Option<f64>,
+    /// Whether the 90th percentile is above [`OVER_WEIGHT`] times its weight.
+    pub over_weight: bool,
+    /// Passed runs that kept more than [`OVER_WEIGHT`] times the cores they
+    /// got busy; `None` if none was measured.
+    pub over_grant: Option<usize>,
+    pub run_median_ms: Option<u64>,
+    pub run_p90_ms: Option<u64>,
+    pub wait_median_ms: Option<u64>,
+    pub wait_p90_ms: Option<u64>,
+    pub wait_max_ms: Option<u64>,
+}
+
+/// The rows of `checks`, one per setting of a task: during a switch-over,
+/// old branches run it with another weight or other resources.
+pub fn rows(checks: &[Check]) -> Vec<Row> {
     let mut by_task: BTreeMap<Setting, Vec<&Check>> = BTreeMap::new();
     for check in checks {
         by_task
@@ -495,6 +582,52 @@ fn task_table(checks: &[Check]) -> (String, Flags) {
             .or_default()
             .push(check);
     }
+    by_task
+        .into_iter()
+        .map(|((task, weight, min_weight, uses), checks)| {
+            let count = |result| checks.iter().filter(|c| c.result == result).count();
+            let passed = || checks.iter().filter(|c| c.result == CheckResult::Passed);
+            let runs: Vec<u64> = passed().filter_map(|c| c.run_ms).collect();
+            let measured: Vec<(f64, u32)> = passed()
+                .filter_map(|c| Some((c.cpu_ms?, c.run_ms.filter(|&run| run > 0)?, c)))
+                .map(|(cpu, run, c)| (cpu as f64 / run as f64, c.granted.unwrap_or(c.weight)))
+                .collect();
+            let cores: Vec<f64> = measured.iter().map(|&(cores, _)| cores).collect();
+            let cores_p90 = percentile(&cores, 0.9);
+            let waits: Vec<u64> = checks.iter().map(|c| c.wait_ms).collect();
+            Row {
+                task: task.to_owned(),
+                weight,
+                min_weight,
+                uses: uses.clone(),
+                checks: checks.len(),
+                passed: count(CheckResult::Passed),
+                failed: count(CheckResult::Failed),
+                killed: count(CheckResult::Killed),
+                left_line: count(CheckResult::LeftLine),
+                not_run: count(CheckResult::NotRun),
+                cores_median: percentile(&cores, 0.5),
+                cores_p90,
+                over_weight: cores_p90.is_some_and(|c| c > OVER_WEIGHT * f64::from(weight)),
+                // Each against the cores it got.
+                over_grant: (!measured.is_empty()).then(|| {
+                    measured
+                        .iter()
+                        .filter(|&&(cores, got)| cores > OVER_WEIGHT * f64::from(got))
+                        .count()
+                }),
+                run_median_ms: percentile(&runs, 0.5),
+                run_p90_ms: percentile(&runs, 0.9),
+                wait_median_ms: percentile(&waits, 0.5),
+                wait_p90_ms: percentile(&waits, 0.9),
+                wait_max_ms: waits.iter().copied().max(),
+            }
+        })
+        .collect()
+}
+
+/// The per-task table, and what it flags.
+fn task_table(checks: &[Check]) -> (String, Flags) {
     let header = [
         "TASK",
         "WEIGHT",
@@ -516,70 +649,46 @@ fn task_table(checks: &[Check]) -> (String, Flags) {
     ];
     let mut rows = vec![header.map(String::from).to_vec()];
     let mut flags = Flags::default();
-    for ((task, weight, least, uses), checks) in by_task {
-        let count = |result| {
-            checks
-                .iter()
-                .filter(|c| c.result == result)
-                .count()
-                .to_string()
-        };
-        let passed = || checks.iter().filter(|c| c.result == CheckResult::Passed);
-        let runs: Vec<u64> = passed().filter_map(|c| c.run_ms).collect();
-        let measured: Vec<(f64, u32)> = passed()
-            .filter_map(|c| Some((c.cpu_ms?, c.run_ms.filter(|&run| run > 0)?, c)))
-            .map(|(cpu, run, c)| (cpu as f64 / run as f64, c.granted.unwrap_or(c.weight)))
-            .collect();
-        let cores: Vec<f64> = measured.iter().map(|&(cores, _)| cores).collect();
-        let cores_p90 = percentile(&cores, 0.9);
-        let over = cores_p90.is_some_and(|cores| cores > OVER_WEIGHT * f64::from(weight));
-        flags.weight |= over;
-        // Each against the cores it got.
-        let over_grant = measured
-            .iter()
-            .filter(|&&(cores, got)| cores > OVER_WEIGHT * f64::from(got))
-            .count();
-        flags.grant |= over_grant > 0;
-        let waits: Vec<u64> = checks.iter().map(|c| c.wait_ms).collect();
-        let ms = |v: Option<u64>| {
-            v.map_or("-".to_owned(), |ms| {
-                format_duration(Duration::from_millis(ms))
-            })
-        };
+    let ms = |v: Option<u64>| {
+        v.map_or("-".to_owned(), |ms| {
+            format_duration(Duration::from_millis(ms))
+        })
+    };
+    for row in self::rows(checks) {
+        flags.weight |= row.over_weight;
+        flags.grant |= row.over_grant.is_some_and(|n| n > 0);
         rows.push(vec![
-            task.to_owned(),
-            match least {
-                Some(least) => format!("{weight} (from {least})"),
-                None => weight.to_string(),
+            row.task.clone(),
+            match row.min_weight {
+                Some(least) => format!("{} (from {least})", row.weight),
+                None => row.weight.to_string(),
             },
-            if uses.is_empty() {
+            if row.uses.is_empty() {
                 "-".to_owned()
             } else {
-                uses.iter()
+                row.uses
+                    .iter()
                     .map(|(name, amount)| format!("{name}={amount}"))
                     .collect::<Vec<_>>()
                     .join(",")
             },
-            percentile(&cores, 0.5).map_or("-".to_owned(), |c| format!("{c:.1}")),
-            cores_p90.map_or("-".to_owned(), |c| {
-                format!("{c:.1}{}", if over { "!" } else { "" })
+            row.cores_median
+                .map_or("-".to_owned(), |c| format!("{c:.1}")),
+            row.cores_p90.map_or("-".to_owned(), |c| {
+                format!("{c:.1}{}", if row.over_weight { "!" } else { "" })
             }),
-            if measured.is_empty() {
-                "-".to_owned()
-            } else {
-                over_grant.to_string()
-            },
-            checks.len().to_string(),
-            count(CheckResult::Passed),
-            count(CheckResult::Failed),
-            count(CheckResult::Killed),
-            count(CheckResult::LeftLine),
-            count(CheckResult::NotRun),
-            ms(percentile(&runs, 0.5)),
-            ms(percentile(&runs, 0.9)),
-            ms(percentile(&waits, 0.5)),
-            ms(percentile(&waits, 0.9)),
-            ms(waits.iter().copied().max()),
+            row.over_grant.map_or("-".to_owned(), |n| n.to_string()),
+            row.checks.to_string(),
+            row.passed.to_string(),
+            row.failed.to_string(),
+            row.killed.to_string(),
+            row.left_line.to_string(),
+            row.not_run.to_string(),
+            ms(row.run_median_ms),
+            ms(row.run_p90_ms),
+            ms(row.wait_median_ms),
+            ms(row.wait_p90_ms),
+            ms(row.wait_max_ms),
         ]);
     }
     let widths: Vec<usize> = (0..header.len())

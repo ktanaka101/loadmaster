@@ -93,6 +93,35 @@ fn report_summarizes_results_per_task() {
     assert_eq!(row("pass"), ["pass", "1", "2", "2", "0", "0", "0", "0"]);
     assert_eq!(row("fail"), ["fail", "1", "1", "0", "1", "0", "0", "0"]);
     assert_eq!(row("gone"), ["gone", "1", "1", "0", "0", "0", "0", "1"]);
+
+    // The same, as data.
+    let json: serde_json::Value =
+        serde_json::from_slice(&sandbox.run(&["report", "--json"]).stdout).unwrap();
+    let section = &json["sections"][0];
+    assert_eq!(section["mode"], "admission");
+    assert_eq!(section["capacity"], 4);
+    assert_eq!(section["checks"], 4);
+    let of = |task: &str| {
+        section["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["task"] == task)
+            .unwrap()
+            .clone()
+    };
+    let pass = of("pass");
+    assert_eq!(
+        (&pass["weight"], &pass["checks"], &pass["passed"]),
+        (
+            &serde_json::json!(1),
+            &serde_json::json!(2),
+            &serde_json::json!(2)
+        )
+    );
+    assert!(pass["run_ms"]["median"].is_u64(), "{json:#}");
+    assert_eq!(of("fail")["failed"], 1);
+    assert_eq!(of("gone")["not_run"], 1);
 }
 
 #[test]
