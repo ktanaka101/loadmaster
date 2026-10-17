@@ -128,12 +128,17 @@ the stop, so a cancel after a Ctrl-C sends nothing more. The history log
 records that the task was asked to stop, and the report counts a run that
 then exited with a code of its own (Playwright exits with 130) as stopped,
 like one a signal ended, not as failed. That takes the stop reaching the
-task's own command while it ran: whether it still runs is told right
-before the signal, after the look at its processes, so a command that
-failed on its own during the look, leaving processes behind, is not made a
-stop by the signal those get (found in review; up to 0.15.1 it was, as
-anything sent before the exit was seen counted). It still counts if the
-command exits in the microseconds between that check and the signal.
+task's own command while it ran. Right before the signal, after the look at
+its processes, loadmaster asks the OS, as the command's parent and without
+waiting for it (`waitid` with `WNOWAIT`), whether it has exited, and
+whether it is still in its group (`getpgid`): a command that failed on its
+own during the look, or moved itself to another group, and left processes
+behind is not made a stop by the signal those get (found in review; up to
+0.15.1 it was, as anything sent before the exit was seen counted). Asked of
+the OS as its parent, nothing that hides a process from a look by PID
+(`hidepid` on Linux, a command that is not dumpable) hides this. It still
+counts if the command exits in the microseconds between that check and the
+signal.
 
 Signals that were already ignored when `loadmaster` started (SIGHUP under
 `nohup`, SIGINT in a background job of a non-interactive script) are left
@@ -149,10 +154,11 @@ SIGHUP within one poll forwards both. Signals that arrive just as the task's
 main process exits, or while its slot is being released or handed over, are
 still forwarded to the rest of its group. While the leader has not been
 waited for, its PID, which is the group's ID, is not handed out again, so
-the group is the task's for certain and a signal needs only a running
-member (a group whose leader just exited and that runs nothing gets none).
-Once it has been waited for, the group is checked by its leader's start
-time, so a group ID the OS has reused for someone else after the task ended
+the group is the task's for certain and the signal is sent without a look:
+the OS says whether anyone got it (a group of only an exited leader not yet
+waited for refuses it on macOS and takes it on Linux; it is no stop either
+way). Once it has been waited for, the group is checked by its leader's
+start time, so a group ID the OS has reused for someone else after the task ended
 is not signalled. Up to 0.15.1 that check was made every time: a start time
 misread while the task ran would have dropped the signal without a word,
 one way a signal for a running task could be lost, closed in case it was

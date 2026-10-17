@@ -70,16 +70,6 @@ impl ProcessId {
     }
 }
 
-/// What runs in a process group (see [`ProcessGroup::runs_unwaited`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Runs {
-    /// Its leader, and maybe others.
-    Leader,
-    /// Others: the leader has exited.
-    Members,
-    Nothing,
-}
-
 /// A child process group, identified by its leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessGroup {
@@ -103,16 +93,35 @@ impl ProcessGroup {
         }
     }
 
-    /// What runs in a group whose leader is a child of this process not yet
-    /// waited for: its PID, the group's ID, is not handed out again until
-    /// then, so a running leader is the task's without a look at its start
-    /// time, and so is any member.
-    pub fn runs_unwaited(&self) -> Runs {
-        match start_time(self.pgid) {
-            Ok(Some(_)) | Err(_) => Runs::Leader,
-            Ok(None) if has_running_member(self.pgid).unwrap_or(true) => Runs::Members,
-            Ok(None) => Runs::Nothing,
+    /// For a group whose leader is a child of this process not yet waited
+    /// for (its PID, the group's ID, is not handed out again until then):
+    /// whether the leader still runs, in the group, so that a signal to the
+    /// group reaches it. Asked of the OS as its parent, not by a look at
+    /// its PID, which may hide it (`hidepid` on Linux, a process that is not
+    /// dumpable); if the OS cannot tell, it does.
+    pub fn leader_runs_unwaited(&self) -> bool {
+        let Ok(pid) = libc::pid_t::try_from(self.pgid) else {
+            return true;
+        };
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `info` is valid for writes; WNOWAIT leaves the child to be
+        // waited for.
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pgid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // SAFETY: zeroed, and filled in only if the child has exited.
+        if r == 0 && unsafe { info.assume_init() }.si_signo != 0 {
+            return false;
         }
+        // One that moved itself to another group gets none of this one's.
+        // SAFETY: getpgid has no memory-safety preconditions.
+        let in_group = unsafe { libc::getpgid(pid) };
+        in_group < 0 || in_group == pid
     }
 
     /// Whether the group's leader, the task's own command, is known to have
@@ -993,8 +1002,8 @@ mod tests {
     }
 
     #[test]
-    fn a_group_whose_leader_is_not_waited_for_is_ours_whatever_its_start_time() {
-        use std::os::unix::process::CommandExt;
+    fn a_leader_not_waited_for_is_asked_of_the_os_whatever_its_start_time() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
         let mut leader = Command::new("sleep")
             .arg("30")
             .process_group(0)
@@ -1007,14 +1016,46 @@ mod tests {
             leader_start_time: Some(start_time + 1),
         };
         assert!(!group.is_alive());
-        assert_eq!(group.runs_unwaited(), Runs::Leader);
+        assert!(group.leader_runs_unwaited());
         leader.kill().unwrap();
-        // A zombie runs nothing.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while group.runs_unwaited() != Runs::Nothing {
-            assert!(std::time::Instant::now() < deadline, "the group never died");
+        while group.leader_runs_unwaited() {
+            assert!(std::time::Instant::now() < deadline, "it never exited");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // Still there to be waited for.
+        assert_eq!(leader.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn a_leader_that_left_its_group_does_not_run_in_it() {
+        use std::os::unix::process::CommandExt;
+        // It leaves `sleep` in its group and moves to that of this process.
+        let mut leader = Command::new("perl")
+            .args([
+                "-e",
+                "my $g = getpgrp(0) == $$ ? getpgrp(getppid()) : 0; \
+                 if (!fork) { sleep 30; exit 0 } setpgrp(0, $g) or die $!; \
+                 print qq(moved\n); $| = 1; sleep 30",
+            ])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let group = ProcessGroup {
+            pgid: leader.id(),
+            leader_start_time: ProcessId::of(leader.id()).unwrap().map(|p| p.start_time),
+        };
+        let mut moved = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(leader.stdout.take().unwrap()),
+            &mut moved,
+        )
+        .unwrap();
+        assert_eq!(moved, "moved\n");
+        assert!(!group.leader_runs_unwaited());
+        group.signal(libc::SIGKILL).unwrap();
+        leader.kill().unwrap();
         leader.wait().unwrap();
     }
 

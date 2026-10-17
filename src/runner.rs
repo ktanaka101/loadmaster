@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::process::{Descendants, ProcessGroup, ProcessId, Runs};
+use crate::process::{Descendants, ProcessGroup, ProcessId};
 
 /// Set in a running task's environment to the job ID that holds the slot.
 /// A nested `loadmaster run` sees it and runs directly instead of queueing.
@@ -363,10 +363,11 @@ fn signal_group(group: &ProcessGroup, signal: i32) -> bool {
 /// of its own, is found only through its parent, which the signal may end
 /// (as Playwright exits on SIGTERM, leaving its `webServer`). While its
 /// leader has not been waited for (`unwaited`), the group is the task's for
-/// certain (see [`ProcessGroup::runs_unwaited`]), and whether the leader
-/// still runs is told right before the signal; once it has, it is checked
-/// after the look, which takes a while, so a group ID the OS has reused
-/// meanwhile is never hit.
+/// certain, and whether the leader still runs in it is told right before the
+/// signal (see [`ProcessGroup::leader_runs_unwaited`]): whoever else runs in
+/// the group gets it, and the OS says if no one does. Once it has been
+/// waited for, the group is checked after the look, which takes a while, so
+/// a group ID the OS has reused meanwhile is never hit.
 fn signal_looked(
     group: &ProcessGroup,
     descendants: &mut Descendants,
@@ -380,12 +381,10 @@ fn signal_looked(
         } else {
             Sent::No
         }
+    } else if group.leader_runs_unwaited() {
+        Sent::ToLeader
     } else {
-        match group.runs_unwaited() {
-            Runs::Leader => Sent::ToLeader,
-            Runs::Members => Sent::ToMembers,
-            Runs::Nothing => Sent::No,
-        }
+        Sent::ToMembers
     };
     if to != Sent::No && signal_group(group, signal) {
         to
