@@ -11,7 +11,8 @@ pub(crate) fn held(args: HeldArgs) -> Result<i32> {
     let not_held = |reason: String| -> Result<i32> {
         say!(
             "loadmaster: not running through loadmaster: {reason}\n\
-             loadmaster: start it with `loadmaster run <task>`; the tasks are in {}",
+             loadmaster: next: run it with `loadmaster run <task>` instead; `loadmaster guide` \
+             lists the tasks of {}",
             checkout.display()
         );
         Ok(EXIT_NOT_HELD)

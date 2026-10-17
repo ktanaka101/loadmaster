@@ -33,14 +33,16 @@ pub enum Error {
     VersionTooOld { path: PathBuf, required: String },
 
     #[error(
-        "unknown task `{name}` in {}\navailable tasks: {}",
+        "unknown task `{name}` in {}{}\ntasks: {}",
         path.display(),
+        closest(name, available).map_or(String::new(), |t| format!("; did you mean `{t}`?")),
         format_tasks(available)
     )]
     UnknownTask {
         name: String,
         path: PathBuf,
-        available: Vec<(String, u32)>,
+        /// Each task's name, weight and description.
+        available: Vec<(String, u32, Option<String>)>,
     },
 
     #[error(
@@ -80,9 +82,8 @@ pub enum Error {
     #[error(
         "cannot write to the state directory {} ({detail})\n\
          loadmaster keeps the queue that every agent on this machine shares there; in an \
-         agent's sandbox, allow writing to it (see \"Let it write the state directory\" in \
-         loadmaster's README). LOADMASTER_STATE_DIR moves it, but every agent must then use \
-         the same one",
+         agent's sandbox, it must be allowed to write to it. LOADMASTER_STATE_DIR moves it, \
+         but every agent must then use the same one",
         dir.display()
     )]
     StateDirNotWritable { dir: PathBuf, detail: String },
@@ -131,6 +132,83 @@ impl Error {
             source,
         }
     }
+
+    /// What to do about it, where there is one thing to do: what an agent
+    /// is told on a `loadmaster: next:` line.
+    pub fn next(&self) -> Option<String> {
+        Some(match self {
+            Error::RepoConfigNotFound { .. } => format!(
+                "run checks from a checkout that has {REPO_CONFIG_FILE}; `loadmaster guide` \
+                 says how loadmaster is used and set up"
+            ),
+            Error::UnknownTask {
+                name, available, ..
+            } => match closest(name, available) {
+                Some(task) => format!("run `loadmaster run {task}`"),
+                None => "run one of the tasks above with `loadmaster run <task>`".to_owned(),
+            },
+            Error::VersionTooOld { required, .. } => {
+                format!("install loadmaster {required} or newer, then run the same command again")
+            }
+            Error::InvalidConfig { path, .. } => format!(
+                "fix {}; `loadmaster check` says whether it is valid",
+                path.display()
+            ),
+            Error::MissingMachineConfig { path } => format!(
+                "create {} or unset LOADMASTER_CONFIG, then run the same command again",
+                path.display()
+            ),
+            Error::StateDirNotWritable { dir, .. } => format!(
+                "allow writing to {} in the settings of the tool that runs this command \
+                 (`loadmaster doctor` checks them), then run the same command again",
+                dir.display()
+            ),
+            Error::QueueTooNew { .. } => "upgrade loadmaster to the version that the other \
+                 agents on this machine use, then run the same command again"
+                .to_owned(),
+            Error::InvalidEnv { var, .. } => {
+                format!("fix or unset {var}, then run the same command again")
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// The task meant by a mistyped `name`, if one is close: within an edit or
+/// two (a third of its length, at least one), or the start of one.
+fn closest<'a>(name: &str, tasks: &'a [(String, u32, Option<String>)]) -> Option<&'a str> {
+    let allowed = (name.chars().count() / 3).max(1);
+    tasks
+        .iter()
+        .map(|(task, _, _)| (distance(name, task), task.as_str()))
+        .filter(|&(d, task)| d <= allowed || (name.len() >= 2 && task.starts_with(name)))
+        .min_by_key(|&(d, _)| d)
+        .map(|(_, task)| task)
+}
+
+/// The edit distance between `a` and `b`, in characters, where swapping two
+/// neighbours (`lnit` for `lint`) is one edit, as typing slips often are.
+fn distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
 }
 
 fn not_found(start: &Path, repo_root: Option<&Path>, beyond: Option<&Path>) -> String {
@@ -168,13 +246,39 @@ fn sandbox_hint(source: &io::Error) -> &'static str {
     }
 }
 
-fn format_tasks(tasks: &[(String, u32)]) -> String {
+fn format_tasks(tasks: &[(String, u32, Option<String>)]) -> String {
     if tasks.is_empty() {
         return "(none defined)".to_owned();
     }
     tasks
         .iter()
-        .map(|(name, weight)| format!("{name} (weight {weight})"))
+        .map(|(name, weight, description)| match description {
+            Some(text) => format!("{name} (weight {weight}: {text})"),
+            None => format!("{name} (weight {weight})"),
+        })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mistyped_task_is_matched_to_the_closest() {
+        let tasks: Vec<(String, u32, Option<String>)> = ["e2e", "lint", "test", "typecheck"]
+            .iter()
+            .map(|t| ((*t).to_owned(), 1, None))
+            .collect();
+        for (typed, meant) in [
+            ("lnit", Some("lint")),
+            ("tset", Some("test")),
+            ("tests", Some("test")),
+            ("type", Some("typecheck")),
+            ("e2", Some("e2e")),
+            ("build", None),
+        ] {
+            assert_eq!(closest(typed, &tasks), meant, "{typed}");
+        }
+    }
 }

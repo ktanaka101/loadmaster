@@ -202,6 +202,9 @@ fn main() {
     };
     let code = result.unwrap_or_else(|e| {
         say!("loadmaster: error: {e}");
+        if let Some(next) = e.next() {
+            say!("loadmaster: next: {next}");
+        }
         EXIT_ERROR
     });
     std::process::exit(code);

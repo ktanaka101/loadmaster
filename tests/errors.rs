@@ -47,7 +47,8 @@ fn unknown_task_lists_available_tasks() {
         &["run", "lnit"],
         &[
             "unknown task `lnit`",
-            "available tasks: e2e (weight 8), hold (weight 4), lint (weight 1)",
+            "; did you mean `lint`?\ntasks: e2e (weight 8), hold (weight 4), lint (weight 1)",
+            "\nloadmaster: next: run `loadmaster run lint`\n",
         ],
     );
     assert_eq!(sandbox.snapshot().jobs.len(), 1, "nothing was queued");
@@ -234,7 +235,8 @@ fn a_state_directory_it_may_not_write_is_named() {
                 err.contains(&format!(
                     "cannot write to the state directory {}",
                     dir.display()
-                )) && err.contains("in an agent's sandbox, allow writing to it"),
+                )) && err.contains("in an agent's sandbox, it must be allowed to write to it")
+                    && err.contains("loadmaster: next: allow writing to "),
                 "{args:?} in {}: {err}",
                 dir.display()
             );

@@ -31,6 +31,9 @@ const RESERVED_CORES: u32 = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
     pub name: String,
+    /// What it checks, and how to run part of it, in one line: what
+    /// `loadmaster guide` tells an agent choosing a task.
+    pub description: Option<String>,
     pub weight: u32,
     /// The least cores it may start with, if it says (`min_weight`): its
     /// consent to fewer than its weight, which it sizes itself by through
@@ -81,6 +84,7 @@ struct RepoFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskFile {
+    description: Option<String>,
     weight: u32,
     min_weight: Option<u32>,
     #[serde(default)]
@@ -196,7 +200,7 @@ impl RepoConfig {
             available: self
                 .tasks
                 .values()
-                .map(|t| (t.name.clone(), t.weight))
+                .map(|t| (t.name.clone(), t.weight, t.description.clone()))
                 .collect(),
         })
     }
@@ -243,6 +247,17 @@ impl Task {
         if def.weight == 0 {
             return Err(format!("task `{name}`: weight must be at least 1"));
         }
+        let description = match def.description.as_deref().map(str::trim) {
+            Some("") => {
+                return Err(format!(
+                    "task `{name}`: description must not be empty; leave it out instead"
+                ));
+            }
+            Some(text) if text.contains('\n') => {
+                return Err(format!("task `{name}`: description must be one line"));
+            }
+            text => text.map(str::to_owned),
+        };
         if let Some(min) = def.min_weight
             && !(1..=def.weight).contains(&min)
         {
@@ -332,6 +347,7 @@ impl Task {
         }
         Ok(Task {
             name,
+            description,
             weight: def.weight,
             min_weight: def.min_weight,
             uses: def.uses,
@@ -596,6 +612,7 @@ mod tests {
         assert_eq!(
             config.task("test").unwrap(),
             &Task {
+                description: None,
                 name: "test".into(),
                 weight: 4,
                 min_weight: None,
