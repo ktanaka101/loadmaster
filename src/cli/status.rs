@@ -3,7 +3,7 @@
 use crate::cli::run::name_group;
 use crate::*;
 use loadmaster::report::{Check, CheckResult};
-use loadmaster::usual::Usual;
+use loadmaster::usual::{self, Usual};
 
 pub(crate) fn status(args: StatusArgs) -> Result<i32> {
     let machine = MachineConfig::load()?;
@@ -37,10 +37,13 @@ pub(crate) fn status(args: StatusArgs) -> Result<i32> {
         .ok()
         .and_then(|cwd| RepoConfig::find(&cwd))
         .and_then(|config| config.parent().and_then(|dir| fs::canonicalize(dir).ok()));
-    let usual = Usual::load(&state_dir);
+    // One read of the end of the history, for both.
+    let entries = history::read_recent(&state_dir.join(HISTORY_FILE), usual::RECENT_BYTES)
+        .unwrap_or_default();
+    let usual = Usual::of(&entries);
     let recent = here
         .as_deref()
-        .map_or_else(Vec::new, |here| recent_checks(&state_dir, here));
+        .map_or_else(Vec::new, |here| recent_checks(&entries, here));
     if args.json {
         let others = queue::jobs_in_other_queues(&state_dir);
         let value = json::status(&json::Status {
@@ -356,12 +359,12 @@ const LATELY: Duration = Duration::from_secs(30 * 60);
 /// At most this many checks that ended lately are shown.
 const RECENT: usize = 5;
 
-/// The checks of `checkout` that ended lately, latest first.
-pub(crate) fn recent_checks(state_dir: &Path, checkout: &Path) -> Vec<Check> {
-    let entries = history::read_recent(&state_dir.join(HISTORY_FILE), 1 << 20).unwrap_or_default();
+/// The checks of `checkout` that ended lately, latest first, from the
+/// latest `entries` of the history.
+fn recent_checks(entries: &[history::Entry], checkout: &Path) -> Vec<Check> {
     let since = history::unix_ms(SystemTime::now() - LATELY);
     let checkout = checkout.to_string_lossy();
-    let mut checks: Vec<Check> = report::checks(&entries)
+    let mut checks: Vec<Check> = report::checks(entries)
         .into_iter()
         .filter(|c| c.checkout == checkout && c.end() >= since)
         .collect();

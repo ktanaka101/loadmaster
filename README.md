@@ -699,7 +699,9 @@ written, briefly, in the same words each time.
 
   `LOADMASTER_QUIET=1` leaves out the lines that only inform (started,
   waiting, ended), so the task's stderr passes through as it is; what asks
-  for action is always said.
+  for action is always said. It is for scripts, not agents: a tool that ends
+  a command silent for a while (Gemini CLI's shell, after 5 minutes) would
+  end a quiet one that waits that long.
 - `status`: the capacity and what is in use, resources, the load average,
   the CPU busy beyond what running jobs got, jobs in the queue of a version
   up to 0.11, then one line per job in line order: its state, task, cores or

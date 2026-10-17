@@ -12,7 +12,7 @@ use crate::report::{self, CheckResult};
 
 /// The latest part of the log that is read: enough for usual times, at a
 /// cost that does not grow with the log.
-const RECENT_BYTES: u64 = 4 << 20;
+pub const RECENT_BYTES: u64 = 4 << 20;
 
 /// Fewer passed runs than this say too little to be called usual.
 const LEAST_RUNS: usize = 3;
