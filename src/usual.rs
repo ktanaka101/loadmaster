@@ -176,6 +176,7 @@ mod tests {
             stopped: false,
             granted: None,
             min_weight: None,
+            sizes_itself: false,
             uses: BTreeMap::new(),
             limits: BTreeMap::new(),
         }

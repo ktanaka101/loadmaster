@@ -369,7 +369,15 @@ fn recent_checks(entries: &[history::Entry], checkout: &Path, queued: &[Job]) ->
     let mut checks: Vec<Check> = report::checks(entries)
         .into_iter()
         .filter(|c| c.checkout == checkout && c.end() >= since)
-        .filter(|c| !queued.iter().any(|job| job.id == c.job))
+        .filter(|c| {
+            // The same job: its ID, checkout and time in line (an ID can come
+            // back in a queue made anew).
+            !queued.iter().any(|job| {
+                job.id == c.job
+                    && job.checkout.to_string_lossy() == c.checkout
+                    && history::unix_ms(job.enqueued_at).abs_diff(c.queued_at) <= 1_000
+            })
+        })
         .collect();
     checks.sort_by_key(|c| std::cmp::Reverse(c.end()));
     checks.truncate(RECENT);

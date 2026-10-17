@@ -48,6 +48,8 @@ pub struct Check {
     pub granted: Option<u32>,
     /// The least cores it may start with, if fewer than its weight.
     pub min_weight: Option<u32>,
+    /// Whether it sizes itself by its cores (see [`Entry::sizes_itself`]).
+    pub sizes_itself: bool,
     /// The resources it used, by name.
     pub uses: BTreeMap<String, u32>,
     /// Their limits, as it got in line with them.
@@ -186,6 +188,7 @@ fn join(first: &Entry, last: &Entry) -> Check {
         machine_busy: last.machine_busy,
         granted: last.granted,
         min_weight: last.min_weight,
+        sizes_itself: last.sizes_itself,
         uses: last.uses.clone(),
         limits: last.limits.clone(),
         exit_code: last.exit_code,
@@ -863,8 +866,21 @@ pub fn format_time(unix_ms: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A passed check of weight `weight` that ran `run_ms` using `cpu_ms`.
+    pub(crate) fn check_for_tune(weight: u32, run_ms: u64, cpu_ms: u64) -> Check {
+        let entry = Entry {
+            run_ms: Some(run_ms),
+            cpu_ms: Some(cpu_ms),
+            weight,
+            ok: Some(true),
+            exit_code: Some(0),
+            ..entry(1, "test", Outcome::Exited, 0, 0)
+        };
+        checks(&[entry]).remove(0)
+    }
 
     fn entry(job: i64, task: &str, outcome: Outcome, queued_at: u64, wait_ms: u64) -> Entry {
         Entry {
@@ -891,6 +907,7 @@ mod tests {
             stopped: false,
             granted: None,
             min_weight: None,
+            sizes_itself: false,
             uses: BTreeMap::new(),
             limits: BTreeMap::new(),
         }

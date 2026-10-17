@@ -102,7 +102,10 @@ impl Arrival {
             task: check.task.clone(),
             setting: TaskSetting {
                 weight: check.weight,
-                min_weight: check.min_weight,
+                // One as high as its weight still says it sizes itself.
+                min_weight: check
+                    .min_weight
+                    .or(check.sizes_itself.then_some(check.weight)),
             },
             uses: check.uses.clone(),
             limits: check.limits.clone(),
@@ -448,6 +451,28 @@ mod tests {
         };
         assert_eq!(unmeasured.run_with(4, consents), 200_000);
         assert_eq!(unmeasured.busy_with(4, 200_000, consents), 4.0);
+    }
+
+    #[test]
+    fn a_record_that_sizes_itself_runs_longer_on_fewer_cores() {
+        // Recorded with min_weight = weight = 8: the record says it sizes
+        // itself; replayed on 4 cores it takes longer.
+        let check = Check {
+            sizes_itself: true,
+            ..crate::report::tests::check_for_tune(8, 100_000, 400_000)
+        };
+        let a = Arrival::of(&check, &mut crate::config::Workloads::default()).unwrap();
+        let out = replay(&[a], 4, "/elsewhere", &Settings::new());
+        assert_eq!(out.turnarounds, [150_000]);
+        let fixed = Check {
+            sizes_itself: false,
+            ..check
+        };
+        let a = Arrival::of(&fixed, &mut crate::config::Workloads::default()).unwrap();
+        assert_eq!(
+            replay(&[a], 4, "/elsewhere", &Settings::new()).turnarounds,
+            [100_000]
+        );
     }
 
     #[test]

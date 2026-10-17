@@ -110,6 +110,11 @@ pub struct Record<'a> {
     /// `min_weight`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_weight: Option<u32>,
+    /// The task declares a `min_weight`, so it sizes itself by
+    /// LOADMASTER_WEIGHT: also one as high as its weight, which `min_weight`
+    /// leaves out. What a replay with fewer cores needs.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sizes_itself: bool,
     /// The resources the task used, by name, so runs of one task with
     /// different settings can be told apart.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -152,6 +157,8 @@ pub struct Entry {
     pub granted: Option<u32>,
     #[serde(default)]
     pub min_weight: Option<u32>,
+    #[serde(default)]
+    pub sizes_itself: bool,
     #[serde(default)]
     pub uses: BTreeMap<String, u32>,
     #[serde(default)]
@@ -266,6 +273,7 @@ mod tests {
                 stopped: false,
                 granted: None,
                 min_weight: None,
+                sizes_itself: false,
                 uses: BTreeMap::new(),
                 limits: BTreeMap::new(),
             };
@@ -318,6 +326,7 @@ mod tests {
             stopped: false,
             granted: None,
             min_weight: None,
+            sizes_itself: false,
             uses: BTreeMap::from([("db".to_owned(), 1)]),
             limits: BTreeMap::new(),
         };
@@ -387,6 +396,7 @@ mod tests {
                 stopped: false,
                 granted: None,
                 min_weight: None,
+                sizes_itself: false,
                 uses: BTreeMap::from([("db".to_owned(), 1)]),
                 limits: BTreeMap::new(),
             }

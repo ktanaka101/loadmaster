@@ -410,6 +410,11 @@ impl Workloads {
             .entry(path.to_owned())
             .or_insert_with(|| {
                 let path = Path::new(path);
+                // One that is gone is known by its path, not by a config
+                // that survives in a parent of it.
+                if !path.exists() {
+                    return path.display().to_string();
+                }
                 let checkout = RepoConfig::find(path)
                     .and_then(|config| config.parent().map(Path::to_owned))
                     .and_then(|dir| std::fs::canonicalize(dir).ok());
@@ -721,6 +726,9 @@ mod workload_tests {
             workloads.of(None, &main.join("src").display().to_string()),
             common
         );
+        // One that is gone, though a parent's config survives.
+        let gone = main.join("gone/sub").display().to_string();
+        assert_eq!(workloads.of(None, &gone), gone);
     }
 }
 

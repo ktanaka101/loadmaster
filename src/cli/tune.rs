@@ -35,19 +35,22 @@ pub(crate) fn tune(args: TuneArgs) -> Result<i32> {
     let ours = arrivals.iter().filter(|a| a.workload == workload).count();
     // The scenarios: as configured, with measured weights, with the
     // agent's own changes, which are checked first, whatever the history.
+    // As the config declares them: the replay caps them at the capacity,
+    // as the machine counts them.
     let current: Settings = repo
         .tasks()
         .map(|t| {
             let setting = TaskSetting {
-                weight: t.weight.min(capacity),
-                min_weight: t.min_weight.map(|l| l.min(t.weight.min(capacity))),
+                weight: t.weight,
+                min_weight: t.min_weight,
             };
             (t.name.clone(), setting)
         })
         .collect();
-    let yours = match args.set.is_empty() {
-        true => None,
-        false => Some(with_changes(&current, &args.set, capacity)?),
+    let yours = if args.set.is_empty() {
+        None
+    } else {
+        Some(with_changes(&current, &args.set)?)
     };
     if arrivals.len() < LEAST_CHECKS || ours == 0 {
         let message = format!(
@@ -75,7 +78,7 @@ pub(crate) fn tune(args: TuneArgs) -> Result<i32> {
     for (task, setting) in &mut measured {
         if let Some((weight, p90, runs)) =
             tune::measured_weight(&arrivals, &workload, task, capacity)
-            && weight != setting.weight
+            && weight != setting.weight.min(capacity)
         {
             // A min_weight above the new weight comes down with it.
             let least = setting.min_weight.filter(|&l| l > weight).map(|_| weight);
@@ -264,7 +267,7 @@ struct Change {
 
 /// `current` with the agent's `--set task.key=value` changes, all applied
 /// before the result is checked.
-fn with_changes(current: &Settings, sets: &[String], capacity: u32) -> Result<Settings> {
+fn with_changes(current: &Settings, sets: &[String]) -> Result<Settings> {
     let mut settings = current.clone();
     for set in sets {
         let invalid = |why: &str| {
@@ -286,7 +289,7 @@ fn with_changes(current: &Settings, sets: &[String], capacity: u32) -> Result<Se
                 .ok_or_else(|| invalid("the value must be a whole number, 1 or more"))
         };
         match field {
-            "weight" => setting.weight = number()?.min(capacity),
+            "weight" => setting.weight = number()?,
             "min_weight" if value.trim() == "none" => setting.min_weight = None,
             "min_weight" => setting.min_weight = Some(number()?),
             _ => return Err(invalid(&format!("`{field}` cannot be tuned"))),

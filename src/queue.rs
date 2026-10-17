@@ -1109,6 +1109,8 @@ fn record(job: &Job, outcome: Outcome, waited_until: SystemTime) -> Record<'_> {
         stopped: false,
         granted: job.granted.filter(|&granted| granted < job.weight),
         min_weight: job.min_weight.filter(|&least| least < job.weight),
+        // Whether its task declared one is not in the queue.
+        sizes_itself: false,
         uses: job
             .uses
             .iter()

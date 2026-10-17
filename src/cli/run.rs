@@ -121,6 +121,7 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
         stopped: false,
         granted: None,
         min_weight: (min_weight < task.weight).then_some(min_weight),
+        sizes_itself: task.min_weight.is_some(),
         uses: task.uses.clone(),
         limits: queue::limits(&uses),
     };

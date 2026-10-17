@@ -116,6 +116,8 @@ fn tune_says_when_there_is_too_little_to_replay_and_refuses_bad_changes() {
     for sets in [
         ["test.weight=2", "test.min_weight=1"],
         ["test.min_weight=1", "test.weight=2"],
+        // As declared, above the capacity of 4: valid, counted as 4.
+        ["test.weight=8", "test.min_weight=8"],
     ] {
         let output = sandbox.run(&["tune", "--set", sets[0], "--set", sets[1]]);
         assert!(output.status.success(), "{sets:?}: {}", stderr(&output));
