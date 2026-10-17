@@ -530,6 +530,11 @@ mod tests {
     fn wait_misread(received: &[i32], canceled: Option<i32>) -> ExitStatus {
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
+        // Whatever this test process inherited, as a task gets its stop
+        // signal.
+        for &signal in received.iter().chain(&canceled) {
+            deliver_stop_signal(&mut cmd, signal);
+        }
         let mut task = spawn(&mut cmd, |_| Ok::<(), ()>(())).unwrap();
         task.group.leader_start_time = task.group.leader_start_time.map(|t| t + 1);
         let signals = Signals {

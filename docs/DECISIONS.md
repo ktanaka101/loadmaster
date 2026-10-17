@@ -149,8 +149,9 @@ it has been waited for, the group is checked by its leader's start time,
 so a group ID the OS has reused for someone else after the task ended is
 not signalled. Up to 0.15.1 that check was made every time: a start time
 misread while the task ran would have dropped the signal without a word,
-the one way a signal for a running task could be lost (suspected when a
-test of Ctrl-C timed out once on a macOS Intel runner; never reproduced).
+one way a signal for a running task could be lost, closed in case it
+was the one behind a test of Ctrl-C that timed out once on a macOS Intel
+runner (never reproduced, and not explained).
 One theoretical gap remains: if, after the leader was reaped, the group ID were reused by a new
 group whose own leader had also already exited, that group's remaining
 members would look like ours. That needs the PID space to wrap around within

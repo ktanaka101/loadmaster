@@ -7,6 +7,7 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use common::*;
+use loadmaster::process::ProcessId;
 
 /// `task` (from [`sh_task`]) stopped with `signal`.
 fn stopped_with(task: String, signal: &str) -> String {
@@ -48,19 +49,19 @@ fn run_hold(sandbox: &Sandbox) -> Child {
 
 /// Waits until the task of a [`logging_sandbox`] has logged `n` signals or
 /// more (more fails the test's own check of the log, not a wait), else says
-/// what it logged, whether it and `loadmaster` still run, and what that said.
+/// what it logged, whether a process with its PID still runs (a zombie does
+/// not), whether `loadmaster` does, and what that said.
 fn wait_for_signals(sandbox: &Sandbox, runner: &mut Child, n: usize) {
     let deadline = Instant::now() + TIMEOUT;
     while sandbox.read("signals").lines().count() < n {
         if Instant::now() >= deadline {
-            let task: Option<libc::pid_t> = sandbox.read("hold.pid").trim().parse().ok();
-            // SAFETY: signal 0 only checks that the process exists.
-            let task_runs = task.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
+            let task: Option<u32> = sandbox.read("hold.pid").trim().parse().ok();
+            let task_runs = task.is_some_and(|pid| matches!(ProcessId::of(pid), Ok(Some(_))));
             panic!(
-                "the task logged {:?}, not {n} signals; it {} ({task:?}); loadmaster {:?}, \
-                 and said: {:?}",
+                "the task logged {:?}, not {n} signals; a process with its PID ({task:?}) \
+                 {}; loadmaster {:?}, and said: {:?}",
                 sandbox.read("signals"),
-                if task_runs { "runs" } else { "is gone" },
+                if task_runs { "runs" } else { "does not run" },
                 runner.try_wait(),
                 sandbox.read("hold.err"),
             );
