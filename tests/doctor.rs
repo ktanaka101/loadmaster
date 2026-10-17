@@ -123,3 +123,33 @@ fn a_state_directory_it_may_not_write_is_a_problem() {
     );
     assert!(out.contains("  fix: allow writing to "), "{out}");
 }
+
+#[test]
+fn a_repository_whose_scripts_go_through_loadmaster_needs_no_instruction() {
+    let sandbox = Sandbox::new(4, &sh_task("test", 1, "true"));
+    let home = sandbox.path("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        sandbox.repo.join("package.json"),
+        r#"{"scripts": {"test": "loadmaster run test"}}"#,
+    )
+    .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&doctor(&sandbox, &home, &["--json"]).stdout).unwrap();
+    let found = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["check"] == "instructions")
+        .unwrap()
+        .clone();
+    assert_eq!(found["level"], "ok", "{json:#}");
+    assert!(
+        found["message"]
+            .as_str()
+            .unwrap()
+            .contains("package.json runs checks through loadmaster"),
+        "{json:#}"
+    );
+    assert_eq!(found["fix"], serde_json::Value::Null);
+}

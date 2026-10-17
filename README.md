@@ -738,7 +738,11 @@ written, briefly, in the same words each time.
   (its sandbox's `allowWrite` across the user, project, local and managed
   files, its Bash timeout against `LOADMASTER_MAX_WAIT`), Codex's config
   (its sandbox mode, writable roots or permission profile), and whether the
-  repository's `AGENTS.md` or `CLAUDE.md` tells agents of loadmaster. Each
+  repository's `AGENTS.md` or `CLAUDE.md` tells agents of loadmaster, unless
+  its own commands already go through it (`loadmaster run` or `loadmaster
+  held` in `package.json`, a `Makefile`, a `justfile`, a `Taskfile`,
+  `mise.toml` or `deno.json`): an agent that runs those needs no
+  instruction. Each
   finding is `problem` (something this process could not do; exit code 1),
   `note` (something a settings file suggests; settings have layers and
   defaults a file does not show), `unknown` or `ok`, with the fix: the file

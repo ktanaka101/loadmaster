@@ -47,7 +47,11 @@ terminal.
   Run by the agent's own tool, `doctor`'s probe of the state directory is the
   sure test of its sandbox. It edits no other tool's settings: it prints the
   file and the snippet, which the agent applies under its owner's
-  permissions.
+  permissions. Nor does it ask for a change that is not needed: a repository
+  whose own commands go through loadmaster (`loadmaster run` or `held` in
+  `package.json`, a `Makefile` and the like) needs no instruction line, since
+  an agent that runs them is in the queue without knowing (clew's are;
+  0.16.0 still told it to add the line).
 - **`tune` is a scenario, not a recommendation to act on blindly.** It
   replays this machine's history through the admission rule itself, with
   the current settings, with measured weights, and with an agent's own
@@ -85,6 +89,12 @@ terminal.
   first user's machine, 6 were of its main checkout and 89 of its
   repository. Records of 0.15 and before have no workload, and are matched
   where their checkout still exists; those of deleted worktrees are not.
+  A `tune --dir TEXT` that took every record from a matching path for the
+  repository's was asked for (clew deletes a worktree with each merge, so
+  149 of its 4352 checks were matched) and not added: in `report`, `--dir`
+  narrows what is counted, while here it would claim checks, those of any
+  repository whose path holds the text too, and the need passes within days
+  as 0.16's records, which carry their workload, build up.
 - **`same checkout`, not "yours".** Several agents can work in one checkout,
   and `cancel --here` stops all their jobs: the mark says what is known.
 

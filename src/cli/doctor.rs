@@ -63,7 +63,16 @@ pub(crate) fn doctor(args: DoctorArgs) -> Result<i32> {
             .map(|name| repo.dir().join(name))
             .filter_map(|path| Some((path.clone(), fs::read_to_string(&path).ok()?)))
             .collect();
-        findings.push(doctor::instructions(repo.dir(), &files));
+        let entry_points: Vec<(PathBuf, String)> = doctor::ENTRY_POINTS
+            .iter()
+            .map(|name| repo.dir().join(name))
+            .filter_map(|path| Some((path.clone(), fs::read_to_string(&path).ok()?)))
+            .collect();
+        findings.push(doctor::instructions(
+            repo.dir(),
+            &files,
+            doctor::routed(&entry_points),
+        ));
     }
     findings.sort_by_key(|f| f.level);
     let problems = findings

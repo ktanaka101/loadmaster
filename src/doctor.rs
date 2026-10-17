@@ -310,9 +310,40 @@ pub fn codex(config: Option<(&Path, &str)>, state_dir: &Path, home: Option<&Path
     vec![finding]
 }
 
-/// Whether the repository's instruction files point agents at loadmaster.
-/// `files` are the ones found (`AGENTS.md`, `CLAUDE.md`) with their text.
-pub fn instructions(root: &Path, files: &[(PathBuf, String)]) -> Finding {
+/// The files a repository's own commands are defined in, where a check
+/// that goes through loadmaster says `loadmaster run` or `loadmaster held`.
+pub const ENTRY_POINTS: &[&str] = &[
+    "package.json",
+    "Makefile",
+    "GNUmakefile",
+    "makefile",
+    "justfile",
+    "Justfile",
+    ".justfile",
+    "Taskfile.yml",
+    "Taskfile.yaml",
+    "mise.toml",
+    ".mise.toml",
+    "deno.json",
+    "deno.jsonc",
+];
+
+/// Whether a repository's own commands route checks through loadmaster:
+/// the first of `entry_points` (those found, with their text) that runs a
+/// task with `loadmaster run` or guards one with `loadmaster held`.
+pub fn routed(entry_points: &[(PathBuf, String)]) -> Option<&Path> {
+    entry_points
+        .iter()
+        .find(|(_, text)| text.contains("loadmaster run") || text.contains("loadmaster held"))
+        .map(|(path, _)| path.as_path())
+}
+
+/// Whether agents are told to run checks through loadmaster, or need not
+/// be: `files` are the instruction files found (`AGENTS.md`, `CLAUDE.md`)
+/// with their text, `routed` the entry point that already routes checks
+/// through loadmaster (see [`routed`]), if any: an agent that runs the
+/// repository's own commands then goes through the queue without knowing.
+pub fn instructions(root: &Path, files: &[(PathBuf, String)], routed: Option<&Path>) -> Finding {
     const CHECK: &str = "instructions";
     const LINE: &str = "Run checks only through loadmaster: before running any, run `loadmaster \
                         guide` and follow it.";
@@ -321,6 +352,17 @@ pub fn instructions(root: &Path, files: &[(PathBuf, String)]) -> Finding {
             Level::Ok,
             CHECK,
             format!("{} tells agents of loadmaster", path.display()),
+        );
+    }
+    if let Some(path) = routed {
+        return Finding::new(
+            Level::Ok,
+            CHECK,
+            format!(
+                "{} runs checks through loadmaster, so an agent that uses it goes through the \
+                 queue without being told; no instruction is needed for those checks",
+                path.display()
+            ),
         );
     }
     let to = match files.first() {
@@ -454,7 +496,7 @@ mod tests {
             root.join("AGENTS.md"),
             "Run tests with npm test.".to_owned(),
         );
-        let found = instructions(root, std::slice::from_ref(&agents));
+        let found = instructions(root, std::slice::from_ref(&agents), None);
         assert_eq!(found.level, Level::Note);
         assert!(
             found
@@ -466,6 +508,37 @@ mod tests {
             root.join("CLAUDE.md"),
             "Use `loadmaster run test`.".to_owned(),
         );
-        assert_eq!(instructions(root, &[agents, told]).level, Level::Ok);
+        assert_eq!(instructions(root, &[agents, told], None).level, Level::Ok);
+    }
+
+    #[test]
+    fn entry_points_that_route_checks_through_the_queue_need_no_instruction() {
+        let root = Path::new("/repo");
+        let agents = (
+            root.join("AGENTS.md"),
+            "Run tests with npm test.".to_owned(),
+        );
+        let scripts = [
+            (
+                root.join("Makefile"),
+                "lint:\n\tnpx biome check .\n".to_owned(),
+            ),
+            (
+                root.join("package.json"),
+                r#"{"scripts": {"test": "loadmaster run test"}}"#.to_owned(),
+            ),
+        ];
+        let through = routed(&scripts);
+        assert_eq!(through, Some(root.join("package.json").as_path()));
+        let found = instructions(root, std::slice::from_ref(&agents), through);
+        assert_eq!(found.level, Level::Ok);
+        assert!(found.fix.is_none());
+        // A guard counts too; a file that calls the tools directly does not.
+        let guarded = [(
+            root.join("justfile"),
+            "e2e:\n  loadmaster held && npx playwright test\n".to_owned(),
+        )];
+        assert!(routed(&guarded).is_some());
+        assert_eq!(routed(&scripts[..1]), None);
     }
 }
