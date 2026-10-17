@@ -1,6 +1,6 @@
 [package]
 name = "loadmaster"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Weighted job admission for parallel AI agents"
