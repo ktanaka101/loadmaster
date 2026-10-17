@@ -28,7 +28,7 @@ fn a_task_that_may_start_with_fewer_cores_takes_what_is_left() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "1");
     assert!(
-        stderr(&output).contains("starting `some` with 1 of its 4 cores, the most that fit now"),
+        stderr(&output).contains("`some` started with 1 of its 4 cores, the most that fit now"),
         "{}",
         stderr(&output)
     );

@@ -22,7 +22,23 @@ fn output_and_arguments_pass_through() {
     );
     let output = sandbox.run(&["run", "io"]);
     assert_eq!(stdout(&output), "out\n");
-    assert_eq!(stderr(&output), "err\n");
+    // The task's stderr passes through; loadmaster's own lines, which say
+    // which job it was and how it ended, all start with its name.
+    let err = stderr(&output);
+    let (own, task): (Vec<&str>, Vec<&str>) = err
+        .lines()
+        .partition(|line| line.starts_with("loadmaster: "));
+    assert_eq!(task, ["err"]);
+    assert_eq!(own[0], "loadmaster: #1 `io` started", "{err}");
+    assert!(
+        own[1].starts_with("loadmaster: #1 `io` passed in ") && own[1].ends_with(" (exit 0)"),
+        "{err}"
+    );
+    assert_eq!(own.len(), 2, "{err}");
+    // Quiet: the task's stderr and nothing else.
+    let mut cmd = sandbox.cmd(&["run", "io"]);
+    cmd.env("LOADMASTER_QUIET", "1");
+    assert_eq!(stderr(&common::output(cmd)), "err\n");
 
     // No shell in between: arguments arrive exactly as given.
     let output = sandbox.run(&["run", "args", "--", "a b", "$HOME", "'q'", ""]);

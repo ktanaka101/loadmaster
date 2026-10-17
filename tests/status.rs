@@ -74,7 +74,8 @@ fn waiting_job_reports_progress_on_stderr() {
         .unwrap();
     wait_until("the waiting message", || {
         sandbox.read("waiter.err").contains(
-            "loadmaster: waiting to run `test` (weight 4, next in line) for all 4 cores (3 in use)",
+            "loadmaster: #2 `test` is waiting (weight 4, next in line) for all 4 cores (3 in use); \
+             running: #1 `hold` for ",
         )
     });
     sandbox.release("hold");
@@ -82,7 +83,7 @@ fn waiting_job_reports_progress_on_stderr() {
     assert!(
         sandbox
             .read("waiter.err")
-            .contains("loadmaster: starting `test` after waiting"),
+            .contains("loadmaster: #2 `test` started after waiting"),
         "{}",
         sandbox.read("waiter.err")
     );

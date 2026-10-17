@@ -29,7 +29,11 @@ fn rerun_after_max_wait_resumes_the_original_place() {
     assert_eq!(gave_up.status.code(), Some(75), "{}", stderr(&gave_up));
     assert!(started.elapsed() >= Duration::from_secs(1));
     assert!(
-        stderr(&gave_up).contains("run the same command again from this directory"),
+        stderr(&gave_up).contains(&format!(
+            "loadmaster: next: run `loadmaster run test --max-wait 1 -- a` again from {} \
+             within 120s: it resumes its place in line",
+            std::fs::canonicalize(&sandbox.repo).unwrap().display()
+        )),
         "{}",
         stderr(&gave_up)
     );
@@ -60,7 +64,7 @@ fn rerun_after_max_wait_resumes_the_original_place() {
     wait_until("the resume", || {
         sandbox
             .read("resumed.err")
-            .contains("resumed your place in line")
+            .contains("resumed its place in line")
     });
     let job = sandbox.job("test").unwrap();
     assert_eq!(job.id, parked.id, "kept the original place");

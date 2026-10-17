@@ -40,7 +40,6 @@ const EXIT_NOT_FOUND: i32 = 127;
 const MAX_WAIT_ENV: &str = "LOADMASTER_MAX_WAIT";
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Writes a line to stderr, ignoring errors: `eprintln!` would panic if stderr
 /// is a closed pipe (e.g. `loadmaster run test 2>&1 | head -1`).
@@ -48,6 +47,26 @@ macro_rules! say {
     ($($arg:tt)*) => {{
         let _ = writeln!(io::stderr(), $($arg)*);
     }};
+}
+
+/// [`say!`] for a line that only informs (a job started, waits, ended),
+/// which `LOADMASTER_QUIET` leaves out; what asks for action is always said.
+macro_rules! tell {
+    ($($arg:tt)*) => {{
+        if !crate::quiet() {
+            say!($($arg)*);
+        }
+    }};
+}
+
+/// Set (not empty, not `0`): `run` says only what asks for action
+/// (warnings, errors, giving up, `next:`), so the task's stderr passes
+/// through as it is.
+const QUIET_ENV: &str = "LOADMASTER_QUIET";
+
+fn quiet() -> bool {
+    static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *QUIET.get_or_init(|| env::var_os(QUIET_ENV).is_some_and(|v| !v.is_empty() && v != "0"))
 }
 
 // After `say!`, which the commands use.

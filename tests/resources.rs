@@ -81,8 +81,8 @@ fn a_lint_passes_an_e2e_run_waiting_for_a_database() {
     wait_for_waiting(&sandbox, "e2e");
     wait_until("the reason on stderr", || {
         sandbox.read("e2e.err").contains(
-            "loadmaster: waiting to run `e2e` (weight 2, next in line) for `db` \
-             (1 of 1 in use by #1 `e2e-hold`)\n",
+            "loadmaster: #2 `e2e` is waiting (weight 2, next in line) for `db` \
+             (1 of 1 in use by #1 `e2e-hold`); running: #1 `e2e-hold` for ",
         )
     });
 

@@ -64,7 +64,7 @@ fn jobs_start_with_fewer_cores_while_cpu_is_busy_outside_the_queue() {
     assert!(granted < cores, "LOADMASTER_WEIGHT={granted} of {cores}");
     assert!(
         stderr(&output).contains(&format!(
-            "starting `show` with {granted} of its {cores} cores, the most that fit now"
+            "`show` started with {granted} of its {cores} cores, the most that fit now"
         )),
         "{}",
         stderr(&output)

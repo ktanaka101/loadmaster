@@ -3,7 +3,18 @@
 
 use crate::cli::cancel::cancel_signal;
 use crate::cli::held::holder_here;
+use crate::cli::words::{self, who};
 use crate::*;
+use loadmaster::usual::Usual;
+
+/// A line at least this often while waiting: some agents' tools end a
+/// command that has said nothing for a while (Gemini CLI's shell, after 5
+/// minutes by default).
+const HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// What a job waits for can change often, as short jobs ahead come and go:
+/// a change is said at most this often.
+const CHANGE_GAP: Duration = Duration::from_secs(15);
 
 pub(crate) fn run(args: RunArgs) -> Result<i32> {
     let cwd = env::current_dir().map_err(|e| Error::io("cannot read the current directory", e))?;
@@ -66,6 +77,7 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
         stop_signal: task.stop_signal,
         asked_at: queued_at,
     };
+    let rerun = words::rerun(&task.name, args.max_wait, &args.args);
     let mut ticket = match enqueue_once_moved(
         &queue,
         &request,
@@ -73,12 +85,16 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
         task,
         (wait_started, max_wait),
         &signals,
+        (&rerun, &cwd),
     )? {
         Ok(ticket) => ticket,
         Err(code) => return Ok(code),
     };
     if ticket.resumed() {
-        say!("loadmaster: resumed your place in line for `{}`", task.name);
+        tell!(
+            "loadmaster: {} resumed its place in line",
+            who(ticket.id(), &task.name)
+        );
     }
 
     let mut record = Record {
@@ -118,19 +134,25 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
         let turn = if machine.measure_only {
             // Admitted whatever the capacity and place in line: the run
             // behaves as without loadmaster, and is only recorded.
-            ticket.admit_now().map(|()| Turn::Admitted)
+            ticket.admit_now().map(|()| Turn::Admitted { said: false })
         } else {
-            wait_turn(&ticket, task, (wait_started, max_wait), &signals)
+            wait_turn(
+                (&queue, &state_dir),
+                &ticket,
+                task,
+                (wait_started, max_wait),
+                &signals,
+            )
         };
         record.wait_ms = millis(wait_started.elapsed());
         match turn? {
-            Turn::Admitted => run_admitted(
+            Turn::Admitted { said } => run_admitted(
                 ticket,
                 &state_dir,
                 command,
                 task,
                 &signals,
-                wait_started,
+                (wait_started, said),
                 &mut record,
             ),
             Turn::GaveUp(wait) => {
@@ -146,7 +168,7 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
                         command,
                         task,
                         &signals,
-                        wait_started,
+                        (wait_started, true),
                         &mut record,
                     );
                 }
@@ -155,13 +177,16 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
                 log(&record);
                 logged = true;
                 say!(
-                    "loadmaster: gave up waiting to run `{}` after {} ({}); it waited for {}\n\
-                     loadmaster: your place in line is kept for {}s; \
-                     run the same command again from this directory to resume",
-                    task.name,
+                    "loadmaster: {} gave up after waiting {} ({}) {} (exit {EXIT_GAVE_UP})",
+                    who(record.job, &task.name),
                     format_duration(wait_started.elapsed()),
                     format_ahead(wait.ahead),
-                    wait.waits_for(),
+                    words::waits_for(&wait, None, &Usual::default()),
+                );
+                say!(
+                    "loadmaster: next: run `{rerun}` again from {} within {}s: it resumes its \
+                     place in line",
+                    cwd.display(),
                     PARK_TTL.as_secs(),
                 );
                 Ok(EXIT_GAVE_UP)
@@ -182,6 +207,11 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
             record.exit_code = Some(*code);
             if record.outcome == Outcome::Exited && record.signal.is_none() {
                 record.ok = Some(task.ok_exit_codes.contains(code));
+            }
+            let ran = record.run_ms.map(Duration::from_millis);
+            let line = words::ended(&record, *code, ran);
+            if !line.is_empty() {
+                tell!("loadmaster: {line}");
             }
             if record.outcome == Outcome::Exited
                 && let Some(note) = saturated_note(&record)
@@ -230,7 +260,10 @@ fn resource_uses(repo: &RepoConfig, task: &Task, machine: &MachineConfig) -> Vec
 }
 
 enum Turn {
-    Admitted,
+    /// Its turn came; `said` if it said it waited.
+    Admitted {
+        said: bool,
+    },
     GaveUp(Wait),
     Interrupted(i32),
 }
@@ -239,7 +272,7 @@ enum Turn {
 /// protocol: while jobs of 0.12 to 0.14 finish in it, nothing gets in (see
 /// [`Error::QueueMoving`]). Gives up as `--max-wait` says, counted from
 /// `started`, or on a signal, with the exit code to end with: no place was
-/// kept.
+/// kept, so `rerun`, from `dir`, gets in line anew.
 fn enqueue_once_moved<'q>(
     queue: &'q Queue,
     request: &JobRequest,
@@ -247,8 +280,9 @@ fn enqueue_once_moved<'q>(
     task: &Task,
     (started, max_wait): (Instant, Option<Duration>),
     signals: &Signals,
+    (rerun, dir): (&str, &Path),
 ) -> Result<std::result::Result<Ticket<'q>, i32>> {
-    let mut last_report: Option<Instant> = None;
+    let mut said: Option<Instant> = None;
     loop {
         match queue.enqueue(request, owner) {
             Err(Error::QueueMoving { left }) => {
@@ -257,23 +291,27 @@ fn enqueue_once_moved<'q>(
                 }
                 if max_wait.is_some_and(|max| started.elapsed() >= max) {
                     say!(
-                        "loadmaster: gave up waiting to run `{}` after {}: the queue is still \
+                        "loadmaster: `{}` gave up after {}, not yet in line: the queue is still \
                          moving to the admission protocol of 0.15 ({left} job(s) of loadmaster \
-                         0.12 to 0.14 left); no place in line was kept, run the same command \
-                         again",
+                         0.12 to 0.14 left) (exit {EXIT_GAVE_UP}); no place in line was kept",
                         task.name,
                         format_duration(started.elapsed())
                     );
+                    say!(
+                        "loadmaster: next: run `{rerun}` again from {}: it gets in line anew \
+                         once the queue has moved",
+                        dir.display()
+                    );
                     return Ok(Err(EXIT_GAVE_UP));
                 }
-                if last_report.is_none_or(|at| at.elapsed() >= REPORT_INTERVAL) {
-                    say!(
-                        "loadmaster: waiting to get `{}` in line: the queue is moving to the \
+                if said.is_none_or(|at| at.elapsed() >= HEARTBEAT) {
+                    tell!(
+                        "loadmaster: `{}` is waiting to get in line: the queue is moving to the \
                          admission protocol of 0.15, once the {left} job(s) of loadmaster 0.12 \
                          to 0.14 in it are done (give every agent 0.15 or later)",
                         task.name
                     );
-                    last_report = Some(Instant::now());
+                    said = Some(Instant::now());
                 }
                 thread::sleep(POLL_INTERVAL);
             }
@@ -283,34 +321,34 @@ fn enqueue_once_moved<'q>(
 }
 
 /// Waits for `ticket`'s turn, until `--max-wait` has passed since `started`.
+/// Says so when it starts waiting, when what it waits for or who holds it
+/// changes, and at least every [`HEARTBEAT`]: with who holds what it waits
+/// for, for how long, and how long they usually run (from the history in
+/// `state_dir`).
 fn wait_turn(
+    (queue, state_dir): (&Queue, &Path),
     ticket: &Ticket,
     task: &Task,
     (started, max_wait): (Instant, Option<Duration>),
     signals: &Signals,
 ) -> Result<Turn> {
-    let mut last_report: Option<Instant> = None;
+    let who = who(ticket.id(), &task.name);
+    // When the last line was said, and what about.
+    let mut said: Option<(Instant, String)> = None;
+    let mut usual: Option<Usual> = None;
     loop {
         if let Some(&signal) = signals.take().first() {
             return Ok(Turn::Interrupted(signal));
         }
         if let Some(kill) = ticket.cancel_requested()? {
-            say!(
-                "loadmaster: `{}` was canceled with `loadmaster cancel` while it waited",
-                task.name
-            );
+            say!("loadmaster: {who} was canceled with `loadmaster cancel` while it waited");
             return Ok(Turn::Interrupted(cancel_signal(kill, task)));
         }
         match ticket.try_admit()? {
             Admission::Admitted => {
-                if last_report.is_some() {
-                    say!(
-                        "loadmaster: starting `{}` after waiting {}",
-                        task.name,
-                        format_duration(started.elapsed())
-                    );
-                }
-                return Ok(Turn::Admitted);
+                return Ok(Turn::Admitted {
+                    said: said.is_some(),
+                });
             }
             Admission::Waiting(wait) => {
                 if max_wait.is_some_and(|max| started.elapsed() >= max) {
@@ -321,15 +359,25 @@ fn wait_turn(
                     }
                     return Ok(Turn::GaveUp(wait));
                 }
-                if last_report.is_none_or(|at| at.elapsed() >= REPORT_INTERVAL) {
-                    say!(
-                        "loadmaster: waiting to run `{}` (weight {}, {}) for {}",
-                        task.name,
+                let about = words::wait_key(&wait);
+                let due = said.as_ref().is_none_or(|(at, last)| {
+                    at.elapsed() >= HEARTBEAT || (*last != about && at.elapsed() >= CHANGE_GAP)
+                });
+                if due {
+                    let usual = usual.get_or_insert_with(|| Usual::load(state_dir));
+                    // For who holds it; without, the line still says what.
+                    let snapshot = queue.snapshot().ok();
+                    let what = words::waits_for(&wait, snapshot.as_ref(), usual);
+                    let state = match said {
+                        None => "is waiting".to_owned(),
+                        Some(_) => format!("has waited {}", format_duration(started.elapsed())),
+                    };
+                    tell!(
+                        "loadmaster: {who} {state} (weight {}, {}) {what}",
                         task.weight,
                         format_ahead(wait.ahead),
-                        wait.waits_for(),
                     );
-                    last_report = Some(Instant::now());
+                    said = Some((Instant::now(), about));
                 }
             }
         }
@@ -343,33 +391,36 @@ fn run_admitted(
     mut command: Command,
     task: &Task,
     signals: &Signals,
-    wait_started: Instant,
+    (wait_started, said): (Instant, bool),
     record: &mut Record,
 ) -> Result<i32> {
     if let Some(&signal) = signals.take().first() {
         record.outcome = Outcome::Interrupted;
         return Ok(128 + signal);
     }
+    let who = who(ticket.id(), &task.name);
     if let Some(kill) = ticket.cancel_requested()? {
-        say!(
-            "loadmaster: `{}` was canceled with `loadmaster cancel`",
-            task.name
-        );
+        say!("loadmaster: {who} was canceled with `loadmaster cancel`");
         record.outcome = Outcome::Interrupted;
         return Ok(128 + cancel_signal(kill, task));
     }
-    // Fewer cores than its weight, which it may start with (its min_weight,
-    // or CPU busy outside the queue): the task sizes its parallelism by them.
+    // Fewer cores than its weight, which it may start with (its min_weight):
+    // the task sizes its parallelism by them.
     let granted = ticket.granted()?;
+    let mut start = format!("loadmaster: {who} started");
     if granted < task.weight {
-        say!(
-            "loadmaster: starting `{}` with {granted} of its {} cores, the most that fit now \
-             ({WEIGHT_ENV}={granted})",
-            task.name,
+        start += &format!(
+            " with {granted} of its {} cores, the most that fit now ({WEIGHT_ENV}={granted})",
             task.weight
         );
         record.granted = Some(granted);
     }
+    // Said whenever it said it waited, so the lines agree.
+    let waited = wait_started.elapsed();
+    if said || waited >= Duration::from_secs(1) {
+        start += &format!(" after waiting {}", format_duration(waited));
+    }
+    tell!("{start}");
     command
         .env(HELD_ENV, ticket.id().to_string())
         .env(WEIGHT_ENV, granted.to_string())
@@ -409,8 +460,7 @@ fn run_admitted(
             return None;
         }
         say!(
-            "loadmaster: `{}` was canceled with `loadmaster cancel`; sending it {}",
-            task.name,
+            "loadmaster: {who} was canceled with `loadmaster cancel`; sending it {}",
             runner::signal_name(cancel_signal(kill, task))
         );
         // SIGTERM asks to stop: the forwarder sends the task's stop signal.
