@@ -93,6 +93,17 @@ impl ProcessGroup {
         }
     }
 
+    /// [`ProcessGroup::is_alive`] for a group whose leader is a child of
+    /// this process not yet waited for: its PID, the group's ID, is not
+    /// handed out again until then, so a running leader is the task's
+    /// without a look at its start time, and so is any member.
+    pub fn is_alive_unwaited(&self) -> bool {
+        match start_time(self.pgid) {
+            Ok(Some(_)) | Err(_) => true,
+            Ok(None) => has_running_member(self.pgid).unwrap_or(true),
+        }
+    }
+
     /// Whether the group's leader, the task's own command, is known to have
     /// exited. False if its start time was never read.
     pub fn leader_exited(&self) -> bool {
@@ -968,6 +979,32 @@ mod tests {
             leader_start_time: Some(init.start_time + 1),
         };
         assert!(!dead_group.is_alive());
+    }
+
+    #[test]
+    fn a_group_whose_leader_is_not_waited_for_is_ours_whatever_its_start_time() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // Its start time misread: by it, the leader would be another process.
+        let start_time = ProcessId::of(leader.id()).unwrap().unwrap().start_time;
+        let group = ProcessGroup {
+            pgid: leader.id(),
+            leader_start_time: Some(start_time + 1),
+        };
+        assert!(!group.is_alive());
+        assert!(group.is_alive_unwaited());
+        leader.kill().unwrap();
+        // A zombie runs nothing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while group.is_alive_unwaited() {
+            assert!(std::time::Instant::now() < deadline, "the group never died");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        leader.wait().unwrap();
     }
 
     /// A thread-group leader that called pthread_exit shows as a zombie on

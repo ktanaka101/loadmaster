@@ -333,12 +333,24 @@ fn signal_group(group: &ProcessGroup, signal: i32) -> bool {
 /// [`signal_group`], if the group still has running members, after a look
 /// at the task's processes: one it started since the last look, in a session
 /// of its own, is found only through its parent, which the signal may end
-/// (as Playwright exits on SIGTERM, leaving its `webServer`). Checked after
-/// the look, which takes a while, so a group ID the OS has reused meanwhile
-/// is never hit.
-fn signal_looked(group: &ProcessGroup, descendants: &mut Descendants, signal: i32) -> bool {
+/// (as Playwright exits on SIGTERM, leaving its `webServer`). While its
+/// leader has not been waited for (`unwaited`), the group is the task's for
+/// certain (see [`ProcessGroup::is_alive_unwaited`]); once it has, it is
+/// checked after the look, which takes a while, so a group ID the OS has
+/// reused meanwhile is never hit.
+fn signal_looked(
+    group: &ProcessGroup,
+    descendants: &mut Descendants,
+    signal: i32,
+    unwaited: bool,
+) -> bool {
     descendants.look(group);
-    group.is_alive() && signal_group(group, signal)
+    let alive = if unwaited {
+        group.is_alive_unwaited()
+    } else {
+        group.is_alive()
+    };
+    alive && signal_group(group, signal)
 }
 
 /// Waits for the task's leader to exit, forwarding intercepted signals to the
@@ -365,7 +377,7 @@ pub fn wait(
         let pending = signals.take();
         if !pending.is_empty() {
             forwarder.forward(pending, |signal| {
-                signal_looked(&task.group, descendants, signal)
+                signal_looked(&task.group, descendants, signal, exited.is_none())
             });
         }
         if let Some(status) = exited {
@@ -378,8 +390,9 @@ pub fn wait(
         if polls.is_multiple_of(CANCEL_CHECK_EVERY)
             && let Some(signal) = canceled(forwarder.stop_sent())
         {
+            // Not waited for yet: it had not exited when this poll began.
             forwarder.send_with(signal, |signal| {
-                signal_looked(&task.group, descendants, signal)
+                signal_looked(&task.group, descendants, signal, true)
             });
         }
         thread::sleep(CHILD_POLL_INTERVAL);
@@ -484,6 +497,71 @@ mod tests {
         assert!(marker.exists());
         assert_eq!(task.group.pgid, task.child.id());
         assert!(task.group.leader_start_time.is_some());
+    }
+
+    #[test]
+    fn a_signal_reaches_a_task_whose_leader_is_not_waited_for_whatever_its_start_time() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // Its start time misread: checked by it, the task gets nothing.
+        let start_time = ProcessId::of(leader.id()).unwrap().unwrap().start_time;
+        let group = ProcessGroup {
+            pgid: leader.id(),
+            leader_start_time: Some(start_time + 1),
+        };
+        let mut descendants = Descendants::default();
+        assert!(!signal_looked(
+            &group,
+            &mut descendants,
+            libc::SIGTERM,
+            false
+        ));
+        assert!(leader.try_wait().unwrap().is_none());
+        assert!(signal_looked(&group, &mut descendants, libc::SIGTERM, true));
+        assert_eq!(leader.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// A task whose leader's start time was misread, waited for with
+    /// `received` signals pending (no handler is installed) and `canceled`.
+    fn wait_misread(received: &[i32], canceled: Option<i32>) -> ExitStatus {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let mut task = spawn(&mut cmd, |_| Ok::<(), ()>(())).unwrap();
+        task.group.leader_start_time = task.group.leader_start_time.map(|t| t + 1);
+        let signals = Signals {
+            pending: INTERCEPTED_SIGNALS.map(|signal| {
+                (
+                    signal,
+                    Arc::new(AtomicBool::new(received.contains(&signal))),
+                )
+            }),
+        };
+        let mut forwarder = Forwarder::new(libc::SIGTERM);
+        let (status, _) = wait(
+            &mut task,
+            &signals,
+            &mut forwarder,
+            &mut Descendants::default(),
+            |_| canceled,
+        )
+        .unwrap();
+        status
+    }
+
+    #[test]
+    fn signals_reach_a_running_task_whatever_its_leaders_start_time() {
+        assert_eq!(
+            wait_misread(&[libc::SIGINT], None).signal(),
+            Some(libc::SIGINT)
+        );
+        assert_eq!(
+            wait_misread(&[], Some(libc::SIGTERM)).signal(),
+            Some(libc::SIGTERM)
+        );
     }
 
     #[test]

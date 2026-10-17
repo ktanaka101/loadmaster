@@ -141,10 +141,17 @@ because an inherited "ignore" would make the task's exit status unobtainable.
 Each intercepted signal has its own pending flag, so a SIGINT followed by a
 SIGHUP within one poll forwards both. Signals that arrive just as the task's
 main process exits, or while its slot is being released or handed over, are
-still forwarded to the rest of its group. Before forwarding, the group is
-checked by its leader's start time, so a group ID the OS has reused for
-someone else after the task ended is not signalled. One theoretical gap
-remains: if, after the leader was reaped, the group ID were reused by a new
+still forwarded to the rest of its group. While the leader has not been
+waited for, its PID, which is the group's ID, is not handed out again, so
+the group is the task's for certain and a signal needs only a running
+member (a leader that just exited and runs nothing is not stopped). Once
+it has been waited for, the group is checked by its leader's start time,
+so a group ID the OS has reused for someone else after the task ended is
+not signalled. Up to 0.15.1 that check was made every time: a start time
+misread while the task ran would have dropped the signal without a word,
+the one way a signal for a running task could be lost (suspected when a
+test of Ctrl-C timed out once on a macOS Intel runner; never reproduced).
+One theoretical gap remains: if, after the leader was reaped, the group ID were reused by a new
 group whose own leader had also already exited, that group's remaining
 members would look like ours. That needs the PID space to wrap around within
 milliseconds, so it is accepted rather than paid for with a more complex wait.
