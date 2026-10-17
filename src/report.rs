@@ -24,6 +24,8 @@ pub struct Check {
     pub task: String,
     /// The caller's directory (lossy).
     pub dir: String,
+    /// Its checkout (see [`Entry::checkout`]).
+    pub checkout: String,
     /// The extra arguments of its last run.
     pub args: Vec<String>,
     pub weight: u32,
@@ -46,6 +48,8 @@ pub struct Check {
     pub min_weight: Option<u32>,
     /// The resources it used, by name.
     pub uses: BTreeMap<String, u32>,
+    /// Their limits, as it got in line with them.
+    pub limits: BTreeMap<String, crate::history::Limit>,
     pub result: CheckResult,
 }
 
@@ -163,6 +167,7 @@ fn join(first: &Entry, last: &Entry) -> Check {
         job: last.job,
         task: last.task.clone(),
         dir: last.dir.clone(),
+        checkout: last.checkout().to_owned(),
         args: last.args.clone(),
         weight: last.weight,
         capacity: last.capacity,
@@ -176,6 +181,7 @@ fn join(first: &Entry, last: &Entry) -> Check {
         granted: last.granted,
         min_weight: last.min_weight,
         uses: last.uses.clone(),
+        limits: last.limits.clone(),
         result,
     }
 }
