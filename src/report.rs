@@ -50,6 +50,8 @@ pub struct Check {
     pub uses: BTreeMap<String, u32>,
     /// Their limits, as it got in line with them.
     pub limits: BTreeMap<String, crate::history::Limit>,
+    /// What its last run exited with.
+    pub exit_code: Option<i32>,
     pub result: CheckResult,
 }
 
@@ -75,7 +77,8 @@ pub enum CheckResult {
 }
 
 impl Check {
-    fn end(&self) -> u64 {
+    /// When it ended, in Unix milliseconds.
+    pub fn end(&self) -> u64 {
         self.queued_at + self.wait_ms + self.run_ms.unwrap_or(0)
     }
 }
@@ -182,6 +185,7 @@ fn join(first: &Entry, last: &Entry) -> Check {
         min_weight: last.min_weight,
         uses: last.uses.clone(),
         limits: last.limits.clone(),
+        exit_code: last.exit_code,
         result,
     }
 }

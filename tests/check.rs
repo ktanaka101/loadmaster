@@ -108,9 +108,13 @@ fn a_scenario_is_judged_as_the_queue_it_was_captured_from() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let out = stdout(&output);
     assert!(out.contains("#1 `hold` holds 3 cores\n"), "{out}");
-    let waits = "#2 `e2e` waits for all 4 cores (3 in use)";
-    assert!(out.contains(&format!("{waits}\n")), "{out}");
-    assert!(status.contains(waits), "{status}");
+    let waits = "waits for all 4 cores (3 in use)";
+    assert!(out.contains(&format!("#2 `e2e` {waits}\n")), "{out}");
+    assert!(status.contains("#2 waiting `e2e` "), "{status}");
+    assert!(
+        status.contains(&format!("next in line; {waits}\n")),
+        "{status}"
+    );
 }
 
 #[test]

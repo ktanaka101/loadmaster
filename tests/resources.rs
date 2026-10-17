@@ -116,11 +116,11 @@ fn one_e2e_run_per_checkout() {
             .contains("for `db` in its checkout (1 of 1 in use by #1 `e2e-hold`)")
     });
     let status = stdout(&sandbox.run(&["status"]));
-    assert!(status.contains("db: 1/2 in use\n"), "{status}");
+    assert!(status.contains("`db`: 1 of 2 in use\n"), "{status}");
+    assert!(status.contains("#3 waiting `e2e` "), "{status}");
     assert!(
         status.contains(
-            "why jobs wait:\n  #3 `e2e` waits for `db` in its checkout \
-             (1 of 1 in use by #1 `e2e-hold`)\n"
+            ": next in line; waits for `db` in its checkout (1 of 1 in use by #1 `e2e-hold`)\n"
         ),
         "{status}"
     );
@@ -176,9 +176,8 @@ fn status_shows_what_jobs_use() {
     let sandbox = sandbox("capacity = 1", log.path());
     let mut holder = hold_database(&sandbox);
     let status = stdout(&sandbox.run(&["status"]));
-    assert!(status.contains("db: 1/1 in use\n"), "{status}");
-    assert!(status.contains(" USES "), "{status}");
-    assert!(status.contains(" db=1 "), "{status}");
+    assert!(status.contains("`db`: 1 of 1 in use\n"), "{status}");
+    assert!(status.contains(", using `db`, for "), "{status}");
     sandbox.release("hold");
     assert!(wait(&mut holder).success());
 }
@@ -275,7 +274,8 @@ fn a_check_starts_beside_one_waiting_for_what_a_long_run_holds() {
 
     let status = stdout(&sandbox.run(&["status"]));
     assert!(
-        status.contains("#2 `unit` waits for `browser` (1 of 1 in use by #1 `ui`)\n"),
+        status.contains("#2 waiting `unit` ")
+            && status.contains("waits for `browser` (1 of 1 in use by #1 `ui`)\n"),
         "{status}"
     );
     let lint = sandbox.run(&["run", "lint", "--max-wait", "0"]);

@@ -2,6 +2,8 @@
 
 use crate::cli::run::name_group;
 use crate::*;
+use loadmaster::report::{Check, CheckResult};
+use loadmaster::usual::Usual;
 
 pub(crate) fn status(args: StatusArgs) -> Result<i32> {
     let machine = MachineConfig::load()?;
@@ -29,6 +31,16 @@ pub(crate) fn status(args: StatusArgs) -> Result<i32> {
     } else {
         Vec::new()
     };
+    // The checkout this is run from, if any: its jobs are marked, and what
+    // became of its latest checks is told.
+    let here = env::current_dir()
+        .ok()
+        .and_then(|cwd| RepoConfig::find(&cwd))
+        .and_then(|config| config.parent().and_then(|dir| fs::canonicalize(dir).ok()));
+    let usual = Usual::load(&state_dir);
+    let recent = here
+        .as_deref()
+        .map_or_else(Vec::new, |here| recent_checks(&state_dir, here));
     if args.json {
         let others = queue::jobs_in_other_queues(&state_dir);
         let value = json::status(&json::Status {
@@ -39,20 +51,23 @@ pub(crate) fn status(args: StatusArgs) -> Result<i32> {
             others: &others,
             explained: &explained,
             moving,
+            here: here.as_deref(),
+            usual: &usual,
+            recent: &recent,
         });
         print(&format!("{value:#}\n"));
         return Ok(0);
     }
     let mut out = format!(
-        "{}/{} in use (capacity {})\n",
-        snapshot.used(),
+        "capacity {} ({}): {} in use\n",
         machine.capacity,
-        machine.capacity_source
+        machine.capacity_source,
+        snapshot.used(),
     );
     for (name, used, capacity) in resources_in_use(&snapshot.jobs, &machine) {
         out += &match capacity {
-            Some(capacity) => format!("{name}: {used}/{capacity} in use\n"),
-            None => format!("{name}: {used} in use (no machine-wide limit)\n"),
+            Some(capacity) => format!("`{name}`: {used} of {capacity} in use\n"),
+            None => format!("`{name}`: {used} in use (no machine-wide limit)\n"),
         };
     }
     out += &load_line();
@@ -116,10 +131,10 @@ pub(crate) fn status(args: StatusArgs) -> Result<i32> {
     if snapshot.jobs.is_empty() {
         out += "no jobs\n";
     } else {
-        out += "\n";
-        out += &jobs_table(&snapshot.jobs);
-        out += &why_jobs_wait(&snapshot.jobs, &explained);
+        out += "\njobs, in line order:\n";
+        out += &job_lines(&snapshot.jobs, &explained, here.as_deref(), &usual);
     }
+    out += &recent_lines(&recent);
     print(&out);
     Ok(0)
 }
@@ -139,36 +154,6 @@ fn load_line() -> String {
                  processes waiting for disks count too";
     }
     line + "\n"
-}
-
-/// One line per waiting job: what the admission rule says it waits for.
-fn why_jobs_wait(jobs: &[Job], explained: &[(JobId, Admission, Option<u32>)]) -> String {
-    let lines: Vec<String> = explained
-        .iter()
-        .filter_map(|(id, admission, cores)| {
-            let job = jobs.iter().find(|job| job.id == *id)?;
-            if job.state != JobState::Waiting || job.measure_only {
-                return None;
-            }
-            let who = format!("#{id} `{}`", job.task);
-            Some(match (admission, cores) {
-                (Admission::Admitted, Some(cores)) if *cores < job.weight => {
-                    format!(
-                        "  {who} is about to start, with {cores} of its {} cores\n",
-                        job.weight
-                    )
-                }
-                (Admission::Admitted, _) => format!("  {who} is about to start\n"),
-                (Admission::Waiting(wait), _) => {
-                    format!("  {who} waits for {}\n", wait.waits_for())
-                }
-            })
-        })
-        .collect();
-    if lines.is_empty() {
-        return String::new();
-    }
-    format!("\nwhy jobs wait:\n{}", lines.concat())
 }
 
 /// Each machine-wide resource that any job uses: how much running jobs use,
@@ -217,99 +202,174 @@ pub(crate) fn shown_state(job: &Job) -> (&'static str, Option<SystemTime>) {
     }
 }
 
-fn jobs_table(jobs: &[Job]) -> String {
+/// One line per job, in line order: its state, task, what it holds or may
+/// start with, for how long (and how long it usually runs), where from, and
+/// what an agent needs to know of it: why it waits, until when a parked
+/// place is kept, what holds the slot of one whose loadmaster is gone.
+fn job_lines(
+    jobs: &[Job],
+    explained: &[(JobId, Admission, Option<u32>)],
+    here: Option<&Path>,
+    usual: &Usual,
+) -> String {
     let now = SystemTime::now();
-    let since = |t: Option<SystemTime>| {
-        t.and_then(|t| now.duration_since(t).ok())
-            .map_or_else(|| "-".to_owned(), format_duration)
-    };
-    let mut rows = vec![
-        [
-            "ID", "STATE", "TASK", "WEIGHT", "USES", "PID", "PGID", "FOR", "DIR",
-        ]
-        .map(String::from),
-    ];
-    let (mut orphaned, mut parked) = (false, false);
-    // Jobs whose task's command exited, and what holds their slot.
-    let mut lingering = Vec::new();
+    let mut out = String::new();
     for job in jobs {
         let (state, at) = shown_state(job);
-        match state {
-            "lingering" => {
-                if let Some(group) = job.child {
-                    lingering.push(format!(
-                        "  #{} `{}`: {}\n",
-                        job.id,
-                        job.task,
-                        name_group(&group)
-                    ));
-                }
+        let mut line = format!("#{} {state} `{}`", job.id, job.task);
+        line += &match job.granted.filter(|_| job.state == JobState::Running) {
+            Some(granted) if granted < job.weight => {
+                format!(" with {granted} of its {} cores", job.weight)
             }
-            "orphaned" => orphaned = true,
-            "parked" => parked = true,
-            _ => {}
+            Some(granted) => format!(" with {granted} core{}", plural(granted)),
+            None if job.least() < job.weight => {
+                format!(" (weight {}, from {})", job.weight, job.least())
+            }
+            None => format!(" (weight {})", job.weight),
+        };
+        if !job.uses.is_empty() {
+            let uses: Vec<String> = job
+                .uses
+                .iter()
+                .map(|u| match u.amount {
+                    1 => format!("`{}`", u.name),
+                    n => format!("{n} of `{}`", u.name),
+                })
+                .collect();
+            line += &format!(", using {}", uses.join(" and "));
         }
-        rows.push([
-            job.id.to_string(),
-            state.to_owned(),
-            job.task.clone(),
-            // "6 of 8": it started with fewer cores, for CPU busy outside.
-            match job.granted.filter(|&granted| granted < job.weight) {
-                Some(granted) => format!("{granted} of {}", job.weight),
-                None if job.state != JobState::Running && job.least() < job.weight => {
-                    format!("{} (from {})", job.weight, job.least())
+        if let Some(since) = at.and_then(|t| now.duration_since(t).ok()) {
+            line += &format!(", for {}", format_duration(since));
+        }
+        if job.state == JobState::Running
+            && let Some(usual) = usual.of_job(job)
+        {
+            line += &format!(" (usually {})", format_duration(usual.median));
+        }
+        line += &format!(", from {}", tilde(&job.dir));
+        if here == Some(job.checkout.as_path()) {
+            line += " (same checkout)";
+        }
+        let decision = explained.iter().find(|(id, _, _)| *id == job.id);
+        let why = match state {
+            "lingering" => job.child.map(|group| {
+                format!(
+                    "its command exited, but {} still runs and holds the slot; `loadmaster \
+                     cancel {}` stops it",
+                    name_group(&group),
+                    job.id
+                )
+            }),
+            "orphaned" => Some(
+                "its loadmaster is gone; the task still runs and holds the slot until its \
+                 process group exits"
+                    .to_owned(),
+            ),
+            "parked" => {
+                let left = job
+                    .parked_at
+                    .and_then(|at| (at + PARK_TTL).duration_since(now).ok())
+                    .unwrap_or_default();
+                Some(format!(
+                    "gave up waiting; its place is kept {} more for a re-run of the same \
+                     command from there",
+                    format_duration(left)
+                ))
+            }
+            "waiting" if job.measure_only => None,
+            "waiting" => decision.map(|(_, admission, cores)| match (admission, cores) {
+                (Admission::Admitted, Some(cores)) if *cores < job.weight => {
+                    format!("about to start, with {cores} of its {} cores", job.weight)
                 }
-                None => job.weight.to_string(),
-            },
-            if job.uses.is_empty() {
-                "-".to_owned()
-            } else {
-                job.uses
-                    .iter()
-                    .map(|u| format!("{}={}", u.name, u.amount))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            },
-            job.owner.map_or("-".to_owned(), |o| o.pid.to_string()),
-            job.child.map_or("-".to_owned(), |c| c.pgid.to_string()),
-            since(at),
-            job.dir.display().to_string(),
-        ]);
-    }
-    let widths: Vec<usize> = (0..rows[0].len())
-        .map(|col| {
-            rows.iter()
-                .map(|r| r[col].chars().count())
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    let mut out = String::new();
-    for row in &rows {
-        let cells: Vec<String> = row
-            .iter()
-            .zip(&widths)
-            .map(|(cell, width)| format!("{cell:<width$}"))
-            .collect();
-        out += cells.join("  ").trim_end();
+                (Admission::Admitted, _) => "about to start".to_owned(),
+                (Admission::Waiting(wait), _) => {
+                    format!(
+                        "{}; waits for {}",
+                        format_ahead(wait.ahead),
+                        wait.waits_for()
+                    )
+                }
+            }),
+            _ => None,
+        };
+        if let Some(why) = why {
+            line += &format!(": {why}");
+        }
+        out += &line;
         out += "\n";
     }
-    if orphaned {
-        out += "\norphaned: loadmaster is gone but the task is still running; the slot is held \
-                until its process group exits\n";
+    out
+}
+
+/// The checks of the checkout `here` that ended lately, latest first: what
+/// became of a run whose output an agent lost (its tool timed out, say).
+fn recent_lines(recent: &[Check]) -> String {
+    if recent.is_empty() {
+        return String::new();
     }
-    if !lingering.is_empty() {
-        out += "\nlingering: the task's command exited, but processes it started in its process \
-                group still run, and hold the slot until they exit (`loadmaster cancel ID` stops \
-                them):\n";
-        out += &lingering.concat();
-    }
-    if parked {
+    let now = history::unix_ms(SystemTime::now());
+    let mut out = "\nended lately, from this checkout:\n".to_owned();
+    for check in recent {
+        let ago = format_duration(Duration::from_millis(now.saturating_sub(check.end())));
+        let ran = check.run_ms.map_or(String::new(), |ms| {
+            format!(" in {}", format_duration(Duration::from_millis(ms)))
+        });
+        let code = check
+            .exit_code
+            .map_or(String::new(), |code| format!(" (exit {code})"));
         out += &format!(
-            "\nparked: gave up waiting (--max-wait); keeps its place for {}s for a re-run \
-             of the same command from the same directory\n",
-            PARK_TTL.as_secs()
+            "#{} `{}` {}{ran}{code}, {ago} ago\n",
+            check.job,
+            check.task,
+            result_words(check.result)
         );
     }
     out
+}
+
+/// A check's result in `status --json`: one of a fixed set of values.
+pub(crate) fn result_code(result: CheckResult) -> &'static str {
+    match result {
+        CheckResult::Passed => "passed",
+        CheckResult::Failed => "failed",
+        CheckResult::Killed => "killed",
+        CheckResult::LeftLine => "left_line",
+        CheckResult::NotRun => "not_run",
+        CheckResult::Canceled => "canceled",
+    }
+}
+
+/// A check's result, as `status` words it.
+fn result_words(result: CheckResult) -> &'static str {
+    match result {
+        CheckResult::Passed => "passed",
+        CheckResult::Failed => "failed",
+        CheckResult::Killed => "was killed or stopped",
+        CheckResult::LeftLine => "left the line without running",
+        CheckResult::NotRun => "could not start",
+        CheckResult::Canceled => "was canceled",
+    }
+}
+
+/// How long ago a check may have ended to count as lately.
+const LATELY: Duration = Duration::from_secs(30 * 60);
+/// At most this many checks that ended lately are shown.
+const RECENT: usize = 5;
+
+/// The checks of `checkout` that ended lately, latest first.
+pub(crate) fn recent_checks(state_dir: &Path, checkout: &Path) -> Vec<Check> {
+    let entries = history::read_recent(&state_dir.join(HISTORY_FILE), 1 << 20).unwrap_or_default();
+    let since = history::unix_ms(SystemTime::now() - LATELY);
+    let checkout = checkout.to_string_lossy();
+    let mut checks: Vec<Check> = report::checks(&entries)
+        .into_iter()
+        .filter(|c| c.checkout == checkout && c.end() >= since)
+        .collect();
+    checks.sort_by_key(|c| std::cmp::Reverse(c.end()));
+    checks.truncate(RECENT);
+    checks
+}
+
+fn plural(n: u32) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }

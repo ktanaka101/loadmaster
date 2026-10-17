@@ -293,6 +293,19 @@ fn open_queue() -> Result<(PathBuf, Queue)> {
     Ok((dir, queue))
 }
 
+/// `path` with the home directory as `~`: shorter, for an agent's context.
+fn tilde(path: &Path) -> String {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 fn print(text: &str) {
     // Ignore EPIPE (e.g. `loadmaster status | head`).
     let _ = io::stdout().lock().write_all(text.as_bytes());

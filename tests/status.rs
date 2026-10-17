@@ -11,7 +11,11 @@ fn empty_queue() {
     let output = sandbox.run(&["status"]);
     assert!(output.status.success());
     let out = stdout(&output);
-    assert!(out.starts_with("0/6 in use (capacity set in "), "{out}");
+    assert!(out.starts_with("capacity 6 (set in "), "{out}");
+    assert!(
+        out.lines().next().unwrap().ends_with("): 0 in use"),
+        "{out}"
+    );
     assert!(out.contains("no jobs"), "{out}");
 }
 
@@ -32,24 +36,39 @@ fn shows_running_and_waiting_jobs() {
     });
 
     let out = stdout(&sandbox.run(&["status"]));
-    assert!(out.starts_with("3/4 in use"), "{out}");
-    let rows: Vec<&str> = out
-        .lines()
-        .filter(|l| matches!(l.split_whitespace().nth(1), Some("running" | "waiting")))
-        .collect();
+    assert!(
+        out.lines().next().unwrap().ends_with("): 3 in use"),
+        "{out}"
+    );
+    // One line per job, in line order, saying what an agent needs of it.
+    let rows: Vec<&str> = out.lines().filter(|l| l.starts_with('#')).collect();
     assert_eq!(rows.len(), 2, "{out}");
     assert!(
-        rows[0].contains("running") && rows[0].contains("hold"),
+        rows[0].starts_with("#1 running `hold` with 3 cores, for "),
         "{out}"
     );
     assert!(
-        rows[1].contains("waiting") && rows[1].contains("e2e"),
+        rows[1].starts_with("#2 waiting `e2e` (weight 4), for "),
         "{out}"
     );
-    assert!(out.contains(&sandbox.repo.display().to_string()), "{out}");
     assert!(
-        out.ends_with("why jobs wait:\n  #2 `e2e` waits for all 4 cores (3 in use)\n"),
+        rows[1].ends_with(": next in line; waits for all 4 cores (3 in use)"),
         "{out}"
+    );
+    // Both were run from the checkout `status` is run from.
+    assert!(
+        rows.iter().all(|row| row.contains(" (same checkout)")),
+        "{out}"
+    );
+    let elsewhere = sandbox
+        .cmd(&["status"])
+        .current_dir(&sandbox.root)
+        .output()
+        .unwrap();
+    assert!(
+        !stdout(&elsewhere).contains("same checkout"),
+        "{}",
+        stdout(&elsewhere)
     );
 
     sandbox.release("hold");
@@ -221,4 +240,37 @@ fn status_as_json_says_what_the_table_says() {
     sandbox.release("hold");
     assert!(wait(&mut holder).success());
     assert!(wait(&mut waiter).success());
+}
+
+#[test]
+fn status_says_what_became_of_the_latest_checks_of_this_checkout() {
+    let sandbox = Sandbox::new(
+        4,
+        &(sh_task("ok", 1, "true") + &sh_task("bad", 1, "exit 3")),
+    );
+    assert!(sandbox.run(&["run", "ok"]).status.success());
+    assert_eq!(sandbox.run(&["run", "bad"]).status.code(), Some(3));
+    let out = stdout(&sandbox.run(&["status"]));
+    let lately = out
+        .split("ended lately, from this checkout:\n")
+        .nth(1)
+        .unwrap_or("");
+    let lines: Vec<&str> = lately.lines().collect();
+    assert!(lines[0].starts_with("#2 `bad` failed in "), "{out}");
+    assert!(lines[0].contains(" (exit 3), "), "{out}");
+    assert!(lines[1].starts_with("#1 `ok` passed in "), "{out}");
+    // As data too; from elsewhere, none.
+    let json: serde_json::Value =
+        serde_json::from_slice(&sandbox.run(&["status", "--json"]).stdout).unwrap();
+    assert_eq!(json["recent"][0]["id"], 2);
+    assert_eq!(json["recent"][0]["result"], "failed");
+    assert_eq!(json["recent"][0]["exit_code"], 3);
+    assert_eq!(json["recent"][1]["result"], "passed");
+    let elsewhere = sandbox
+        .cmd(&["status", "--json"])
+        .current_dir(&sandbox.root)
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&elsewhere.stdout).unwrap();
+    assert_eq!(json["recent"], serde_json::json!([]));
 }

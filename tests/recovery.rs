@@ -42,7 +42,12 @@ fn killing_loadmaster_keeps_the_slot_while_the_task_runs() {
     assert!(snapshot.jobs[0].is_orphaned());
     let status = sandbox.run(&["status"]);
     assert!(
-        stdout(&status).contains("4/4 in use"),
+        stdout(&status).contains("): 4 in use\n"),
+        "{}",
+        stdout(&status)
+    );
+    assert!(
+        stdout(&status).contains("its loadmaster is gone; the task still runs"),
         "{}",
         stdout(&status)
     );
@@ -55,7 +60,7 @@ fn killing_loadmaster_keeps_the_slot_while_the_task_runs() {
     wait_until("the orphaned task to exit", || !child.is_alive());
     let status = sandbox.run(&["status"]);
     assert!(
-        stdout(&status).contains("0/4 in use"),
+        stdout(&status).contains("): 0 in use\n"),
         "{}",
         stdout(&status)
     );
@@ -224,14 +229,11 @@ fn slot_stays_taken_while_processes_the_task_left_behind_run() {
         stderr(&output)
     );
     let status = stdout(&sandbox.run(&["status"]));
-    assert!(status.contains(" lingering "), "{status}");
+    assert!(status.contains("#1 lingering `bg` "), "{status}");
     assert!(!status.contains("orphaned"), "{status}");
     assert!(
-        status.contains(&format!(
-            "\nlingering: the task's command exited, but processes it started in its process \
-             group still run, and hold the slot until they exit (`loadmaster cancel ID` stops \
-             them):\n  #1 `bg`: {group}"
-        )),
+        status.contains(&format!(": its command exited, but {group}"))
+            && status.contains("still runs and holds the slot; `loadmaster cancel 1` stops it\n"),
         "{status}"
     );
 

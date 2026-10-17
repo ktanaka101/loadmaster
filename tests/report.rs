@@ -30,7 +30,10 @@ fn measure_only_starts_everything_at_once_and_records_it() {
     });
     let status = sandbox.run(&["status"]);
     let text = stdout(&status);
-    assert!(text.starts_with("4/2 in use"), "{text}");
+    assert!(
+        text.lines().next().unwrap().ends_with("): 4 in use"),
+        "{text}"
+    );
     assert!(text.contains("measure-only: jobs start at once"), "{text}");
 
     sandbox.release("a");

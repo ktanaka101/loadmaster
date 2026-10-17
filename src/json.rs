@@ -3,7 +3,7 @@
 //! format, listed as a breaking change. The table `status` prints for people
 //! may change in any release.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -14,6 +14,8 @@ use loadmaster::queue::{
     Admission, Cause, Job, JobId, JobRef, JobState, Need, OtherQueue, Outside, Shortage, Snapshot,
     Use, Wait,
 };
+use loadmaster::report::Check;
+use loadmaster::usual::Usual;
 
 /// The version of the format, in its `format` field.
 const FORMAT: u32 = 2;
@@ -34,6 +36,12 @@ pub struct Status<'a> {
     /// The jobs of 0.12 to 0.14 left in a queue that is moving to this
     /// version's admission protocol, if it is.
     pub moving: Option<usize>,
+    /// The checkout `status` was run from, if any.
+    pub here: Option<&'a Path>,
+    /// How long jobs usually run.
+    pub usual: &'a Usual,
+    /// The checks of `here` that ended lately, latest first.
+    pub recent: &'a [Check],
 }
 
 pub fn status(status: &Status) -> Value {
@@ -48,7 +56,16 @@ pub fn status(status: &Status) -> Value {
                 .iter()
                 .find(|(id, _, _)| *id == job.id)
                 .map(|(_, admission, cores)| (admission, *cores));
-            job_value(job, decision)
+            let mut value = job_value(job, decision);
+            value["same_checkout"] = json!(status.here == Some(job.checkout.as_path()));
+            value["usual_run"] = status.usual.of_job(job).map_or(Value::Null, |usual| {
+                json!({
+                    "median_ms": u64::try_from(usual.median.as_millis()).unwrap_or(u64::MAX),
+                    "runs": usual.runs,
+                    "latest_at_ms": usual.latest_at,
+                })
+            });
+            value
         })
         .collect();
     json!({
@@ -79,6 +96,15 @@ pub fn status(status: &Status) -> Value {
         })).collect::<Vec<_>>(),
         "reclaimed": status.snapshot.reaped.len(),
         "jobs": jobs,
+        "recent": status.recent.iter().map(|check| json!({
+            "id": check.job,
+            "task": check.task,
+            "result": crate::cli::status::result_code(check.result),
+            "exit_code": check.exit_code,
+            "run_ms": check.run_ms,
+            "wait_ms": check.wait_ms,
+            "ended_at_ms": check.end(),
+        })).collect::<Vec<_>>(),
     })
 }
 
