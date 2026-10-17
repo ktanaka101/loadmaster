@@ -127,7 +127,13 @@ second Ctrl-C or carry on after SIGHUP; one that is the stop signal counts as
 the stop, so a cancel after a Ctrl-C sends nothing more. The history log
 records that the task was asked to stop, and the report counts a run that
 then exited with a code of its own (Playwright exits with 130) as stopped,
-like one a signal ended, not as failed.
+like one a signal ended, not as failed. That takes the stop reaching the
+task's own command while it ran: whether it still runs is told right
+before the signal, after the look at its processes, so a command that
+failed on its own during the look, leaving processes behind, is not made a
+stop by the signal those get (found in review; up to 0.15.1 it was, as
+anything sent before the exit was seen counted). It still counts if the
+command exits in the microseconds between that check and the signal.
 
 Signals that were already ignored when `loadmaster` started (SIGHUP under
 `nohup`, SIGINT in a background job of a non-interactive script) are left
@@ -144,17 +150,17 @@ main process exits, or while its slot is being released or handed over, are
 still forwarded to the rest of its group. While the leader has not been
 waited for, its PID, which is the group's ID, is not handed out again, so
 the group is the task's for certain and a signal needs only a running
-member (a leader that just exited and runs nothing is not stopped). Once
-it has been waited for, the group is checked by its leader's start time,
-so a group ID the OS has reused for someone else after the task ended is
-not signalled. Up to 0.15.1 that check was made every time: a start time
+member (a group whose leader just exited and that runs nothing gets none).
+Once it has been waited for, the group is checked by its leader's start
+time, so a group ID the OS has reused for someone else after the task ended
+is not signalled. Up to 0.15.1 that check was made every time: a start time
 misread while the task ran would have dropped the signal without a word,
-one way a signal for a running task could be lost, closed in case it
-was the one behind a test of Ctrl-C that timed out once on a macOS Intel
-runner (never reproduced, and not explained).
-One theoretical gap remains: if, after the leader was reaped, the group ID were reused by a new
-group whose own leader had also already exited, that group's remaining
-members would look like ours. That needs the PID space to wrap around within
+one way a signal for a running task could be lost, closed in case it was
+the one behind a test of Ctrl-C that timed out once on a macOS Intel runner
+(never reproduced, and not explained). One theoretical gap remains:
+if, after the leader was reaped, the group ID were reused by a new group
+whose own leader had also already exited, that group's remaining members
+would look like ours. That needs the PID space to wrap around within
 milliseconds, so it is accepted rather than paid for with a more complex wait.
 
 ## Liveness

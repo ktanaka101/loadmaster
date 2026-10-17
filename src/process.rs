@@ -70,6 +70,16 @@ impl ProcessId {
     }
 }
 
+/// What runs in a process group (see [`ProcessGroup::runs_unwaited`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runs {
+    /// Its leader, and maybe others.
+    Leader,
+    /// Others: the leader has exited.
+    Members,
+    Nothing,
+}
+
 /// A child process group, identified by its leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessGroup {
@@ -93,14 +103,15 @@ impl ProcessGroup {
         }
     }
 
-    /// [`ProcessGroup::is_alive`] for a group whose leader is a child of
-    /// this process not yet waited for: its PID, the group's ID, is not
-    /// handed out again until then, so a running leader is the task's
-    /// without a look at its start time, and so is any member.
-    pub fn is_alive_unwaited(&self) -> bool {
+    /// What runs in a group whose leader is a child of this process not yet
+    /// waited for: its PID, the group's ID, is not handed out again until
+    /// then, so a running leader is the task's without a look at its start
+    /// time, and so is any member.
+    pub fn runs_unwaited(&self) -> Runs {
         match start_time(self.pgid) {
-            Ok(Some(_)) | Err(_) => true,
-            Ok(None) => has_running_member(self.pgid).unwrap_or(true),
+            Ok(Some(_)) | Err(_) => Runs::Leader,
+            Ok(None) if has_running_member(self.pgid).unwrap_or(true) => Runs::Members,
+            Ok(None) => Runs::Nothing,
         }
     }
 
@@ -996,11 +1007,11 @@ mod tests {
             leader_start_time: Some(start_time + 1),
         };
         assert!(!group.is_alive());
-        assert!(group.is_alive_unwaited());
+        assert_eq!(group.runs_unwaited(), Runs::Leader);
         leader.kill().unwrap();
         // A zombie runs nothing.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while group.is_alive_unwaited() {
+        while group.runs_unwaited() != Runs::Nothing {
             assert!(std::time::Instant::now() < deadline, "the group never died");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

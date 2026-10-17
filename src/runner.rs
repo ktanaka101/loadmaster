@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::process::{Descendants, ProcessGroup, ProcessId};
+use crate::process::{Descendants, ProcessGroup, ProcessId, Runs};
 
 /// Set in a running task's environment to the job ID that holds the slot.
 /// A nested `loadmaster run` sees it and runs directly instead of queueing.
@@ -268,6 +268,17 @@ const FIRST_LOOK: u32 = 5;
 pub struct Forwarder {
     stop: i32,
     stop_sent: bool,
+    stopped: bool,
+}
+
+/// Whether a signal went to a task's process group, and whether its leader,
+/// the task's own command, still ran then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    No,
+    /// To what it left: the leader had exited.
+    ToMembers,
+    ToLeader,
 }
 
 impl Forwarder {
@@ -276,6 +287,7 @@ impl Forwarder {
         Forwarder {
             stop,
             stop_sent: false,
+            stopped: false,
         }
     }
 
@@ -288,25 +300,39 @@ impl Forwarder {
         if pending.is_empty() || !group.is_alive() {
             return;
         }
-        self.forward(pending, |signal| signal_group(group, signal));
+        // The leader has been waited for: what is left gets it.
+        self.forward(pending, |signal| {
+            if signal_group(group, signal) {
+                Sent::ToMembers
+            } else {
+                Sent::No
+            }
+        });
     }
 
-    /// Sends what `received` asks for with `kill`, which says whether the
-    /// signal was sent. The stop signal as it came goes first: a SIGTERM
-    /// that came with it then asks for nothing more.
-    fn forward(&mut self, mut received: Vec<i32>, mut kill: impl FnMut(i32) -> bool) {
+    /// Sends what `received` asks for with `kill`, which says where the
+    /// signal went. The stop signal as it came goes first: a SIGTERM that
+    /// came with it then asks for nothing more.
+    fn forward(&mut self, mut received: Vec<i32>, mut kill: impl FnMut(i32) -> Sent) {
         received.sort_by_key(|&signal| signal != self.stop);
         for signal in received {
             self.send_with(signal, &mut kill);
         }
     }
 
-    /// Whether the task has had its stop signal.
+    /// Whether the task has had its stop signal: then a request to stop
+    /// sends none again.
     pub fn stop_sent(&self) -> bool {
         self.stop_sent
     }
 
-    fn send_with(&mut self, received: i32, kill: impl FnOnce(i32) -> bool) {
+    /// Whether the task's own command had its stop signal while it ran: one
+    /// sent to what is left once it exited does not make a failure a stop.
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    fn send_with(&mut self, received: i32, kill: impl FnOnce(i32) -> Sent) {
         let request = received == libc::SIGTERM;
         if request && self.stop_sent {
             return;
@@ -316,8 +342,10 @@ impl Forwarder {
         // that changed its user, say) may be tried again. One that came as
         // itself counts too (Ctrl-C, for a stop signal of SIGINT), and still
         // passes each time.
-        if kill(signal) && signal == self.stop {
+        let sent = kill(signal);
+        if sent != Sent::No && signal == self.stop {
             self.stop_sent = true;
+            self.stopped |= sent == Sent::ToLeader;
         }
     }
 }
@@ -335,22 +363,35 @@ fn signal_group(group: &ProcessGroup, signal: i32) -> bool {
 /// of its own, is found only through its parent, which the signal may end
 /// (as Playwright exits on SIGTERM, leaving its `webServer`). While its
 /// leader has not been waited for (`unwaited`), the group is the task's for
-/// certain (see [`ProcessGroup::is_alive_unwaited`]); once it has, it is
-/// checked after the look, which takes a while, so a group ID the OS has
-/// reused meanwhile is never hit.
+/// certain (see [`ProcessGroup::runs_unwaited`]), and whether the leader
+/// still runs is told right before the signal; once it has, it is checked
+/// after the look, which takes a while, so a group ID the OS has reused
+/// meanwhile is never hit.
 fn signal_looked(
     group: &ProcessGroup,
     descendants: &mut Descendants,
     signal: i32,
     unwaited: bool,
-) -> bool {
+) -> Sent {
     descendants.look(group);
-    let alive = if unwaited {
-        group.is_alive_unwaited()
+    let to = if !unwaited {
+        if group.is_alive() {
+            Sent::ToMembers
+        } else {
+            Sent::No
+        }
     } else {
-        group.is_alive()
+        match group.runs_unwaited() {
+            Runs::Leader => Sent::ToLeader,
+            Runs::Members => Sent::ToMembers,
+            Runs::Nothing => Sent::No,
+        }
     };
-    alive && signal_group(group, signal)
+    if to != Sent::No && signal_group(group, signal) {
+        to
+    } else {
+        Sent::No
+    }
 }
 
 /// Waits for the task's leader to exit, forwarding intercepted signals to the
@@ -360,7 +401,7 @@ fn signal_looked(
 /// the forwarder sends none twice. Meanwhile it looks for the processes the
 /// task starts (see [`Descendants`]), and again before each signal it
 /// sends (see [`signal_looked`]). Returns the leader's exit status, and
-/// whether it had had its stop signal by then.
+/// whether it had its stop signal while it ran (see [`Forwarder::stopped`]).
 pub fn wait(
     task: &mut Task,
     signals: &Signals,
@@ -371,7 +412,6 @@ pub fn wait(
     let mut polls = 0u32;
     loop {
         let exited = task.child.try_wait()?;
-        let stopped = forwarder.stop_sent();
         // Forward even if the leader just exited: others in its group may
         // still be running.
         let pending = signals.take();
@@ -381,7 +421,7 @@ pub fn wait(
             });
         }
         if let Some(status) = exited {
-            return Ok((status, stopped));
+            return Ok((status, forwarder.stopped()));
         }
         polls = polls.wrapping_add(1);
         if polls % LOOK_EVERY == FIRST_LOOK {
@@ -417,7 +457,7 @@ mod tests {
         for batch in batches {
             forwarder.forward(batch.to_vec(), |signal| {
                 sent.push(signal);
-                true
+                Sent::ToLeader
             });
         }
         sent
@@ -445,9 +485,65 @@ mod tests {
     }
 
     #[test]
+    fn only_a_stop_that_reached_the_running_command_makes_it_stopped() {
+        // What it left gets the stop, once; the command had exited.
+        let mut forwarder = Forwarder::new(libc::SIGTERM);
+        forwarder.forward(vec![libc::SIGTERM], |_| Sent::ToMembers);
+        assert!(forwarder.stop_sent() && !forwarder.stopped());
+        let mut forwarder = Forwarder::new(libc::SIGTERM);
+        forwarder.forward(vec![libc::SIGTERM], |_| Sent::ToLeader);
+        assert!(forwarder.stop_sent() && forwarder.stopped());
+        // Another signal is no stop, wherever it went.
+        let mut forwarder = Forwarder::new(libc::SIGTERM);
+        forwarder.forward(vec![libc::SIGINT], |_| Sent::ToLeader);
+        assert!(!forwarder.stop_sent() && !forwarder.stopped());
+    }
+
+    #[test]
+    fn a_signal_after_the_command_exited_goes_to_what_it_left() {
+        use std::os::unix::process::CommandExt;
+        // The leader exits at once, leaving `sleep` in its group; it is not
+        // waited for yet.
+        let mut leader = Command::new("sh")
+            .args(["-c", "sleep 30 >/dev/null & echo $!"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let group = ProcessGroup {
+            pgid: leader.id(),
+            leader_start_time: ProcessId::of(leader.id()).unwrap().map(|p| p.start_time),
+        };
+        let output = std::mem::take(&mut leader.stdout);
+        let sleeper: u32 = std::io::read_to_string(output.unwrap())
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ProcessId::of(leader.id()).unwrap().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the leader never exited"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut descendants = Descendants::default();
+        assert_eq!(
+            signal_looked(&group, &mut descendants, libc::SIGTERM, true),
+            Sent::ToMembers
+        );
+        while ProcessId::of(sleeper).unwrap().is_some() {
+            assert!(std::time::Instant::now() < deadline, "`sleep` got nothing");
+            thread::sleep(Duration::from_millis(10));
+        }
+        leader.wait().unwrap();
+    }
+
+    #[test]
     fn a_stop_signal_that_was_refused_may_be_sent_again() {
         let mut forwarder = Forwarder::new(libc::SIGINT);
-        forwarder.forward(vec![libc::SIGTERM], |_| false);
+        forwarder.forward(vec![libc::SIGTERM], |_| Sent::No);
         assert!(!forwarder.stop_sent());
         assert_eq!(sent(&mut forwarder, &[&[libc::SIGTERM]]), [libc::SIGINT]);
     }
@@ -514,20 +610,17 @@ mod tests {
             leader_start_time: Some(start_time + 1),
         };
         let mut descendants = Descendants::default();
-        assert!(!signal_looked(
-            &group,
-            &mut descendants,
-            libc::SIGTERM,
-            false
-        ));
+        let mut looked =
+            |unwaited| signal_looked(&group, &mut descendants, libc::SIGTERM, unwaited);
+        assert_eq!(looked(false), Sent::No);
         assert!(leader.try_wait().unwrap().is_none());
-        assert!(signal_looked(&group, &mut descendants, libc::SIGTERM, true));
+        assert_eq!(looked(true), Sent::ToLeader);
         assert_eq!(leader.wait().unwrap().signal(), Some(libc::SIGTERM));
     }
 
     /// A task whose leader's start time was misread, waited for with
     /// `received` signals pending (no handler is installed) and `canceled`.
-    fn wait_misread(received: &[i32], canceled: Option<i32>) -> ExitStatus {
+    fn wait_misread(received: &[i32], canceled: Option<i32>) -> (ExitStatus, bool) {
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         // Whatever this test process inherited, as a task gets its stop
@@ -546,27 +639,53 @@ mod tests {
             }),
         };
         let mut forwarder = Forwarder::new(libc::SIGTERM);
-        let (status, _) = wait(
+        wait(
             &mut task,
             &signals,
             &mut forwarder,
             &mut Descendants::default(),
             |_| canceled,
         )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_stop_that_came_after_the_command_exited_does_not_make_it_stopped() {
+        // It fails, leaving `sleep` in its group, as the stop comes.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 >/dev/null & exit 1"]);
+        let mut task = spawn(&mut cmd, |_| Ok::<(), ()>(())).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ProcessId::of(task.child.id()).unwrap().is_some() {
+            assert!(std::time::Instant::now() < deadline, "it never exited");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let signals = Signals {
+            pending: INTERCEPTED_SIGNALS
+                .map(|signal| (signal, Arc::new(AtomicBool::new(signal == libc::SIGTERM)))),
+        };
+        let mut forwarder = Forwarder::new(libc::SIGTERM);
+        let (status, stopped) = wait(
+            &mut task,
+            &signals,
+            &mut forwarder,
+            &mut Descendants::default(),
+            |_| None,
+        )
         .unwrap();
-        status
+        assert_eq!((status.code(), stopped), (Some(1), false));
+        // What it left had the stop, so a request to stop sends none again.
+        assert!(forwarder.stop_sent());
     }
 
     #[test]
     fn signals_reach_a_running_task_whatever_its_leaders_start_time() {
-        assert_eq!(
-            wait_misread(&[libc::SIGINT], None).signal(),
-            Some(libc::SIGINT)
-        );
-        assert_eq!(
-            wait_misread(&[], Some(libc::SIGTERM)).signal(),
-            Some(libc::SIGTERM)
-        );
+        // A SIGINT is not its stop signal; a cancel's request to stop
+        // reached it while it ran.
+        let (status, stopped) = wait_misread(&[libc::SIGINT], None);
+        assert_eq!((status.signal(), stopped), (Some(libc::SIGINT), false));
+        let (status, stopped) = wait_misread(&[], Some(libc::SIGTERM));
+        assert_eq!((status.signal(), stopped), (Some(libc::SIGTERM), true));
     }
 
     #[test]
