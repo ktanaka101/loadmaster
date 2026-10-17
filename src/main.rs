@@ -85,6 +85,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// How AI agents run checks here: the rules, and this repository's tasks
+    Guide,
     /// Run a task from .loadmaster.toml once its weight fits in the machine's capacity
     Run(RunArgs),
     /// Show running and waiting jobs
@@ -189,6 +191,7 @@ fn main() {
         std::process::exit(if e.use_stderr() { EXIT_ERROR } else { 0 });
     });
     let result = match cli.command {
+        Cmd::Guide => cli::guide::guide(),
         Cmd::Run(args) => cli::run::run(args),
         Cmd::Status(args) => cli::status::status(args),
         Cmd::Clean => cli::cancel::clean(),
