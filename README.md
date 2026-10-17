@@ -35,7 +35,7 @@ port a checkout has.
 | Approach | Every task has a weight (≈ CPU cores it keeps busy), the machine has a capacity, and the line is first come, first served. Tasks can also use named resources (database stacks, memory), limited per machine or per checkout; a job waiting for one doesn't hold up jobs that don't need it. |
 | Interface | A command wrapper: `loadmaster run <task> [-- args]`. No daemon or server; processes coordinate through a SQLite file. |
 | Crash safety | Places and slots of killed processes are reclaimed automatically (PID plus start time, so reused PIDs don't fool it). A task keeps its slot while it runs, even if `loadmaster` itself is killed. |
-| Agent support | Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. `loadmaster held` lets scripts refuse to run outside the queue, whatever the agent. `loadmaster cancel --here` stops an agent's own checks without touching other agents' runs of the same commands. `loadmaster status` says what each job waits for, and `loadmaster check` what the config means on this machine. Works with any agent that runs shell commands, inside sandboxes too; ready-made settings for Claude Code and Codex: instructions, sandbox, timeouts, a hook that blocks direct runs. |
+| Agent support | Made for AI agents as its users: every line says what happened and, where there is something to do, the exact command (`loadmaster: next:`). `loadmaster guide` tells an agent how to run checks here, from the binary itself; `loadmaster doctor` checks that its tool's sandbox and timeouts let loadmaster work, and says what to change; `loadmaster tune` replays the machine's history with other weights before an agent changes them. Exit code 75 with a kept place in line when a wait exceeds `--max-wait`, so a tool timeout never sends an agent to the back of the line. `loadmaster held` lets scripts refuse to run outside the queue, whatever the agent. `loadmaster cancel` stops an agent's own checks without touching other agents' runs of the same commands. `loadmaster status` says what each job waits for and behind whom, and what became of this checkout's latest checks. Works with any agent that runs shell commands, inside sandboxes too; ready-made settings for Claude Code and Codex: instructions, sandbox, timeouts, a hook that blocks direct runs. |
 | Measuring | `loadmaster report` shows failures, timeouts, run and wait times and the cores each task really used; a measure-only mode records a baseline to compare with. See [Checking that it helps](#checking-that-it-helps). |
 | Platforms | macOS and Linux. On Windows, WSL2 should work (it runs the Linux binary) but is not tested yet; native Windows is not supported. |
 | Integration cost | One binary, one `.loadmaster.toml` per repository, a few lines of agent instructions. Removing it means deleting those, `~/.local/state/loadmaster` and `~/.config/loadmaster`. |
@@ -217,11 +217,14 @@ loadmaster run test -- src/parser.test.ts
 loadmaster status
 ```
 
-While a job waits, loadmaster prints a line to stderr every 10 seconds that
-says what it waits for, such as
-``loadmaster: waiting to run `test` (weight 4, 2 jobs ahead) for 4 cores (6 of 8 in use)``.
-Once it starts, the task's stdout and stderr pass straight through and
-loadmaster exits with the task's exit code.
+Every run says on stderr which job it is and how it ended
+(``loadmaster: #42 `test` started``, ``loadmaster: #42 `test` passed in 1m10s (exit 0)``).
+While a job waits, it says what it waits for and behind whom, when that
+changes and at least once a minute, such as
+``loadmaster: #42 `test` is waiting (weight 4, 2 jobs ahead) for 4 cores (6 of 8 in use); running: #41 `e2e` for 1m02s (usually 3m10s)``.
+The task's stdout and stderr pass straight through and loadmaster exits with
+the task's exit code. `loadmaster guide` tells an agent all of this, and
+this repository's tasks.
 
 ```bash
 loadmaster check
@@ -234,38 +237,38 @@ works in CI.
 ## Rules for agents running checks
 
 If you are an AI agent working in a repository that already uses loadmaster
-(it has a `.loadmaster.toml`), this is all you need:
+(it has a `.loadmaster.toml`), run `loadmaster guide` and follow it: it says
+the rules for the version installed, and this repository's tasks. In short:
 
-- **Run checks through loadmaster**: `loadmaster run <task>`. The tasks are
-  the `[tasks.<name>]` tables in `.loadmaster.toml`; an unknown name prints
-  the list.
-- **Never run the underlying commands directly** (`npx vitest`, `npm test`, a
-  script from `cmd`, ...). Other agents share this machine; running outside the
-  queue overloads it and makes everyone's tests time out for no real reason.
-- **Run each `loadmaster` command on its own.** Don't chain anything to it
-  (`; echo $?`, `&& ...`): its exit code already is the check's exit code, and
-  a chained command may need approval.
-- **Pass extra arguments after `--`**: `loadmaster run test -- src/a.test.ts`.
-- **Waiting is normal.** Lines like `loadmaster: waiting to run ...` on stderr
-  mean other jobs are using the machine. Don't kill the command, don't give it
-  a shorter timeout than your default, and don't treat the wait as a failure.
-- **Act on the exit code:**
+- **Run checks only through loadmaster**: `loadmaster run <task>`, extra
+  arguments after `--` (`loadmaster run test -- src/a.test.ts`). Never run the
+  underlying commands directly (`npx vitest`, `npm test`, a script from
+  `cmd`): other agents share this machine, and running outside the line
+  overloads it and makes everyone's checks time out for no real reason.
+- **One `loadmaster` command per tool call**, with nothing chained to it
+  (`; echo $?`, `&& ...`): its exit code is the check's, and a chained
+  command may need approval.
+- **Waiting is normal.** `loadmaster: #42 `test` is waiting ...` says what it
+  waits for and behind whom. Don't stop it or start it again; a tool timeout
+  must cover the wait, the run and its clean-up.
+- **Read how it ended from its last `loadmaster:` line**, not only the exit
+  code, since a task may exit with 75 or 125 itself:
 
-  | Exit code | Meaning | What to do |
+  | Last line | Exit code | What to do |
   | --- | --- | --- |
-  | 0 | The check passed. | Continue. |
-  | 75 with `loadmaster: gave up waiting` on stderr | Gave up waiting; your place in line is kept for 120 s. Not a failure. | Run exactly the same command again, from the same directory, right away. |
-  | 125 | loadmaster itself failed: unknown task, bad config, and so on. | Read the `loadmaster: error:` message; don't retry blindly. |
-  | 126, 127 | The task's program could not be started. | A setup problem, e.g. dependencies not installed. |
-  | 128 + n | The check was killed by signal n (143 = SIGTERM). | It was interrupted, not failed; run it again if needed. |
-  | anything else | The check's own exit code. | Treat it as the check's result. |
+  | `#42 `test` passed ...` | 0 | Continue. |
+  | `#42 `test` failed ... (exit N)` | N | The check's result. |
+  | `#42 `test` gave up after waiting ...`, then `loadmaster: next: run `...` again from ... within 120s` | 75 | Not a failure: run the command it gives, word for word, from there, right away; it resumes the place. |
+  | `loadmaster: error: ...`, maybe `loadmaster: next: ...` | 125 | loadmaster itself failed; do what `next:` says, don't retry blindly. |
+  | `#42 `test` could not start` | 126, 127 | A setup problem, e.g. dependencies not installed. |
+  | `#42 `test` was killed by SIGTERM ...` | 128 + n | Interrupted, not failed; run it again if needed. |
 
-- `loadmaster status` shows what is running and waiting, and what each
-  waiting job waits for.
-- **To stop your own checks, use `loadmaster cancel`**: `loadmaster cancel
-  --here` stops every job started from your checkout, `loadmaster cancel 43`
-  one job (IDs are in `loadmaster status`); if other agents work in the same
-  checkout, cancel by ID. Never stop checks by matching command lines
+- `loadmaster status` shows what runs and waits and why, and what became of
+  this checkout's latest checks.
+- **To stop your own checks, use `loadmaster cancel`**: `loadmaster cancel 43`
+  one job (its ID is on its first line and in `loadmaster status`),
+  `loadmaster cancel --here` every job started from this checkout, other
+  agents' working in it too. Never stop checks by matching command lines
   (`pkill -f vitest`): other agents run the same commands.
 
 ## Configuration
@@ -288,7 +291,8 @@ run against the main checkout's code: loadmaster says so and fails.
 
 | Key | Meaning |
 | --- | --- |
-| `weight` | Integer ≥ 1. Use "roughly how many CPU cores this task keeps busy" as the unit, in every repository, because all repositories on the machine share one capacity. |
+| `description` | Optional, one line: what the task checks and how to run part of it ("Unit tests; pass test files after --"). `loadmaster guide` shows it to the agent choosing a task, and the error for an unknown task lists it. |
+| `weight` | Integer ≥ 1. Use "roughly how many CPU cores this task keeps busy" as the unit, in every repository, because all repositories on the machine share one capacity. `loadmaster tune` measures it and shows what another would do. |
 | `min_weight` | Optional: the fewest cores the task may start with, from 1 to its weight. Set it only for a task that sizes its parallelism by `LOADMASTER_WEIGHT` (`vitest --maxWorkers=$LOADMASTER_WEIGHT`, `eslint --concurrency=$LOADMASTER_WEIGHT`): it then starts with what is left whenever that fits, rather than waiting for its whole weight, and runs longer with fewer workers. Without it, a task always starts with its weight. A task that holds a scarce resource while it runs (a browser, a database) holds it longer with fewer cores, which may keep others waiting longer than they gain. |
 | `cmd` | Array: the program and its arguments. No shell is involved. Arguments after `--` are appended to the end exactly as given. |
 | `uses` | Optional: the resources the task uses, such as `{ e2e-db = 1 }`; see [Resources besides CPU](#resources-besides-cpu). |
@@ -522,11 +526,12 @@ agent on a machine at once, when few checks run. Versions up to 0.11 kept separa
 other way round: `loadmaster status` and `loadmaster run` say when such a
 file holds jobs.
 Next to it, `history.jsonl` gets one line per job
-(task, weight and the cores it got if fewer, resources, capacity, wait and run
-time, CPU time, load average, the machine's CPU busy while it ran, signal,
-whether loadmaster asked it to stop, exit code and whether it counts as
-passed), which `loadmaster report`
-summarizes; it reads only lines of the format this version writes, and says
+(task, weight and the cores it got if fewer, resources and their limits,
+capacity, its checkout and its repository, wait and run time, CPU time, load
+average, the machine's CPU busy while it ran, signal, whether loadmaster
+asked it to stop, exit code and whether it counts as passed), which
+`loadmaster report` summarizes, `loadmaster tune` replays, and `status`,
+`guide` and the lines of a waiting run take usual run times from; it reads only lines of the format this version writes, and says
 how many others it skipped. If `loadmaster` is killed before it can write its
 line, the process that later reclaims the job writes one with outcome `lost`.
 
@@ -642,26 +647,69 @@ seconds are fixed, and each resumed run may again wait up to `--max-wait`.
 
 `LOADMASTER_MAX_WAIT` sets the default for `--max-wait`; set to an empty
 string, it means no limit. You can tell loadmaster's 75 from a task that
-happens to exit with 75 by the `loadmaster: gave up waiting` line on stderr.
+happens to exit with 75 by its last line on stderr: `... gave up after waiting
+...`, followed by the `loadmaster: next:` line with the command to run again.
 
 ## Commands
 
 ```text
+loadmaster guide
 loadmaster run [--max-wait SECONDS] <TASK> [-- ARGS...]
-loadmaster status
+loadmaster status [--json]
 loadmaster cancel [--kill] (<ID>... | --here)
+loadmaster doctor [--json]
 loadmaster check [--scenario FILE]
-loadmaster clean
+loadmaster tune [--since TIME] [--until TIME] [--set TASK.KEY=VALUE]... [--json]
 loadmaster report [--since TIME] [--until TIME] [--dir TEXT] [--args TEXT]
+loadmaster clean
 loadmaster held [--uses RESOURCE]
 ```
 
-- `run`: run a task once its weight and resources fit.
-- `status`: show used/total capacity, resources in use, the load average,
+Their users are AI agents: every line is meant to be acted on as it is
+written, briefly, in the same words each time.
+
+- `guide`: how an agent runs checks here, from the binary itself, so it
+  matches the version installed: the rules (run checks only through
+  loadmaster, one command per call, waiting is normal, what each way a run
+  ends means and what to do), the machine's capacity and mode, and this
+  repository's tasks, one line each, with their weight, the cores they may
+  start with, resources, the exit codes that pass, their usual run time and
+  their `description`. Without a `.loadmaster.toml`, or with a broken one, it
+  still says the rules, and how to set one up or what to fix. An instruction
+  file needs one line: run `loadmaster guide` and follow it.
+- `run`: run a task once its weight and resources fit. What it says on
+  stderr, every line starting with `loadmaster: ` and naming the job
+  `#ID `task``:
+  - `#42 `test` started` when the task starts (with the cores if fewer than
+    its weight, and how long it waited);
+  - `#42 `test` is waiting (weight 4, 1 job ahead) for 4 cores (8 of 8 in
+    use); running: #41 `e2e` for 1m02s (usually 3m10s)` when it starts to
+    wait, then when what it waits for or who holds it changes (at most every
+    15 s), and at least every 60 s (some agents' tools end a command that has
+    said nothing for a while);
+  - `#42 `test` passed in 2m03s (exit 0; waited 12s)` when it ends: `passed`,
+    `failed`, `stopped as asked`, `was killed by SIG...`, `left the line
+    without running` or `could not start`, with the exit code, so that a
+    task's own exit code of 75 or 125 is not taken for loadmaster's;
+  - `#42 `test` gave up after waiting 10m00s ... (exit 75)`, followed by
+    `loadmaster: next: run `loadmaster run test -- a.ts` again from /repo
+    within 120s: it resumes its place in line`;
+  - `loadmaster: error: ...` (exit 125), followed by `loadmaster: next: ...`
+    where there is one thing to do.
+
+  `LOADMASTER_QUIET=1` leaves out the lines that only inform (started,
+  waiting, ended), so the task's stderr passes through as it is; what asks
+  for action is always said.
+- `status`: the capacity and what is in use, resources, the load average,
   the CPU busy beyond what running jobs got, jobs in the queue of a version
-  up to 0.11, every running, waiting or parked job, and what each
-  waiting job waits for. `--json` prints it for tools; see
-  [Status as JSON](#status-as-json).
+  up to 0.11, then one line per job in line order: its state, task, cores or
+  weight, for how long (and how long it usually runs), where from,
+  `(same checkout)` for the checkout `status` is run from, and why: what it
+  waits for, how long a parked place is still kept, what holds the slot of a
+  job whose command exited. Then `ended lately, from this checkout`: the
+  checkout's checks of the last 30 minutes with their result and exit code,
+  for a run whose output was lost (a tool that timed out, say). `--json`
+  prints it for tools; see [Status as JSON](#status-as-json).
 - `cancel`: stop jobs, by ID or (`--here`) every job started from this
   checkout except the one `cancel` itself runs in, and wait until they have
   left the queue. It leaves a request in the queue, and the job's own
@@ -677,6 +725,20 @@ loadmaster held [--uses RESOURCE]
   `--kill` asks for SIGKILL instead, for a task that does not stop; it gets
   no chance to clean up. `loadmaster report` leaves canceled checks out.
   Exits with 0 once the jobs are gone.
+- `doctor`: whether loadmaster works for agents here, and what to change
+  where it does not: this binary against the one on `PATH`, the configs,
+  `LOADMASTER_MAX_WAIT`, whether this process may write to the state
+  directory (it creates and removes a file there: run by an agent's tool,
+  this is the sure test of its sandbox), the queue file as it is (read,
+  never created or moved), other versions' queues, Claude Code's settings
+  (its sandbox's `allowWrite` across the user, project, local and managed
+  files, its Bash timeout against `LOADMASTER_MAX_WAIT`), Codex's config
+  (its sandbox mode, writable roots or permission profile), and whether the
+  repository's `AGENTS.md` or `CLAUDE.md` tells agents of loadmaster. Each
+  finding is `problem` (something this process could not do; exit code 1),
+  `note` (something a settings file suggests; settings have layers and
+  defaults a file does not show), `unknown` or `ok`, with the fix: the file
+  and the snippet. It changes no settings itself. `--json` for tools.
 - `check`: validate `.loadmaster.toml` and the machine config, list the tasks
   and resources with their limits on this machine, say how many cores the
   capacity leaves for CPU busy outside the queue, and warn about weights that
@@ -690,40 +752,57 @@ loadmaster held [--uses RESOURCE]
   It reads no config and no queue; the jobs' states are taken as they are.
   Paths are compared as `status --json` writes them, so two checkouts whose
   paths differ only in bytes that are not UTF-8 count as one.
-- `clean`: reclaim places and slots whose processes are gone. Every update
-  already does this, so you should rarely need it.
+- `tune`: what other settings of this repository's tasks would have done to
+  this machine's checks, replayed through the admission rule itself: with the
+  current settings, with measured weights (each the 90th percentile of the
+  cores its passed runs kept busy, rounded up), and with your own
+  `--set TASK.weight=N` or `--set TASK.min_weight=N` (or `none`). It compares
+  their waits, their times from getting in line to the end, and the share of
+  the time more cores were busy than the capacity (the cost of a weight below
+  what a task uses), and prints the change to try. A scenario, not a promise,
+  and it says so with every assumption: checks arrive when they did, no CPU
+  is busy outside the queue, a task with `min_weight` runs longer on fewer
+  cores as its CPU work would and others as long as they ran, more cores
+  shorten nothing, and the share over capacity is a lower bound from
+  averages. Only this repository's tasks (from any of its worktrees) change;
+  every other check is replayed as it recorded. It says how close its replay
+  of the current settings comes to the waits recorded, and suggests no change
+  of a resource or of `min_weight` on its own. `--since`/`--until` as for
+  `report`; `--json` for tools.
 - `report`: summarize the history log per task. `--since` and `--until`
   limit it to checks that got in line in a period, given as a time ago
   (`12h`, `7d`, `2w`) or a local time (`2026-10-12T16:44`, `2026-10-12`), for
   example around a change of settings; `--dir myapp` keeps checks run from
   directories whose path contains `myapp`. See
   [Checking that it helps](#checking-that-it-helps).
+- `clean`: reclaim places and slots whose processes are gone. Every update
+  already does this, so you should rarely need it.
 - `held`: exit with 0 if this process runs inside a loadmaster job started
   from this checkout (and, with `--uses`, using that resource), and with 1
-  (saying why on stderr) if not; see [Guarding a script](#guarding-a-script).
-  Its own failures exit with 125.
+  if not, saying why and, on a `loadmaster: next:` line, to run it with
+  `loadmaster run` instead; see [Guarding a script](#guarding-a-script). Its
+  own failures exit with 125.
 
 ```text
 $ loadmaster status
-5/8 in use (capacity set in /Users/you/.config/loadmaster/config.toml)
-e2e-db: 1/2 in use
+capacity 8 (set in /Users/you/.config/loadmaster/config.toml): 5 in use
+`e2e-db`: 1 of 2 in use
 load average 22.9 over the last minute, on 14 cores: more than the cores, often from work outside the queue or tasks that use more cores than their weight (see `loadmaster report`); on Linux, processes waiting for disks count too
 
-ID  STATE    TASK       WEIGHT  USES      PID    PGID   FOR   DIR
-41  running  test       4       -         10687  10689  3.0s  /Users/you/src/app-wt1
-42  running  e2e-smoke  1       e2e-db=1  10700  10702  2.5s  /Users/you/src/app-wt2
-43  waiting  e2e        2       e2e-db=1  10753  -      2.0s  /Users/you/src/app-wt2
-44  waiting  lint       3       -         10772  -      1.4s  /Users/you/src/app-wt3
+jobs, in line order:
+#41 running `test` with 4 cores, for 3.0s (usually 1m10s), from ~/src/app-wt1
+#42 running `e2e-smoke` with 1 core, using `e2e-db`, for 2.5s (usually 40s), from ~/src/app-wt2 (same checkout)
+#43 waiting `e2e` (weight 2), using `e2e-db`, for 2.0s, from ~/src/app-wt2 (same checkout): next in line; waits for `e2e-db` in its checkout (1 of 1 in use by #42 `e2e-smoke`)
+#44 waiting `lint` (weight 3), for 1.4s, from ~/src/app-wt3: 1 job ahead; waits for 3 cores (6 of 8 could be in use when #43 `e2e` starts, beside #41 `test`)
 
-why jobs wait:
-  #43 `e2e` waits for `e2e-db` in its checkout (1 of 1 in use by #42 `e2e-smoke`)
-  #44 `lint` waits for 3 cores (6 of 8 could be in use when #43 `e2e` starts, beside #41 `test`)
+ended lately, from this checkout:
+#40 `lint` passed in 8.1s (exit 0), 2m ago
 ```
 
 Job 43 waits because `app-wt2` already has its one `e2e-db`. Job 44 would fit
 in the 3 cores free now, but job 43 starts once job 42 ends, maybe while job
 41 still runs, and then 6 of the 8 cores are in use: the lint would take the
-machine past its capacity, so it waits. `FOR` is the time spent in the current
+machine past its capacity, so it waits. `for` is the time spent in the current
 state. The load average counts everything on the machine; well above the
 capacity in use, it points to work outside the queue, here a build run
 directly.
@@ -734,8 +813,9 @@ directly.
 format is versioned (`format`); within a version, fields may be added, so
 ignore the ones you do not know. Any other change is a new version, listed as
 a breaking change of a release: a field removed or renamed, or its meaning,
-type or unit changed, and a new value of `state`, `need` or `reason`. The
-table above, and every `text`, may change in any release.
+type or unit changed, and a new value of `state`, `need`, `reason` or
+`result`. The text `status` prints, and every `text`, may change in any
+release.
 
 - `format`: 2.
 - `protocol`: the admission protocol of the queue: 1 for one that 0.12 to
@@ -759,6 +839,12 @@ table above, and every `text`, may change in any release.
   its jobs that run, wait, or keep a parked place they may resume (`null`
   where the file could not be read).
 - `reclaimed`: how many jobs whose processes were gone were reclaimed.
+- `recent`: the checks of the checkout `status` was run from that ended in
+  the last 30 minutes, latest first (at most 5; none if it was not run from
+  a checkout), each `{id, task, result, exit_code, run_ms, wait_ms,
+  ended_at_ms}`; `result` is `passed`, `failed`, `killed` (by a signal or
+  after its stop signal), `left_line` (never ran), `not_run` (could not
+  start) or `canceled`.
 - `jobs`, in line order, each with:
   - `id`, `task`, `weight`, `min_weight` (the fewest cores it may start
     with: its weight unless the task sets one), `cores` (what it started
@@ -768,12 +854,19 @@ table above, and every `text`, may change in any release.
     `dir` and `checkout` (bytes that are not UTF-8 replaced), `args`, `pid`
     (of its `loadmaster`) and `pgid` (of its task), or `null`; `capacity`,
     `adapts_to_outside_cpu`, `measure_only`;
+  - `same_checkout`: whether it was started from the checkout `status` was
+    run from (other agents may work in it too);
+  - `usual_run`: how long its task, set up so and run with the same
+    arguments, usually runs, from the history: `{median_ms, runs,
+    latest_at_ms}` (the median of how many passed runs, and when the latest
+    ended), or `null` with fewer than 3. A median, not what is left of a
+    running one;
   - `state`: `running`; `waiting`; `parked` (gave up waiting, keeps its place
     for a re-run); `orphaned` (its `loadmaster` is gone, its task still runs);
     or `lingering` (its task's command exited, and processes it left in its
     process group hold the slot);
   - `state_since_ms`: when it entered that state (milliseconds since the
-    Unix epoch), as the table's FOR counts from: when it got in line or
+    Unix epoch), as the text's `for` counts from: when it got in line or
     resumed its place, parked, started, or was handed over to its task's
     process group. `null` where that was not seen, as for a job left orphaned
     by a `loadmaster` that died, or one waiting from before 0.14. Also
@@ -900,27 +993,24 @@ settings.
 
 ### 1. Tell the agents
 
-Put this in the instructions file your tools read: `AGENTS.md`, which Codex
-and many other tools read, `CLAUDE.md` for Claude Code, or both. Or point the
-agents at [Rules for agents running checks](#rules-for-agents-running-checks).
+Put this line in the instructions file your tools read: `AGENTS.md`, which
+Codex and many other tools read, `CLAUDE.md` for Claude Code, or both:
 
 ```markdown
-Run lint, tests and e2e only through loadmaster: `loadmaster run lint`,
-`loadmaster run test`, `loadmaster run e2e` (the tasks are in
-`.loadmaster.toml`). To run part of the suite, pass arguments after `--`,
-e.g. `loadmaster run test -- src/parser.test.ts`.
-- Run each `loadmaster` command on its own, without chaining other commands
-  to it; its exit code is the check's exit code.
-- Waiting is normal: `loadmaster: waiting to run ...` on stderr means other
-  agents are using the machine. Don't stop the command.
-- If it exits with code 75 (`loadmaster: gave up waiting`), run exactly the
-  same command again, right away: your place in line is kept.
-- To stop your own checks, use `loadmaster cancel --here`, never `pkill`.
+Run checks only through loadmaster: before running any, run `loadmaster guide` and follow it.
 ```
 
-The "on its own" line matters: agents like to append `; echo "exit=$?"`, and
-a chained command no longer matches allow rules such as Claude Code's
-`Bash(loadmaster run *)`, so it stops for approval.
+`loadmaster guide` says the rest, for the version installed and this
+repository's tasks (give them a `description`): an instruction file that
+copied the rules would drift from them. Among them, "one command per call"
+matters: agents like to append `; echo "exit=$?"`, and a chained command no
+longer matches allow rules such as Claude Code's `Bash(loadmaster run *)`, so
+it stops for approval.
+
+Then run `loadmaster doctor` the way an agent would, from its tool: it
+checks the next two steps (whether the tool's sandbox lets loadmaster write
+the state directory, and whether its timeout leaves room for the wait) and
+prints what to change.
 
 ### 2. Let it write the state directory
 

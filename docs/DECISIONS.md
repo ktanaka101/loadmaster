@@ -2,6 +2,86 @@
 
 The design decisions behind loadmaster, and why they were made.
 
+## AI agents as the users
+
+loadmaster's users are AI agents, not people: they run the checks, read its
+stderr into a context they pay for, take its words literally, work under a
+tool's timeout, and choose the weights and edit `.loadmaster.toml` too (the
+first real user's agent did). So, from 0.16, every output is an agent's next
+action: what happened, what it means, and exactly what to run next; briefly;
+in the same words each time; the same in text and JSON. Nothing it could do
+before was taken away; its words changed where they served a reader at a
+terminal.
+
+- **A run names its job and says how it ended.** `#42 `test` started` and
+  `#42 `test` failed in 2m03s (exit 1; waited 12s)` cost two lines, and give
+  the ID that `cancel` and `status` take, and an outcome that the exit code
+  alone cannot: a task may itself exit with 75 or 125. Every line starts with
+  `loadmaster: `; `loadmaster: next:` gives the action to take, after giving
+  up (the command to run, word for word, and where from) and after an error
+  that has one remedy (an unknown task gets the closest name: a swap of
+  neighbours counts as one slip). `LOADMASTER_QUIET` leaves out the lines
+  that only inform, for a script that wants the task's stderr as it is.
+- **A wait says less, but never nothing for long.** A line every 10 s put 60
+  lines in an agent's context in a 10-minute wait. A waiting run now says
+  so when it starts waiting, when what it waits for or who holds it changes
+  (at most every 15 s), and at least every 60 s: Gemini CLI's shell ends a
+  command that has printed nothing for 5 minutes by default, so a wait with
+  nothing new to say would have been killed (found in review, Codex). Each
+  line names the running jobs it waits behind, how long they have run, and
+  how long they usually run: what an agent decides by whether to wait or to
+  run it in the background.
+- **The binary describes itself.** `loadmaster guide` prints the rules for
+  the version installed and this repository's tasks with their
+  `description`, usual run time and what passes. An instruction file copied
+  from the README drifted from the binary with each release; now it holds
+  one line pointing at the guide. The guide says the rules where there is no
+  config, or a broken one: a guide that needed a working setup could not say
+  how to fix it. It is kept to about 500 words and a line per task.
+- **`doctor` is as sure as what it rests on.** What this process could not
+  do (write to the state directory, tried by creating and removing a file;
+  read a valid config) is a problem, and exit code 1. What an agent tool's
+  settings files suggest is a note: Claude Code merges user, project, local
+  and managed settings and has defaults no file shows, and Codex has layers,
+  profiles and overrides, so a missing entry in one file proves nothing.
+  Run by the agent's own tool, `doctor`'s probe of the state directory is the
+  sure test of its sandbox. It edits no other tool's settings: it prints the
+  file and the snippet, which the agent applies under its owner's
+  permissions.
+- **`tune` is a scenario, not a recommendation to act on blindly.** It
+  replays this machine's history through the admission rule itself, with
+  the current settings, with measured weights, and with an agent's own
+  changes. The model is said with every result: checks arrive when they did
+  (an agent that waited less might have asked sooner; a retried failure is
+  demand another setting might not have had), no CPU is busy outside the
+  queue, a task without `min_weight` runs as long as it did, and one with
+  it runs longer on fewer cores as its CPU work would: its CPU work, spread
+  over the cores it had, spread over fewer. Spreading the whole run instead
+  was rejected (Codex): a task that spends 50 s on 8 cores and 50 s waiting
+  for I/O takes 150 s on 4, not 100. More cores never shorten a run, which
+  biases against parallelism but never oversells it. The share of the time
+  over capacity is from each check's average cores, a lower bound, since
+  two tasks of average 4 can each peak at 8 at once. Measured weights (the
+  90th percentile of the cores kept busy) are something to try, not a safe
+  weight: `tune` says how close its replay of the current settings comes to
+  the recorded waits, and never proposes loosening a resource or adding a
+  `min_weight` on its own, since only the task can say whether it sizes
+  itself by its cores.
+- **Checks are known by their workload.** A repository's worktrees share its
+  committed `.loadmaster.toml` and run the same tasks, while another
+  repository's `test` is another workload of the same name. So usual run
+  times and `tune` count a task by its repository (its main git directory,
+  read from `.git` without running git, and the place of the config in it)
+  and by its setting and arguments (one file of a suite says little about
+  the whole suite); per-checkout things (`(same checkout)`, what ended
+  lately) stay per checkout. Grouping by checkout, as first written, left an
+  agent working in worktrees with almost no history: of 4248 checks on the
+  first user's machine, 6 were of its main checkout and 89 of its
+  repository. Records of 0.15 and before have no workload, and are matched
+  where their checkout still exists; those of deleted worktrees are not.
+- **`same checkout`, not "yours".** Several agents can work in one checkout,
+  and `cancel --here` stops all their jobs: the mark says what is known.
+
 ## The task runs in its own process group
 
 The task is spawned as the leader of a new process group, and the group's ID
@@ -593,8 +673,8 @@ queue. Made-up durations and core use are exactly what goes wrong with
 weights, though, so it would answer confidently from the wrong inputs. The
 explanations above, the warnings of `loadmaster check` and the report's
 measured cores cover most of the need; replaying the recorded history against
-other settings would answer the rest from real inputs, and is the form to
-build if it is needed.
+other settings would answer the rest from real inputs, and is the form that
+was built: `loadmaster tune` (0.16; see "AI agents as the users").
 
 `check --scenario` (0.14) is the part of that which needs no durations: it
 judges the queue a file describes (a `status --json` captured from a real
@@ -939,8 +1019,8 @@ it so: a quarter of a second of one waiter's time and one short write every
 3 seconds while jobs wait, and a quarter of a second more for a job that
 starts after 3 quiet seconds. A running
 task is polled for exit every 20 ms. The waiting message is printed when a
-job starts waiting and then every 10 seconds: often enough to show progress,
-rarely enough not to flood an agent's context.
+job starts waiting, when what it waits for changes, and at least every 60
+seconds (see "AI agents as the users").
 
 Since 0.15 the loadmaster that takes the write lock to start its own job
 starts every waiting job that may, in line order, each with its cores and
@@ -1028,10 +1108,11 @@ job.
 ## History log
 
 `history.jsonl` in the state directory gets one JSON object per queued run:
-job ID, task, weight (and `min_weight` if it is less), resources used,
-capacity, whether the machine was in
+job ID, task, weight (and `min_weight` if it is less), resources used and
+their limits, capacity, whether the machine was in
 measure-only mode,
-caller directory, arguments, outcome (`exited`, `gave_up`, `interrupted`,
+caller directory, its checkout and its workload (from 0.16; see "AI agents
+as the users"), arguments, outcome (`exited`, `gave_up`, `interrupted`,
 `spawn_failed`, `error`, `lost`, or `canceled` for the extra record
 `loadmaster cancel` writes), queue time, wait and run durations, CPU
 time, the 1-minute load average when the task ended, the signal that killed
