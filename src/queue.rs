@@ -1088,6 +1088,7 @@ fn record(job: &Job, outcome: Outcome, waited_until: SystemTime) -> Record<'_> {
         capacity: job.capacity,
         measure_only: job.measure_only,
         dir: job.dir.to_string_lossy(),
+        checkout: Some(job.checkout.to_string_lossy()),
         args: &job.args,
         outcome,
         queued_at: history::unix_ms(job.enqueued_at),
@@ -1112,7 +1113,21 @@ fn record(job: &Job, outcome: Outcome, waited_until: SystemTime) -> Record<'_> {
             .iter()
             .map(|u| (u.name.clone(), u.amount))
             .collect(),
+        limits: limits(&job.uses),
     }
+}
+
+/// The limits of the resources `uses` names, for the history log.
+pub fn limits(uses: &[Use]) -> std::collections::BTreeMap<String, history::Limit> {
+    uses.iter()
+        .map(|u| {
+            let limit = history::Limit {
+                capacity: u.capacity,
+                per_checkout: u.per_checkout,
+            };
+            (u.name.clone(), limit)
+        })
+        .collect()
 }
 
 /// A place in line, and later a slot. Dropping it leaves the queue (or frees

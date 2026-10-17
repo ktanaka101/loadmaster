@@ -519,8 +519,9 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
+        // Exited, to be waited for: no longer seen, it may still be exiting.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while ProcessId::of(leader.id()).unwrap().is_some() {
+        while group.leader_runs_unwaited() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the leader never exited"
@@ -655,7 +656,8 @@ mod tests {
         cmd.args(["-c", "sleep 30 >/dev/null & exit 1"]);
         let mut task = spawn(&mut cmd, |_| Ok::<(), ()>(())).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while ProcessId::of(task.child.id()).unwrap().is_some() {
+        // Exited, to be waited for: no longer seen, it may still be exiting.
+        while task.group.leader_runs_unwaited() {
             assert!(std::time::Instant::now() < deadline, "it never exited");
             thread::sleep(Duration::from_millis(10));
         }

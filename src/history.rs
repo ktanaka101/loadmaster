@@ -40,6 +40,16 @@ pub enum Outcome {
     Canceled,
 }
 
+/// A resource's limits as a run got in line with them: the machine-wide
+/// capacity and the per-checkout limit, where there is one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_checkout: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Record<'a> {
     pub job: i64,
@@ -49,8 +59,14 @@ pub struct Record<'a> {
     pub capacity: u32,
     /// Whether the run was admitted without waiting (`measure_only`).
     pub measure_only: bool,
-    /// Lossy for non-UTF-8 paths, so the record can always be written.
+    /// Where it was run. Lossy for non-UTF-8 paths, so the record can
+    /// always be written.
     pub dir: Cow<'a, str>,
+    /// Its checkout: the resolved directory of the `.loadmaster.toml` it
+    /// ran from, which `dir` may be inside of. Tasks of other checkouts are
+    /// other workloads, though they may share a name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<Cow<'a, str>>,
     pub args: &'a [String],
     pub outcome: Outcome,
     /// When this invocation got in line, in Unix milliseconds.
@@ -93,6 +109,10 @@ pub struct Record<'a> {
     /// different settings can be told apart.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub uses: BTreeMap<String, u32>,
+    /// The limits of those resources, as it got in line with them: what a
+    /// replay of the line needs.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub limits: BTreeMap<String, Limit>,
 }
 
 /// A record read back from the log, as [`Record`] writes it.
@@ -102,6 +122,9 @@ pub struct Entry {
     pub task: String,
     pub weight: u32,
     pub dir: String,
+    /// Not in records of 0.15 and before.
+    #[serde(default)]
+    pub checkout: Option<String>,
     pub args: Vec<String>,
     pub capacity: u32,
     pub measure_only: bool,
@@ -123,9 +146,15 @@ pub struct Entry {
     pub min_weight: Option<u32>,
     #[serde(default)]
     pub uses: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub limits: BTreeMap<String, Limit>,
 }
 
 impl Entry {
+    /// Its checkout, or, for a record of 0.15 and before, where it was run.
+    pub fn checkout(&self) -> &str {
+        self.checkout.as_deref().unwrap_or(&self.dir)
+    }
     /// Whether it has what [`Record`] writes for its outcome. A record of
     /// an older format may lack it, and would be misread.
     fn is_whole(&self) -> bool {
@@ -152,7 +181,31 @@ pub fn append(state_dir: &Path, record: &Record) -> io::Result<()> {
 /// that are not records of this format (a line cut short by a crash, or one
 /// an older version wrote).
 pub fn read(path: &Path) -> io::Result<(Vec<Entry>, usize)> {
-    let bytes = std::fs::read(path)?;
+    Ok(parse(&std::fs::read(path)?))
+}
+
+/// [`read`] of the last `max_bytes` of the log at most: its latest records,
+/// at a cost that does not grow with the log, which is never rotated.
+pub fn read_recent(path: &Path, max_bytes: u64) -> io::Result<Vec<Entry>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let from = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    // Started inside a line: that part of it is no record.
+    let whole = match from {
+        0 => &bytes[..],
+        _ => bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(&[][..], |at| &bytes[at + 1..]),
+    };
+    Ok(parse(whole).0)
+}
+
+fn parse(bytes: &[u8]) -> (Vec<Entry>, usize) {
     let mut entries = Vec::new();
     let mut unreadable = 0;
     for line in bytes.split(|&b| b == b'\n') {
@@ -164,7 +217,7 @@ pub fn read(path: &Path) -> io::Result<(Vec<Entry>, usize)> {
             _ => unreadable += 1,
         }
     }
-    Ok((entries, unreadable))
+    (entries, unreadable)
 }
 
 pub fn unix_ms(t: SystemTime) -> u64 {
@@ -177,6 +230,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_latest_records_are_read_from_the_end_of_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = [];
+        for job in 1..=3 {
+            let record = Record {
+                job,
+                task: "test",
+                weight: 4,
+                capacity: 8,
+                measure_only: false,
+                dir: Cow::Borrowed("/repo"),
+                checkout: None,
+                args: &args,
+                outcome: Outcome::Exited,
+                queued_at: 1_000,
+                wait_ms: 0,
+                run_ms: Some(300),
+                cpu_ms: None,
+                load: None,
+                machine_busy: None,
+                signal: None,
+                exit_code: Some(0),
+                started: None,
+                ok: Some(true),
+                stopped: false,
+                granted: None,
+                min_weight: None,
+                uses: BTreeMap::new(),
+                limits: BTreeMap::new(),
+            };
+            append(dir.path(), &record).unwrap();
+        }
+        let path = dir.path().join(HISTORY_FILE);
+        let line = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .len() as u64;
+        // A line and a half: the cut one is dropped, the last is whole.
+        let jobs = |max| -> Vec<i64> {
+            read_recent(&path, max)
+                .unwrap()
+                .iter()
+                .map(|e| e.job)
+                .collect()
+        };
+        assert_eq!(jobs(line * 3 / 2), [3]);
+        assert_eq!(jobs(u64::MAX), [1, 2, 3]);
+    }
+
+    #[test]
     fn records_read_back_and_other_lines_are_counted() {
         let dir = tempfile::tempdir().unwrap();
         let args = ["a".to_owned()];
@@ -187,6 +292,7 @@ mod tests {
             capacity: 8,
             measure_only: true,
             dir: Cow::Borrowed("/repo"),
+            checkout: None,
             args: &args,
             outcome: Outcome::Exited,
             queued_at: 1_000,
@@ -203,6 +309,7 @@ mod tests {
             granted: None,
             min_weight: None,
             uses: BTreeMap::from([("db".to_owned(), 1)]),
+            limits: BTreeMap::new(),
         };
         append(dir.path(), &record).unwrap();
         for record in [
@@ -251,6 +358,7 @@ mod tests {
                 task: "test".into(),
                 weight: 4,
                 dir: "/repo".into(),
+                checkout: None,
                 args: vec!["a".into()],
                 capacity: 8,
                 measure_only: true,
@@ -269,6 +377,7 @@ mod tests {
                 granted: None,
                 min_weight: None,
                 uses: BTreeMap::from([("db".to_owned(), 1)]),
+                limits: BTreeMap::new(),
             }
         );
         assert_eq!(entries[1].started, Some(false));

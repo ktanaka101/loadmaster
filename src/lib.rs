@@ -11,5 +11,6 @@ pub mod process;
 pub mod queue;
 pub mod report;
 pub mod runner;
+pub mod usual;
 
 pub use error::{Error, Result};

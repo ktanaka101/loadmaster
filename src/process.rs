@@ -114,14 +114,21 @@ impl ProcessGroup {
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
         };
-        // SAFETY: zeroed, and filled in only if the child has exited.
-        if r == 0 && unsafe { info.assume_init() }.si_signo != 0 {
+        if r == 0 {
+            // SAFETY: zeroed, and filled in only if the child has exited.
+            if unsafe { info.assume_init() }.si_signo != 0 {
+                return false;
+            }
+        } else if io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            // Not a child of this process to wait for, so not one that runs.
             return false;
         }
         // One that moved itself to another group gets none of this one's.
         // SAFETY: getpgid has no memory-safety preconditions.
-        let in_group = unsafe { libc::getpgid(pid) };
-        in_group < 0 || in_group == pid
+        match unsafe { libc::getpgid(pid) } {
+            in_group if in_group >= 0 => in_group == pid,
+            _ => io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH),
+        }
     }
 
     /// Whether the group's leader, the task's own command, is known to have
@@ -1025,6 +1032,16 @@ mod tests {
         }
         // Still there to be waited for.
         assert_eq!(leader.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn a_process_that_is_no_child_of_this_one_is_no_leader_running_for_it() {
+        // PID 1 runs, but is nothing this process waits for.
+        let group = ProcessGroup {
+            pgid: 1,
+            leader_start_time: None,
+        };
+        assert!(!group.leader_runs_unwaited());
     }
 
     #[test]

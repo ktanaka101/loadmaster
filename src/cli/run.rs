@@ -88,6 +88,7 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
         capacity: machine.capacity,
         measure_only: machine.measure_only,
         dir: cwd.to_string_lossy(),
+        checkout: Some(checkout.to_string_lossy()),
         args: &args.args,
         outcome: Outcome::Exited,
         queued_at: history::unix_ms(queued_at),
@@ -104,6 +105,7 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
         granted: None,
         min_weight: (min_weight < task.weight).then_some(min_weight),
         uses: task.uses.clone(),
+        limits: queue::limits(&uses),
     };
     // Set once this run's line is written.
     let mut logged = false;

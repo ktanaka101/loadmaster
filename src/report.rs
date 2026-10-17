@@ -750,6 +750,7 @@ mod tests {
             task: task.to_owned(),
             weight: 4,
             dir: "/src/app-wt1".to_owned(),
+            checkout: None,
             args: Vec::new(),
             capacity: 8,
             measure_only: false,
@@ -768,6 +769,7 @@ mod tests {
             granted: None,
             min_weight: None,
             uses: BTreeMap::new(),
+            limits: BTreeMap::new(),
         }
     }
 
