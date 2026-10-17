@@ -55,13 +55,19 @@ terminal.
   (an agent that waited less might have asked sooner; a retried failure is
   demand another setting might not have had), no CPU is busy outside the
   queue, a task without `min_weight` runs as long as it did, and one with
-  it runs longer on fewer cores as its CPU work would: its CPU work, spread
-  over the cores it had, spread over fewer. Spreading the whole run instead
+  it (whatever its value: a `min_weight` declares that the task sizes
+  itself by its cores) runs longer on fewer cores as its CPU work would: its
+  CPU work, spread over the cores it had, spread over fewer. Spreading the whole run instead
   was rejected (Codex): a task that spends 50 s on 8 cores and 50 s waiting
   for I/O takes 150 s on 4, not 100. More cores never shorten a run, which
   biases against parallelism but never oversells it. The share of the time
-  over capacity is from each check's average cores, a lower bound, since
-  two tasks of average 4 can each peak at 8 at once. Measured weights (the
+  over capacity is estimated from each check's average cores, and is no
+  bound either way (Codex): two tasks of average 4 can each peak at 8 at
+  once, and two of average 3 on 4 cores, each busy at 6 for half its run,
+  overlap only half the time. Checks that got in line at the same
+  millisecond keep their job IDs' order. The machine is replayed with the
+  capacity it has now, a measure-only check as one admitted, and a resource
+  whose limits a record lacks as unlimited; each is said with the result. Measured weights (the
   90th percentile of the cores kept busy) are something to try, not a safe
   weight: `tune` says how close its replay of the current settings comes to
   the recorded waits, and never proposes loosening a resource or adding a

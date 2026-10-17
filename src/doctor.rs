@@ -176,9 +176,10 @@ pub fn claude_code(
                 Level::Note,
                 CHECK,
                 format!(
-                    "its Bash tool ends a command after {}s by default, the wait in line \
-                     included, and LOADMASTER_MAX_WAIT is not set: a check that waits that long \
-                     is killed and loses its place",
+                    "its Bash tool's timeout is {}s by default, the wait in line included, and \
+                     LOADMASTER_MAX_WAIT is not set: a check that waits that long is either \
+                     moved to the background (then follow it there; do not start another) or \
+                     ended, which loses its place",
                     timeout_ms / 1000
                 ),
             )
@@ -193,8 +194,10 @@ pub fn claude_code(
                 Level::Note,
                 CHECK,
                 format!(
-                    "LOADMASTER_MAX_WAIT is {secs}s, but its Bash tool ends a command after \
-                     {}s by default, the wait in line included: loadmaster cannot give up first",
+                    "LOADMASTER_MAX_WAIT is {secs}s, but its Bash tool's timeout is {}s by \
+                     default, the wait in line included: where the tool ends a command at its \
+                     timeout rather than moving it to the background, loadmaster cannot give up \
+                     first",
                     timeout_ms / 1000
                 ),
             )

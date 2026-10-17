@@ -274,3 +274,21 @@ fn status_says_what_became_of_the_latest_checks_of_this_checkout() {
     let json: serde_json::Value = serde_json::from_slice(&elsewhere.stdout).unwrap();
     assert_eq!(json["recent"], serde_json::json!([]));
 }
+
+#[test]
+fn a_check_that_keeps_its_place_has_not_ended() {
+    let probe = Sandbox::new(4, "");
+    let tasks = sh_task("hold", 4, &probe.hold_script("hold")) + &sh_task("test", 4, "true");
+    std::fs::write(probe.repo.join(".loadmaster.toml"), tasks).unwrap();
+    let sandbox = probe;
+    let mut holder = sandbox.spawn(&["run", "hold"]);
+    wait_until("the task to start", || sandbox.started("hold"));
+    // It gives up, and keeps its place: it is parked, not ended.
+    let gave_up = sandbox.run(&["run", "test", "--max-wait", "0"]);
+    assert_eq!(gave_up.status.code(), Some(75));
+    let out = stdout(&sandbox.run(&["status"]));
+    assert!(out.contains("#2 parked `test`"), "{out}");
+    assert!(!out.contains("ended lately"), "{out}");
+    sandbox.release("hold");
+    assert!(wait(&mut holder).success());
+}

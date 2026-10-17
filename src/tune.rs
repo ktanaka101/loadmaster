@@ -8,13 +8,19 @@
 //!   for its next check sooner, and a failure that was retried is demand
 //!   that another setting might not have had.
 //! - No CPU is busy outside the queue.
-//! - A check runs as long as it did, except that a task that may start with
-//!   fewer cores (its `min_weight`, a consent to size itself by
-//!   LOADMASTER_WEIGHT) runs longer on fewer: its CPU work, spread over
-//!   the cores it had, is spread over fewer. More cores never shorten a
-//!   run.
+//! - A check runs as long as it did, except that a task with a `min_weight`
+//!   (which declares that it sizes itself by LOADMASTER_WEIGHT) runs longer
+//!   on fewer cores than it had: its CPU work, spread over the cores it had,
+//!   is spread over fewer. A task without one is taken to run as long
+//!   whatever cores it gets, as one that does not size itself would. More
+//!   cores never shorten a run.
 //! - What the replay calls over capacity is from each check's cores kept
-//!   busy on average: a lower bound, since peaks are higher.
+//!   busy on average: an estimate, not a bound, since checks that average
+//!   more than the capacity together may peak at different times, and ones
+//!   that average less may peak together.
+//! - The machine has the capacity it has now; a measure-only check is
+//!   replayed as one admitted; a resource whose limits a record lacks (from
+//!   0.15 and before) is taken as unlimited.
 //! - Only the workload's own tasks change; every other check on the machine
 //!   keeps what it recorded, and is replayed beside them.
 
@@ -44,10 +50,11 @@ impl TaskSetting {
         }
     }
 
-    /// Whether it may start with fewer cores than its weight, and so sizes
-    /// itself by them.
-    fn consents(self) -> bool {
-        self.min_weight.is_some_and(|l| l < self.weight)
+    /// Whether it sizes itself by the cores it gets: what a `min_weight`
+    /// declares, whatever its value. One without is taken to run as long
+    /// whatever cores it gets.
+    fn sizes_itself(self) -> bool {
+        self.min_weight.is_some()
     }
 }
 
@@ -59,6 +66,9 @@ pub type Settings = BTreeMap<String, TaskSetting>;
 pub struct Arrival {
     /// When it first got in line, in Unix milliseconds.
     pub at: u64,
+    /// Its job ID: its place among checks that got in line at the same
+    /// millisecond.
+    pub job: i64,
     /// How long it ran, and the CPU time it used.
     pub run_ms: u64,
     pub cpu_ms: Option<u64>,
@@ -84,6 +94,7 @@ impl Arrival {
         let run_ms = check.run_ms?;
         Some(Arrival {
             at: check.queued_at,
+            job: check.job,
             run_ms,
             cpu_ms: check.cpu_ms,
             waited_ms: check.wait_ms,
@@ -101,7 +112,8 @@ impl Arrival {
         })
     }
 
-    /// The cores it kept busy on average, as recorded.
+    /// The cores it kept busy on average, as recorded, or the cores it had
+    /// where its CPU time was not.
     fn busy(&self) -> f64 {
         match self.cpu_ms {
             Some(cpu) if self.run_ms > 0 => cpu as f64 / self.run_ms as f64,
@@ -109,11 +121,23 @@ impl Arrival {
         }
     }
 
+    /// The cores it keeps busy on average when it runs `ran` ms with
+    /// `cores`, set up as `setting`.
+    fn busy_with(&self, cores: u32, ran: u64, setting: TaskSetting) -> f64 {
+        if !setting.sizes_itself() || cores >= self.had {
+            return self.busy();
+        }
+        match self.cpu_ms {
+            Some(cpu) if ran > 0 => cpu as f64 / ran as f64,
+            _ => f64::from(cores),
+        }
+    }
+
     /// How long it runs with `cores`, set up as `setting`: as it did, unless
     /// it sizes itself by its cores and gets fewer than it had, when its CPU
     /// work, spread over the cores it had, is spread over these.
     fn run_with(&self, cores: u32, setting: TaskSetting) -> u64 {
-        if !setting.consents() || cores >= self.had {
+        if !setting.sizes_itself() || cores >= self.had {
             return self.run_ms;
         }
         let run = self.run_ms as f64;
@@ -156,7 +180,7 @@ struct Running {
 /// keeps what it recorded).
 pub fn replay(arrivals: &[Arrival], capacity: u32, workload: &str, settings: &Settings) -> Outcome {
     let mut order: Vec<usize> = (0..arrivals.len()).collect();
-    order.sort_by_key(|&i| (arrivals[i].at, i));
+    order.sort_by_key(|&i| (arrivals[i].at, arrivals[i].job, i));
     // Each check's setting in this scenario, by its rank in line.
     let set: Vec<TaskSetting> = order
         .iter()
@@ -186,10 +210,7 @@ pub fn replay(arrivals: &[Arrival], capacity: u32, workload: &str, settings: &Se
             for (rank, cores) in admit(&waiting, &running, arrivals, &order, &set, capacity) {
                 let a = arrival(rank);
                 let ran = a.run_with(cores, set[rank]);
-                let busy = match (set[rank].consents(), a.cpu_ms) {
-                    (true, Some(cpu)) if ran > 0 => cpu as f64 / ran as f64,
-                    _ => a.busy(),
-                };
+                let busy = a.busy_with(cores, ran, set[rank]);
                 running.push(Running {
                     rank,
                     end: now + ran,
@@ -329,7 +350,13 @@ pub fn measured_weight(
 ) -> Option<(u32, f64, usize)> {
     let busy: Vec<f64> = arrivals
         .iter()
-        .filter(|a| a.workload == workload && a.task == task && a.passed && a.cpu_ms.is_some())
+        .filter(|a| {
+            a.workload == workload
+                && a.task == task
+                && a.passed
+                && a.cpu_ms.is_some()
+                && a.run_ms > 0
+        })
         .map(Arrival::busy)
         .collect();
     if busy.len() < LEAST_RUNS {
@@ -347,6 +374,7 @@ mod tests {
     fn arrival(at: u64, task: &str, weight: u32, run_ms: u64, cpu_ms: u64) -> Arrival {
         Arrival {
             at,
+            job: 0,
             run_ms,
             cpu_ms: Some(cpu_ms),
             waited_ms: 0,
@@ -407,6 +435,19 @@ mod tests {
             min_weight: None,
         };
         assert_eq!(a.run_with(4, fixed), 100_000);
+        // A min_weight as high as the weight still says it sizes itself.
+        let equal = TaskSetting {
+            weight: 4,
+            min_weight: Some(4),
+        };
+        assert_eq!(a.run_with(4, equal), 150_000);
+        // Without its CPU time: the cores it gets, all the while.
+        let unmeasured = Arrival {
+            cpu_ms: None,
+            ..a.clone()
+        };
+        assert_eq!(unmeasured.run_with(4, consents), 200_000);
+        assert_eq!(unmeasured.busy_with(4, 200_000, consents), 4.0);
     }
 
     #[test]

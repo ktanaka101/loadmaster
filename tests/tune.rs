@@ -96,12 +96,30 @@ fn tune_replays_the_history_with_other_weights() {
 
 #[test]
 fn tune_says_when_there_is_too_little_to_replay_and_refuses_bad_changes() {
-    let sandbox = Sandbox::new(4, &sh_task("test", 4, "true"));
+    let sandbox = Sandbox::new(
+        4,
+        &sh_task("test", 4, "true").replacen("cmd = ", "min_weight = 4\ncmd = ", 1),
+    );
     let out = stdout(&sandbox.run(&["tune"]));
     assert!(
         out.starts_with("loadmaster tune: too few checks to replay: 0 on this machine"),
         "{out}"
     );
+    // As data too; and a change is checked whatever the history.
+    let json: serde_json::Value =
+        serde_json::from_slice(&sandbox.run(&["tune", "--json"]).stdout).unwrap();
+    assert_eq!(json["replayed"], false);
+    assert_eq!(json["checks"], 0);
+    let output = sandbox.run(&["tune", "--set", "test.weight=x"]);
+    assert_eq!(output.status.code(), Some(125));
+    // Changes are taken together, in either order.
+    for sets in [
+        ["test.weight=2", "test.min_weight=1"],
+        ["test.min_weight=1", "test.weight=2"],
+    ] {
+        let output = sandbox.run(&["tune", "--set", sets[0], "--set", sets[1]]);
+        assert!(output.status.success(), "{sets:?}: {}", stderr(&output));
+    }
     let lines: Vec<String> = (0..25)
         .map(|i| {
             record(

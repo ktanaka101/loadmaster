@@ -1,8 +1,9 @@
 //! `loadmaster doctor`: whether loadmaster works for agents here, and what
-//! to change where it does not (see [`loadmaster::doctor`]). It changes
-//! nothing but a file it creates and removes in the state directory, to see
-//! whether this process may write there: run by an agent's tool, that is
-//! the sure test of its sandbox.
+//! to change where it does not (see [`loadmaster::doctor`]). It changes no
+//! settings and no jobs: it creates and removes a file in the state
+//! directory, to see whether this process may write there (run by an
+//! agent's tool, the sure test of its sandbox), and opens this queue's file
+//! read-only.
 
 use crate::cli::run::max_wait_from_env;
 use crate::*;
@@ -82,8 +83,10 @@ pub(crate) fn doctor(args: DoctorArgs) -> Result<i32> {
         print(&format!("{value:#}\n"));
     } else {
         let mut out = "loadmaster doctor: whether loadmaster works for agents here. It changes \
-                       nothing but a file it creates and removes in the state directory, to see \
-                       whether this process may write there.\n\n"
+                       no settings and no jobs: it creates and removes a file in the state \
+                       directory, to see whether this process may write there, and reading the \
+                       queue files of 0.11 and before may fold their logs into them, as every \
+                       loadmaster that reads them does.\n\n"
             .to_owned();
         for finding in &findings {
             out += &format!(
@@ -186,12 +189,16 @@ fn repo(cwd: &Path, findings: &mut Vec<Finding>) -> Option<RepoConfig> {
 /// creating and removing a file there (the directory too, if missing).
 fn writable(dir: &Path) -> Finding {
     const CHECK: &str = "state directory";
+    // A name no other process uses, nor this one before.
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let tried = DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
         .and_then(|()| {
-            let probe = dir.join(format!(".doctor-{}", std::process::id()));
+            let probe = dir.join(format!(".doctor-{}-{nanos}", std::process::id()));
             fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -200,14 +207,28 @@ fn writable(dir: &Path) -> Finding {
         });
     match tried {
         Ok(()) => ok(CHECK, format!("this process may write to {}", tilde(dir))),
+        // What a sandbox does: its fix is in the tool's settings.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            problem(
+                CHECK,
+                format!("this process may not write to {} ({e})", tilde(dir)),
+                Error::StateDirNotWritable {
+                    dir: dir.to_owned(),
+                    detail: e.to_string(),
+                }
+                .next(),
+            )
+        }
+        // Anything else (a full disk, say) is not the sandbox's.
         Err(e) => problem(
             CHECK,
-            format!("this process may not write to {} ({e})", tilde(dir)),
-            Error::StateDirNotWritable {
-                dir: dir.to_owned(),
-                detail: e.to_string(),
-            }
-            .next(),
+            format!("writing a file in {} failed: {e}", tilde(dir)),
+            None,
         ),
     }
 }
@@ -218,6 +239,7 @@ fn queue_file(dir: &Path) -> Option<Finding> {
     let path = dir.join(QUEUE_DB_FILE);
     Some(match queue::inspect(&path) {
         Ok(None) => ok(CHECK, "none yet: the first run makes it"),
+        Ok(Some(file)) if file.is_new() => ok(CHECK, "not set up yet: the first run does"),
         Ok(Some(file)) if file.is_current() => ok(
             CHECK,
             format!("{}: {} job(s) in it", tilde(&path), file.jobs),

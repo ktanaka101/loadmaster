@@ -34,10 +34,11 @@ pub struct Setting {
 }
 
 impl Setting {
-    pub fn of_job(job: &Job) -> Setting {
+    /// A job's, its checkout being of `workload`.
+    pub fn of_job(job: &Job, workload: String) -> Setting {
         let least = job.least();
         Setting {
-            workload: crate::config::workload(&job.checkout),
+            workload,
             task: job.task.clone(),
             weight: job.weight,
             min_weight: (least < job.weight).then_some(least),
@@ -83,6 +84,8 @@ pub struct RunTime {
 pub struct Usual {
     /// Each setting's run times, sorted, and when its latest run ended.
     runs: HashMap<Setting, (Vec<u64>, u64)>,
+    /// The workloads of the checkouts asked about, each worked out once.
+    workloads: std::cell::RefCell<crate::config::Workloads>,
 }
 
 impl Usual {
@@ -117,7 +120,10 @@ impl Usual {
         for (times, _) in runs.values_mut() {
             times.sort_unstable();
         }
-        Usual { runs }
+        Usual {
+            runs,
+            workloads: Default::default(),
+        }
     }
 
     /// The usual run time of `setting`, if it passed often enough.
@@ -135,7 +141,8 @@ impl Usual {
 
     /// [`Usual::run_time`] of a job in the queue.
     pub fn of_job(&self, job: &Job) -> Option<RunTime> {
-        self.run_time(&Setting::of_job(job))
+        let workload = self.workloads.borrow_mut().of_checkout(&job.checkout);
+        self.run_time(&Setting::of_job(job, workload))
     }
 }
 

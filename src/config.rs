@@ -366,9 +366,18 @@ impl Task {
 /// tasks; a checkout outside git is a workload of its own (its path). Read
 /// from `.git` alone, without running git.
 pub fn workload(checkout: &Path) -> String {
+    // One that is gone (a worktree removed since) is known by its path: its
+    // parents' repository may not be its own.
+    if !checkout.exists() {
+        return checkout.display().to_string();
+    }
     let mut dir = checkout;
     loop {
         let git = dir.join(".git");
+        if git.symlink_metadata().is_ok() && common_git_dir(&git).is_none() {
+            // A `.git` that leads nowhere: not the parent's repository.
+            return checkout.display().to_string();
+        }
         if let Some(common) = common_git_dir(&git) {
             let inner = checkout.strip_prefix(dir).unwrap_or(Path::new(""));
             return if inner.as_os_str().is_empty() {
@@ -390,14 +399,32 @@ pub fn workload(checkout: &Path) -> String {
 pub struct Workloads(std::collections::HashMap<String, String>);
 
 impl Workloads {
-    /// `recorded`, or else the workload of `checkout`.
-    pub fn of(&mut self, recorded: Option<&str>, checkout: &str) -> String {
+    /// `recorded`, or else the workload of the checkout that `path` (the
+    /// checkout, or for a record of 0.15 and before where it was run, which
+    /// may be inside it) belongs to: that of the nearest `.loadmaster.toml`.
+    pub fn of(&mut self, recorded: Option<&str>, path: &str) -> String {
         if let Some(workload) = recorded {
             return workload.to_owned();
         }
         self.0
-            .entry(checkout.to_owned())
-            .or_insert_with(|| workload(Path::new(checkout)))
+            .entry(path.to_owned())
+            .or_insert_with(|| {
+                let path = Path::new(path);
+                let checkout = RepoConfig::find(path)
+                    .and_then(|config| config.parent().map(Path::to_owned))
+                    .and_then(|dir| std::fs::canonicalize(dir).ok());
+                workload(checkout.as_deref().unwrap_or(path))
+            })
+            .clone()
+    }
+
+    /// The workload of `checkout`, the resolved directory of a
+    /// `.loadmaster.toml`, worked out once.
+    pub fn of_checkout(&mut self, checkout: &Path) -> String {
+        let key = checkout.display().to_string();
+        self.0
+            .entry(key)
+            .or_insert_with(|| workload(checkout))
             .clone()
     }
 }
@@ -677,6 +704,23 @@ mod workload_tests {
         let plain = dir.path().join("plain");
         fs::create_dir_all(&plain).unwrap();
         assert!(!workload(&plain).ends_with(".git"));
+        // A worktree that is gone, or whose `.git` leads nowhere, is not
+        // its parent's repository.
+        let gone = main.join("worktrees-dir/old");
+        assert_eq!(workload(&gone), gone.display().to_string());
+        let broken = main.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join(".git"), "gitdir: /nowhere\n").unwrap();
+        assert_eq!(workload(&broken), broken.display().to_string());
+        // A record of 0.15 and before, run in a subdirectory: the checkout of
+        // the nearest config.
+        fs::write(main.join(".loadmaster.toml"), "").unwrap();
+        fs::create_dir_all(main.join("src")).unwrap();
+        let mut workloads = Workloads::default();
+        assert_eq!(
+            workloads.of(None, &main.join("src").display().to_string()),
+            common
+        );
     }
 }
 

@@ -137,6 +137,8 @@ line says, if it has one; do not retry blindly.
    - `could not start` (exit 126 or 127): the task's program is missing or not executable.
    - `was killed by SIG...` (exit 128+n): interrupted, not failed; run it again if needed.
    - `stopped as asked`: it got its stop signal (a cancel, or your tool's timeout).
+   A run inside another check (LOADMASTER_HELD set) says nothing of its own: its exit code is \
+the task's. If the last line was lost, `loadmaster status` lists this checkout's latest results.
 6. To stop your own checks: `loadmaster cancel <ID>` (the ID is on its first line, `#42`, and in \
 `loadmaster status`). `loadmaster cancel --here` stops every job of this checkout, other agents' \
 working in it too. Never stop checks by command line (`pkill -f vitest`): other agents run the \

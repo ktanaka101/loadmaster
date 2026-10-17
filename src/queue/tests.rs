@@ -516,6 +516,27 @@ fn insert_as_0_13(conn: &Connection, state: &str, owner: Option<ProcessId>, at: 
 }
 
 #[test]
+fn a_queue_file_is_inspected_without_being_made_or_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(QUEUE_DB_FILE);
+    assert_eq!(inspect(&path).unwrap(), None);
+    assert!(!path.exists());
+    // One a first run left before it set it up.
+    drop(Connection::open(&path).unwrap());
+    let file = inspect(&path).unwrap().unwrap();
+    assert!(file.is_new() && !file.is_current() && !file.is_older());
+    assert_eq!(layout(&Connection::open(&path).unwrap()).unwrap(), 0);
+    // Set up, it is this version's.
+    let queue = Queue::open(&path).unwrap();
+    let _ticket = queue
+        .enqueue(&request("test", 1, &[]), ProcessId::current().unwrap())
+        .unwrap();
+    let file = inspect(&path).unwrap().unwrap();
+    assert!(file.is_current(), "{file:?}");
+    assert_eq!(file.jobs, 1);
+}
+
+#[test]
 fn looking_at_a_queue_of_0_12_to_0_14_leaves_it_to_them() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(QUEUE_DB_FILE);

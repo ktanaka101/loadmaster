@@ -41,9 +41,9 @@ pub(crate) fn status(args: StatusArgs) -> Result<i32> {
     let entries = history::read_recent(&state_dir.join(HISTORY_FILE), usual::RECENT_BYTES)
         .unwrap_or_default();
     let usual = Usual::of(&entries);
-    let recent = here
-        .as_deref()
-        .map_or_else(Vec::new, |here| recent_checks(&entries, here));
+    let recent = here.as_deref().map_or_else(Vec::new, |here| {
+        recent_checks(&entries, here, &snapshot.jobs)
+    });
     if args.json {
         let others = queue::jobs_in_other_queues(&state_dir);
         let value = json::status(&json::Status {
@@ -360,13 +360,16 @@ const LATELY: Duration = Duration::from_secs(30 * 60);
 const RECENT: usize = 5;
 
 /// The checks of `checkout` that ended lately, latest first, from the
-/// latest `entries` of the history.
-fn recent_checks(entries: &[history::Entry], checkout: &Path) -> Vec<Check> {
+/// latest `entries` of the history: not those still in the queue (one that
+/// gave up and was resumed, or keeps its place), whose last record is not
+/// their end.
+fn recent_checks(entries: &[history::Entry], checkout: &Path, queued: &[Job]) -> Vec<Check> {
     let since = history::unix_ms(SystemTime::now() - LATELY);
     let checkout = checkout.to_string_lossy();
     let mut checks: Vec<Check> = report::checks(entries)
         .into_iter()
         .filter(|c| c.checkout == checkout && c.end() >= since)
+        .filter(|c| !queued.iter().any(|job| job.id == c.job))
         .collect();
     checks.sort_by_key(|c| std::cmp::Reverse(c.end()));
     checks.truncate(RECENT);

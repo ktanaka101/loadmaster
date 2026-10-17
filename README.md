@@ -252,7 +252,9 @@ the rules for the version installed, and this repository's tasks. In short:
   waits for and behind whom. Don't stop it or start it again; a tool timeout
   must cover the wait, the run and its clean-up.
 - **Read how it ended from its last `loadmaster:` line**, not only the exit
-  code, since a task may exit with 75 or 125 itself:
+  code, since a task may exit with 75 or 125 itself (a run inside another
+  check says nothing of its own, and if the line was lost, `loadmaster
+  status` lists this checkout's latest results):
 
   | Last line | Exit code | What to do |
   | --- | --- | --- |
@@ -765,9 +767,12 @@ written, briefly, in the same words each time.
   and it says so with every assumption: checks arrive when they did, no CPU
   is busy outside the queue, a task with `min_weight` runs longer on fewer
   cores as its CPU work would and others as long as they ran, more cores
-  shorten nothing, and the share over capacity is a lower bound from
-  averages. Only this repository's tasks (from any of its worktrees) change;
-  every other check is replayed as it recorded. It says how close its replay
+  shorten nothing, the share over capacity is an estimate from averages (not
+  a bound: checks peak at other times than their averages say), the machine
+  has its capacity of now, measure-only checks are replayed as admitted, and
+  resources whose limits a record lacks are unlimited. Only this
+  repository's tasks (from any of its worktrees) change; every other check is
+  replayed as it recorded. It says how close its replay
   of the current settings comes to the waits recorded, and suggests no change
   of a resource or of `min_weight` on its own. `--since`/`--until` as for
   `report`; `--json` for tools.

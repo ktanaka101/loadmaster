@@ -1593,6 +1593,12 @@ pub struct QueueFile {
 }
 
 impl QueueFile {
+    /// Whether nothing has been set up in it yet (a first run killed before
+    /// it did): the next one does.
+    pub fn is_new(&self) -> bool {
+        self.layout == 0
+    }
+
     /// Whether this version uses it as it is.
     pub fn is_current(&self) -> bool {
         self.layout == LAYOUT && self.protocol == Some(PROTOCOL)
@@ -1606,16 +1612,15 @@ impl QueueFile {
 }
 
 /// The queue file at `path`, read without changing it: it is not created,
-/// brought up to date, moved or reaped. `None` if there is none.
+/// brought up to date, moved or reaped, and opened read-only, so that not
+/// even its write-ahead log is folded into it. `None` if there is none.
 pub fn inspect(path: &Path) -> rusqlite::Result<Option<QueueFile>> {
     if !path.exists() {
         return Ok(None);
     }
-    // Not read-only: the last connection to close a file in WAL mode folds
-    // its log into it, as a read-only one would not.
     let conn = Connection::open_with_flags(
         path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(Duration::from_secs(1))?;
     let layout = layout(&conn)?;

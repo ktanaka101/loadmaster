@@ -33,19 +33,8 @@ pub(crate) fn tune(args: TuneArgs) -> Result<i32> {
         .filter_map(|c| Arrival::of(c, &mut workloads))
         .collect();
     let ours = arrivals.iter().filter(|a| a.workload == workload).count();
-    if arrivals.len() < LEAST_CHECKS || ours == 0 {
-        print(&format!(
-            "loadmaster tune: too few checks to replay: {} on this machine, {ours} of this \
-             repository ({} at least, and some of it, are needed); run checks through \
-             loadmaster for a while, then again\n",
-            arrivals.len(),
-            LEAST_CHECKS
-        ));
-        return Ok(0);
-    }
-
     // The scenarios: as configured, with measured weights, with the
-    // agent's own changes.
+    // agent's own changes, which are checked first, whatever the history.
     let current: Settings = repo
         .tasks()
         .map(|t| {
@@ -56,6 +45,31 @@ pub(crate) fn tune(args: TuneArgs) -> Result<i32> {
             (t.name.clone(), setting)
         })
         .collect();
+    let yours = match args.set.is_empty() {
+        true => None,
+        false => Some(with_changes(&current, &args.set, capacity)?),
+    };
+    if arrivals.len() < LEAST_CHECKS || ours == 0 {
+        let message = format!(
+            "too few checks to replay: {} on this machine, {ours} of this repository ({} at \
+             least, and some of it, are needed); run checks through loadmaster for a while, then \
+             again",
+            arrivals.len(),
+            LEAST_CHECKS
+        );
+        if args.json {
+            let value = serde_json::json!({
+                "checks": arrivals.len(),
+                "of_this_repository": ours,
+                "replayed": false,
+                "message": message,
+            });
+            print(&format!("{value:#}\n"));
+        } else {
+            print(&format!("loadmaster tune: {message}\n"));
+        }
+        return Ok(0);
+    }
     let mut measured = current.clone();
     let mut changes = Vec::new();
     for (task, setting) in &mut measured {
@@ -63,7 +77,16 @@ pub(crate) fn tune(args: TuneArgs) -> Result<i32> {
             tune::measured_weight(&arrivals, &workload, task, capacity)
             && weight != setting.weight
         {
-            changes.push((task.clone(), setting.weight, weight, p90, runs));
+            // A min_weight above the new weight comes down with it.
+            let least = setting.min_weight.filter(|&l| l > weight).map(|_| weight);
+            changes.push(Change {
+                task: task.clone(),
+                from: setting.weight,
+                to: weight,
+                min_weight: least,
+                p90,
+                runs,
+            });
             setting.weight = weight;
             setting.min_weight = setting.min_weight.map(|l| l.min(weight));
         }
@@ -72,8 +95,8 @@ pub(crate) fn tune(args: TuneArgs) -> Result<i32> {
     if !changes.is_empty() {
         scenarios.push(("measured weights", measured));
     }
-    if !args.set.is_empty() {
-        scenarios.push(("your changes", with_changes(&current, &args.set, capacity)?));
+    if let Some(yours) = yours {
+        scenarios.push(("your changes", yours));
     }
     let outcomes: Vec<Outcome> = scenarios
         .iter()
@@ -106,9 +129,12 @@ pub(crate) fn tune(args: TuneArgs) -> Result<i32> {
                     "in_line_to_end_median_ms": ms(ends, 0.5),
                 }))).collect::<serde_json::Map<_, _>>(),
             })).collect::<Vec<_>>(),
-            "measured": changes.iter().map(|(task, from, to, p90, runs)| serde_json::json!({
-                "task": task, "from": from, "to": to, "p90_cores": p90, "runs": runs,
+            "measured": changes.iter().map(|c| serde_json::json!({
+                "task": c.task, "from": c.from, "to": c.to, "min_weight": c.min_weight,
+                "p90_cores": c.p90, "runs": c.runs,
             })).collect::<Vec<_>>(),
+            "replayed": true,
+            "assumptions": ASSUMPTIONS,
         });
         print(&format!("{value:#}\n"));
         return Ok(0);
@@ -179,26 +205,29 @@ pub(crate) fn tune(args: TuneArgs) -> Result<i32> {
                 busy, rounded up): ";
         let parts: Vec<String> = changes
             .iter()
-            .map(|(task, from, to, p90, runs)| {
-                format!("`{task}` {from} -> {to} (p90 {p90:.1} of {runs} runs)")
+            .map(|c| {
+                format!(
+                    "`{}` {} -> {} (p90 {:.1} of {} runs)",
+                    c.task, c.from, c.to, c.p90, c.runs
+                )
             })
             .collect();
         out += &parts.join(", ");
         out += "\nto try them, in .loadmaster.toml:";
-        for (task, _, to, _, _) in &changes {
-            out += &format!(" [tasks.{task}] weight = {to};");
+        for c in &changes {
+            out += &format!(" [tasks.{}] weight = {}", c.task, c.to);
+            if let Some(least) = c.min_weight {
+                out += &format!(", min_weight = {least}");
+            }
+            out += ";";
         }
         out += " then compare `loadmaster report --since` the change with before.\n";
     }
     out += &format!(
-        "\nA scenario, not a promise: checks arrive when they did (an agent that waited less \
-         might have asked sooner), no CPU is busy outside the queue, a task with min_weight runs \
-         longer on fewer cores as its CPU work would, others as long as they ran, and more cores \
-         shorten nothing. Over capacity is from the cores each check kept busy on average: a \
-         lower bound; a setting that raises it makes checks slower and can make them time out. \
-         Only this repository's tasks change; every other check keeps what it recorded. The \
-         median wait of these checks was {} as recorded, {} as replayed with the current \
-         settings: the closer, the better the replay fits this machine.\n",
+        "\nA scenario, not a promise: {} The median wait of these checks was {} as recorded, {} \
+         as replayed with the current settings: the closer, the better the replay fits this \
+         machine.\n",
+        ASSUMPTIONS.join(" "),
         d(percentile(&recorded, 0.5)),
         d(percentile(&outcomes[0].waits, 0.5)),
     );
@@ -206,7 +235,35 @@ pub(crate) fn tune(args: TuneArgs) -> Result<i32> {
     Ok(0)
 }
 
-/// `current` with the agent's `--set task.key=value` changes.
+/// What the replay assumes, said with every result.
+const ASSUMPTIONS: &[&str] = &[
+    "Checks arrive when they did: an agent that waited less might have asked for its next \
+     check sooner, and a retried failure is demand another setting might not have had.",
+    "No CPU is busy outside the queue, and the machine has the capacity it has now.",
+    "A task with a min_weight runs longer on fewer cores than it had, as its CPU work would; \
+     one without runs as long as it did, whatever cores it gets (true of one that does not \
+     size itself by LOADMASTER_WEIGHT); more cores shorten nothing.",
+    "Over capacity is estimated from the cores each check kept busy on average, not bounded: \
+     checks may peak at other times than their averages say. A setting that raises it makes \
+     checks slower and can make them time out.",
+    "Measure-only checks are replayed as admitted, and a resource whose limits a record lacks \
+     (from 0.15 and before) as unlimited.",
+    "Only this repository's tasks change; every other check keeps what it recorded.",
+];
+
+/// A measured weight that differs from the current one.
+struct Change {
+    task: String,
+    from: u32,
+    to: u32,
+    /// The min_weight that comes down with it, if it was above.
+    min_weight: Option<u32>,
+    p90: f64,
+    runs: usize,
+}
+
+/// `current` with the agent's `--set task.key=value` changes, all applied
+/// before the result is checked.
 fn with_changes(current: &Settings, sets: &[String], capacity: u32) -> Result<Settings> {
     let mut settings = current.clone();
     for set in sets {
@@ -234,8 +291,14 @@ fn with_changes(current: &Settings, sets: &[String], capacity: u32) -> Result<Se
             "min_weight" => setting.min_weight = Some(number()?),
             _ => return Err(invalid(&format!("`{field}` cannot be tuned"))),
         }
-        if setting.min_weight.is_some_and(|l| l > setting.weight) {
-            return Err(invalid("min_weight must not be above the weight"));
+    }
+    for (task, setting) in &settings {
+        if let Some(least) = setting.min_weight.filter(|&l| l > setting.weight) {
+            return Err(Error::Usage(format!(
+                "--set: `{task}` would have min_weight {least}, above its weight {}: \
+                 min_weight must not be above the weight",
+                setting.weight
+            )));
         }
     }
     Ok(settings)

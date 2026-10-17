@@ -203,22 +203,21 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
     if logged {
         return result;
     }
+    // How it ended is the last line, after what else there is to say.
+    let mut ended = None;
     match &result {
         Ok(code) => {
             record.exit_code = Some(*code);
             if record.outcome == Outcome::Exited && record.signal.is_none() {
                 record.ok = Some(task.ok_exit_codes.contains(code));
             }
-            let ran = record.run_ms.map(Duration::from_millis);
-            let line = words::ended(&record, *code, ran);
-            if !line.is_empty() {
-                tell!("loadmaster: {line}");
-            }
             if record.outcome == Outcome::Exited
                 && let Some(note) = saturated_note(&record)
             {
                 say!("{note}");
             }
+            let ran = record.run_ms.map(Duration::from_millis);
+            ended = Some(words::ended(&record, *code, ran)).filter(|line| !line.is_empty());
         }
         Err(_) => {
             record.outcome = Outcome::Error;
@@ -226,6 +225,9 @@ pub(crate) fn run(args: RunArgs) -> Result<i32> {
         }
     }
     log(&record);
+    if let Some(line) = ended {
+        tell!("loadmaster: {line}");
+    }
     result
 }
 
@@ -364,7 +366,10 @@ fn wait_turn(
                 let due = said.as_ref().is_none_or(|(at, last)| {
                     at.elapsed() >= HEARTBEAT || (*last != about && at.elapsed() >= CHANGE_GAP)
                 });
-                if due {
+                // Quiet, nothing is said, so nothing is looked up for it.
+                if due && quiet() {
+                    said = Some((Instant::now(), about));
+                } else if due {
                     let usual = usual.get_or_insert_with(|| Usual::load(state_dir));
                     // For who holds it; without, the line still says what.
                     let snapshot = queue.snapshot().ok();
