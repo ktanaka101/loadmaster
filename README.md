@@ -166,7 +166,7 @@ arm64, statically linked) are on the
 mise use -g github:ktanaka101/loadmaster
 ```
 
-Append `@0.16.0` to pin a version. Without mise, download the archive for your
+Append `@0.16.1` to pin a version. Without mise, download the archive for your
 platform, such as `loadmaster-aarch64-apple-darwin.tar.gz`, and put the
 `loadmaster` binary it contains on your `PATH`.
 
@@ -178,7 +178,7 @@ another distribution, are not seen. This has not been tested yet.
 To build from source instead (Rust 1.88 or later):
 
 ```bash
-cargo install --locked --git https://github.com/ktanaka101/loadmaster --tag v0.16.0
+cargo install --locked --git https://github.com/ktanaka101/loadmaster --tag v0.16.1
 ```
 
 ## Quick start
