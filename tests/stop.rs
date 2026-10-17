@@ -3,8 +3,8 @@
 
 mod common;
 
-use std::process::Stdio;
-use std::time::Duration;
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
 
 use common::*;
 
@@ -23,7 +23,8 @@ fn logging_sandbox() -> Sandbox {
     let probe = Sandbox::new(4, "");
     let log = q(&probe.path("signals"));
     let script = format!(
-        "trap 'echo int >> {log}' INT; trap 'echo term >> {log}' TERM; {}",
+        "echo $$ > {}; trap 'echo int >> {log}' INT; trap 'echo term >> {log}' TERM; {}",
+        q(&probe.path("hold.pid")),
         probe.hold_script("hold")
     );
     std::fs::write(
@@ -34,15 +35,46 @@ fn logging_sandbox() -> Sandbox {
     probe
 }
 
+/// Starts `loadmaster run hold` in a [`logging_sandbox`], keeping what it
+/// says for [`wait_for_signals`], once the task has started.
+fn run_hold(sandbox: &Sandbox) -> Child {
+    let mut cmd = sandbox.cmd(&["run", "hold"]);
+    cmd.stdout(Stdio::null())
+        .stderr(std::fs::File::create(sandbox.path("hold.err")).unwrap());
+    let runner = cmd.spawn().unwrap();
+    wait_until("the task to start", || sandbox.started("hold"));
+    runner
+}
+
+/// Waits until the task of a [`logging_sandbox`] has logged `n` signals or
+/// more (more fails the test's own check of the log, not a wait), else says
+/// what it logged, whether it and `loadmaster` still run, and what that said.
+fn wait_for_signals(sandbox: &Sandbox, runner: &mut Child, n: usize) {
+    let deadline = Instant::now() + TIMEOUT;
+    while sandbox.read("signals").lines().count() < n {
+        if Instant::now() >= deadline {
+            let task: Option<libc::pid_t> = sandbox.read("hold.pid").trim().parse().ok();
+            // SAFETY: signal 0 only checks that the process exists.
+            let task_runs = task.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
+            panic!(
+                "the task logged {:?}, not {n} signals; it {} ({task:?}); loadmaster {:?}, \
+                 and said: {:?}",
+                sandbox.read("signals"),
+                if task_runs { "runs" } else { "is gone" },
+                runner.try_wait(),
+                sandbox.read("hold.err"),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn a_sigterm_reaches_the_task_as_its_stop_signal_once() {
     let sandbox = logging_sandbox();
-    let mut runner = sandbox.spawn(&["run", "hold"]);
-    wait_until("the task to start", || sandbox.started("hold"));
+    let mut runner = run_hold(&sandbox);
     signal(runner.id(), libc::SIGTERM);
-    wait_until("the stop signal", || {
-        sandbox.read("signals").contains("int")
-    });
+    wait_for_signals(&sandbox, &mut runner, 1);
     signal(runner.id(), libc::SIGTERM);
     std::thread::sleep(Duration::from_millis(300));
     sandbox.release("hold");
@@ -58,7 +90,8 @@ fn the_stop_signal_reaches_a_task_whose_loadmaster_inherited_it_ignored() {
     // that, or nothing would stop it.
     let sandbox = logging_sandbox();
     let mut cmd = sandbox.cmd(&["run", "hold"]);
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdout(Stdio::null())
+        .stderr(std::fs::File::create(sandbox.path("hold.err")).unwrap());
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
@@ -69,9 +102,7 @@ fn the_stop_signal_reaches_a_task_whose_loadmaster_inherited_it_ignored() {
     let mut runner = cmd.spawn().unwrap();
     wait_until("the task to start", || sandbox.started("hold"));
     signal(runner.id(), libc::SIGTERM);
-    wait_until("the stop signal", || {
-        sandbox.read("signals").contains("int")
-    });
+    wait_for_signals(&sandbox, &mut runner, 1);
     sandbox.release("hold");
     assert!(wait(&mut runner).success());
     assert_eq!(sandbox.read("signals"), "int\n");
@@ -80,13 +111,10 @@ fn the_stop_signal_reaches_a_task_whose_loadmaster_inherited_it_ignored() {
 #[test]
 fn ctrl_c_passes_each_time_and_counts_as_the_stop() {
     let sandbox = logging_sandbox();
-    let mut runner = sandbox.spawn(&["run", "hold"]);
-    wait_until("the task to start", || sandbox.started("hold"));
+    let mut runner = run_hold(&sandbox);
     for n in 1..=2 {
         signal(runner.id(), libc::SIGINT);
-        wait_until("the SIGINT", || {
-            sandbox.read("signals").matches("int").count() == n
-        });
+        wait_for_signals(&sandbox, &mut runner, n);
     }
     // It has had its stop signal: a SIGTERM asks for nothing more.
     signal(runner.id(), libc::SIGTERM);
